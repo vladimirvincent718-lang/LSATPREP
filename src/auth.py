@@ -22,6 +22,7 @@ import hashlib
 from datetime import datetime, timedelta
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from src.database import (
     create_user, get_user_by_username,
@@ -35,6 +36,8 @@ from src.database import (
 # ── Constants ─────────────────────────────────────────────────────────────────
 COOKIE_NAME   = "sf_auth"          # browser cookie that stores the session token
 SESSION_DAYS  = SESSION_TOKEN_DAYS  # kept in sync with the DB-level expiry
+COOKIE_STATE_KEY = "_sf_cookies"
+COOKIE_LOAD_WAIT_KEY = "_sf_waited_for_cookie_load"
 
 SECURITY_QUESTIONS = [
     "What was the name of your first pet?",
@@ -68,7 +71,7 @@ def _get_cookie_controller():
     # CookieController stores cookie values at st.session_state[key].
     # Creating it with the same key on every call is safe: on the first call it
     # fires the JS component; on subsequent calls it reads from session_state.
-    return CookieController(key="_sf_cookies")
+    return CookieController(key=COOKIE_STATE_KEY)
 
 
 # ── Public session helpers ────────────────────────────────────────────────────
@@ -125,6 +128,14 @@ def restore_session_from_cookie() -> bool:
         return False
 
 
+def cookie_load_is_pending() -> bool:
+    """
+    True only for the first run where the browser cookie component has been
+    mounted but has not yet had a chance to return the real browser cookies.
+    """
+    return not is_logged_in() and COOKIE_STATE_KEY not in st.session_state
+
+
 def require_login() -> int:
     """
     Ensure the current user is authenticated, restoring from cookie if needed.
@@ -132,8 +143,13 @@ def require_login() -> int:
     """
     restore_session_from_cookie()
     if not is_logged_in():
+        if cookie_load_is_pending() and not st.session_state.get(COOKIE_LOAD_WAIT_KEY):
+            st.session_state[COOKIE_LOAD_WAIT_KEY] = True
+            st_autorefresh(interval=300, limit=1, key="auth_cookie_load_refresh")
+            st.stop()
         st.warning("Please log in from the Home page.")
         st.stop()
+    st.session_state.pop(COOKIE_LOAD_WAIT_KEY, None)
     return st.session_state["user_id"]
 
 
@@ -262,7 +278,8 @@ def login_register_form() -> None:
             ok, msg = login_user(uname, pwd)
             if ok:
                 st.success(msg)
-                st.rerun()
+                st_autorefresh(interval=300, limit=1, key="post_login_refresh")
+                st.stop()
             else:
                 st.error(msg)
                 if "Incorrect password" in msg:
@@ -335,4 +352,3 @@ def login_register_form() -> None:
                         st.session_state.pop("reset_username", None)
                     else:
                         st.error(msg)
-

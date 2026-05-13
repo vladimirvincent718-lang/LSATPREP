@@ -18,6 +18,76 @@ QUESTION_TYPES = [
 ]
 
 
+# --- Sidebar page labels ----------------------------------------------------
+_SIDEBAR_PAGE_LABEL_JS = """
+<script>
+(function () {
+    'use strict';
+
+    var P = window.parent;
+    if (!P || !P.document) { return; }
+    var doc = P.document;
+
+    function relabelMainPage() {
+        var nav = doc.querySelector('[data-testid="stSidebarNav"], [data-testid="stSidebarNavItems"]');
+        if (!nav) { return; }
+
+        var links = Array.prototype.slice.call(nav.querySelectorAll('a'));
+        links.forEach(function (link) {
+            var text = (link.textContent || '').trim();
+            var normalizedText = text.toLowerCase();
+            var href = link.getAttribute('href') || '';
+            var isMainAppLink = normalizedText === 'app'
+                || href === './'
+                || href === '/'
+                || href.endsWith('/?');
+            if (!isMainAppLink) { return; }
+
+            link.setAttribute('aria-label', 'Sign In');
+            link.setAttribute('title', 'Sign In');
+
+            var labelNode = link.querySelector('span, p, div');
+            if (labelNode) {
+                labelNode.textContent = 'Sign In';
+            } else {
+                link.textContent = 'Sign In';
+            }
+        });
+    }
+
+    relabelMainPage();
+    setTimeout(relabelMainPage, 100);
+    setTimeout(relabelMainPage, 500);
+
+    if (P._sfPageLabelObs) { P._sfPageLabelObs.disconnect(); }
+    P._sfPageLabelObs = new MutationObserver(relabelMainPage);
+    P._sfPageLabelObs.observe(doc.body, { childList: true, subtree: true });
+})()
+</script>
+"""
+
+_SIDEBAR_PAGE_LABEL_CSS = """
+<style>
+[data-testid="stSidebarNav"] a[href="./"] span,
+[data-testid="stSidebarNavItems"] a[href="./"] span {
+    font-size: 0 !important;
+}
+
+[data-testid="stSidebarNav"] a[href="./"] span::after,
+[data-testid="stSidebarNavItems"] a[href="./"] span::after {
+    content: "Sign In";
+    font-size: 14px;
+}
+</style>
+"""
+
+
+def inject_sidebar_page_labels() -> None:
+    """Rename Streamlit's default app.py sidebar label to the user-facing page name."""
+    st.markdown(_SIDEBAR_PAGE_LABEL_CSS, unsafe_allow_html=True)
+    _components.html(_SIDEBAR_PAGE_LABEL_JS, height=0, scrolling=False)
+
+
 # ── Collapsible sidebar ───────────────────────────────────────────────────────
 #
 # WHY TWO SEPARATE INJECTIONS
@@ -278,12 +348,49 @@ _FEEDBACK_BTN_CSS = """
 
 #sf-feedback-fab-marker { display: none; }
 
+#sf-feedback-fab-container {
+    position: fixed !important;
+    bottom: 18px !important;
+    left: 18px !important;
+    z-index: 99999 !important;
+    width: fit-content !important;
+    height: auto !important;
+    overflow: visible !important;
+}
+
+#sf-feedback-fab-container button {
+    background: linear-gradient(135deg, #FFB000 0%, #FF6B00 100%) !important;
+    color: #ffffff !important;
+    border: 1px solid rgba(255,255,255,0.42) !important;
+    border-radius: 50px !important;
+    padding: 10px 20px !important;
+    font-size: 14px !important;
+    font-weight: 700 !important;
+    box-shadow: 0 6px 20px rgba(255,107,0,0.42), 0 2px 8px rgba(0,0,0,0.18) !important;
+    cursor: pointer !important;
+    white-space: nowrap !important;
+    letter-spacing: 0 !important;
+    width: auto !important;
+    transition: transform 0.18s ease, box-shadow 0.18s ease !important;
+}
+
+#sf-feedback-fab-container button:hover {
+    background: linear-gradient(135deg, #FFC233 0%, #FF7A1A 100%) !important;
+    box-shadow: 0 8px 26px rgba(255,107,0,0.52), 0 4px 12px rgba(0,0,0,0.20) !important;
+    transform: translateY(-2px) !important;
+}
+
+#sf-feedback-fab-container button:active {
+    transform: translateY(0) scale(0.98) !important;
+    box-shadow: 0 3px 12px rgba(255,107,0,0.45), 0 1px 5px rgba(0,0,0,0.18) !important;
+}
+
 /* Pin the element-container that wraps the FAB button */
 [data-testid="element-container"]:has(#sf-feedback-fab-marker)
   + [data-testid="element-container"] {
     position: fixed !important;
-    bottom: 28px !important;
-    right: 28px !important;
+    bottom: 18px !important;
+    left: 18px !important;
     z-index: 99999 !important;
     width: fit-content !important;
     height: auto !important;
@@ -293,28 +400,82 @@ _FEEDBACK_BTN_CSS = """
 /* Style the button itself */
 [data-testid="element-container"]:has(#sf-feedback-fab-marker)
   + [data-testid="element-container"] button {
-    background: linear-gradient(135deg, #4A90D9 0%, #357ABD 100%) !important;
+    background: linear-gradient(135deg, #FFB000 0%, #FF6B00 100%) !important;
     color: #ffffff !important;
-    border: none !important;
+    border: 1px solid rgba(255,255,255,0.42) !important;
     border-radius: 50px !important;
     padding: 10px 20px !important;
     font-size: 14px !important;
-    font-weight: 600 !important;
-    box-shadow: 0 4px 16px rgba(74,144,217,0.45), 0 2px 6px rgba(0,0,0,0.15) !important;
+    font-weight: 700 !important;
+    box-shadow: 0 6px 20px rgba(255,107,0,0.42), 0 2px 8px rgba(0,0,0,0.18) !important;
     cursor: pointer !important;
     white-space: nowrap !important;
-    letter-spacing: 0.01em !important;
+    letter-spacing: 0 !important;
     width: auto !important;
     transition: transform 0.18s ease, box-shadow 0.18s ease !important;
 }
 [data-testid="element-container"]:has(#sf-feedback-fab-marker)
   + [data-testid="element-container"] button:hover {
-    background: linear-gradient(135deg, #5BA0E8 0%, #4A90D9 100%) !important;
-    box-shadow: 0 6px 22px rgba(74,144,217,0.55), 0 3px 10px rgba(0,0,0,0.18) !important;
+    background: linear-gradient(135deg, #FFC233 0%, #FF7A1A 100%) !important;
+    box-shadow: 0 8px 26px rgba(255,107,0,0.52), 0 4px 12px rgba(0,0,0,0.20) !important;
     transform: translateY(-2px) !important;
+}
+[data-testid="element-container"]:has(#sf-feedback-fab-marker)
+  + [data-testid="element-container"] button:active {
+    transform: translateY(0) scale(0.98) !important;
+    box-shadow: 0 3px 12px rgba(255,107,0,0.45), 0 1px 5px rgba(0,0,0,0.18) !important;
 }
 
 /* Hide the sidebar auto-generated Feedback entry */
+#sf-feedback-fab {
+    position: fixed !important;
+    bottom: 18px !important;
+    left: 18px !important;
+    z-index: 9999999 !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 7px !important;
+    min-height: 42px !important;
+    padding: 10px 20px !important;
+    border: 1px solid rgba(255,255,255,0.42) !important;
+    border-radius: 999px !important;
+    background: linear-gradient(135deg, #FFB000 0%, #FF6B00 100%) !important;
+    color: #ffffff !important;
+    box-shadow: 0 6px 20px rgba(255,107,0,0.42), 0 2px 8px rgba(0,0,0,0.18) !important;
+    cursor: pointer !important;
+    font: 700 14px/1.2 sans-serif !important;
+    letter-spacing: 0 !important;
+    white-space: nowrap !important;
+    transition: transform 0.18s ease, box-shadow 0.18s ease, background 0.18s ease !important;
+}
+
+#sf-feedback-fab:hover {
+    background: linear-gradient(135deg, #FFC233 0%, #FF7A1A 100%) !important;
+    box-shadow: 0 8px 26px rgba(255,107,0,0.52), 0 4px 12px rgba(0,0,0,0.20) !important;
+    transform: translateY(-2px) !important;
+}
+
+#sf-feedback-fab:active {
+    transform: translateY(0) scale(0.98) !important;
+    box-shadow: 0 3px 12px rgba(255,107,0,0.45), 0 1px 5px rgba(0,0,0,0.18) !important;
+}
+
+#sf-feedback-fab:focus-visible {
+    outline: 3px solid rgba(255,176,0,0.38) !important;
+    outline-offset: 3px !important;
+}
+
+[data-testid="element-container"]:has(#sf-feedback-fab-marker)
+  + [data-testid="element-container"] {
+    position: absolute !important;
+    left: -9999px !important;
+    bottom: auto !important;
+    width: 1px !important;
+    height: 1px !important;
+    overflow: hidden !important;
+}
+
 [data-testid="stSidebarNavItems"] a[href*="feedback"],
 [data-testid="stSidebarNavItems"] a[href*="Feedback"],
 [data-testid="stSidebarNavItems"] a[href*="11_Feedback"] {
@@ -323,12 +484,117 @@ _FEEDBACK_BTN_CSS = """
 </style>
 """
 
+_FEEDBACK_BTN_JS = """
+<script>
+(function () {
+    'use strict';
+
+    var P = window.parent;
+    if (!P || !P.document) { return; }
+    var doc = P.document;
+    var MARKER = 'sf-feedback-fab-marker';
+    var CONTAINER = 'sf-feedback-fab-container';
+
+    function isAfterMarker(marker, node) {
+        return !!(marker.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING);
+    }
+
+    function findFeedbackButton() {
+        var marker = doc.getElementById(MARKER);
+        if (!marker) { return null; }
+        var buttons = Array.prototype.slice.call(doc.querySelectorAll('button'));
+        for (var i = 0; i < buttons.length; i += 1) {
+            var btn = buttons[i];
+            if (isAfterMarker(marker, btn) && /Feedback/i.test(btn.textContent || '')) {
+                return btn;
+            }
+        }
+        return null;
+    }
+
+    function pinButton() {
+        var btn = findFeedbackButton();
+        if (!btn) { return; }
+        var container = btn.closest('[data-testid="element-container"]') || btn.parentElement;
+        if (!container) { return; }
+        container.id = CONTAINER;
+        btn.setAttribute('aria-label', 'Open feedback');
+        btn.title = 'Open feedback';
+    }
+
+    pinButton();
+    setTimeout(pinButton, 50);
+    setTimeout(pinButton, 250);
+    setTimeout(pinButton, 1000);
+
+    if (P._sfFeedbackObs) { P._sfFeedbackObs.disconnect(); }
+    P._sfFeedbackObs = new MutationObserver(pinButton);
+    P._sfFeedbackObs.observe(doc.body, { childList: true, subtree: true });
+})();
+</script>
+"""
+
+_FEEDBACK_BTN_JS = """
+<script>
+(function () {
+    'use strict';
+
+    var P = window.parent;
+    if (!P || !P.document) { return; }
+    var doc = P.document;
+    var BTN_ID = 'sf-feedback-fab';
+    var MARKER_ID = 'sf-feedback-fab-marker';
+
+    function findStreamlitFeedbackButton() {
+        var marker = doc.getElementById(MARKER_ID);
+        if (!marker) { return null; }
+        var buttons = Array.prototype.slice.call(doc.querySelectorAll('button'));
+        for (var i = 0; i < buttons.length; i += 1) {
+            var btn = buttons[i];
+            var followsMarker = !!(marker.compareDocumentPosition(btn) & 4);
+            if (followsMarker && /Feedback/i.test(btn.textContent || '')) {
+                return btn;
+            }
+        }
+        return null;
+    }
+
+    function ensureFab() {
+        var existing = doc.getElementById(BTN_ID);
+        if (existing) { return existing; }
+
+        var fab = doc.createElement('button');
+        fab.id = BTN_ID;
+        fab.type = 'button';
+        fab.innerHTML = '<span aria-hidden="true">&#128172;</span><span>Feedback</span>';
+        fab.title = 'Open feedback';
+        fab.setAttribute('aria-label', 'Open feedback');
+        fab.addEventListener('click', function () {
+            var streamlitButton = findStreamlitFeedbackButton();
+            if (streamlitButton) { streamlitButton.click(); }
+        });
+        doc.body.appendChild(fab);
+        return fab;
+    }
+
+    ensureFab();
+    setTimeout(ensureFab, 100);
+    setTimeout(ensureFab, 500);
+
+    if (P._sfFeedbackFabObs) { P._sfFeedbackFabObs.disconnect(); }
+    P._sfFeedbackFabObs = new MutationObserver(ensureFab);
+    P._sfFeedbackFabObs.observe(doc.body, { childList: true, subtree: false });
+})();
+</script>
+"""
+
 def _inject_feedback_button() -> None:
     """Inject the floating Feedback FAB into every authenticated page."""
     st.markdown(_FEEDBACK_BTN_CSS, unsafe_allow_html=True)
     st.markdown('<div id="sf-feedback-fab-marker"></div>', unsafe_allow_html=True)
     if st.button("💬 Feedback", key="sf_feedback_fab"):
         st.switch_page("pages/11_Feedback.py")
+    _components.html(_FEEDBACK_BTN_JS, height=0, scrolling=False)
 
 
 # ── Admin view-mode helpers ───────────────────────────────────────────────────
@@ -367,8 +633,15 @@ def page_header(title: str, subtitle: str = "") -> None:
 
 
 def sidebar_nav(username: str) -> None:
+    inject_sidebar_page_labels()
     # Inject collapsible-sidebar (CSS via markdown, JS via iframe component)
     _inject_sidebar_toggle()
+    # Inject responsive layout CSS from admin-managed config
+    try:
+        from src.responsive_layout import inject_responsive_css
+        inject_responsive_css()
+    except Exception:
+        pass
 
     with st.sidebar:
         st.markdown(f"**Logged in as:** {username}")

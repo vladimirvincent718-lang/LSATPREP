@@ -172,6 +172,13 @@ def init_database() -> None:
         FOREIGN KEY (user_id) REFERENCES users(id)
     );
 
+    -- App-wide settings for admin-managed integrations.
+    CREATE TABLE IF NOT EXISTS app_settings (
+        key        TEXT PRIMARY KEY,
+        value      TEXT DEFAULT '',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     -- ── Mistake journal  (user-specific) ────────────────────────────────── --
     CREATE TABLE IF NOT EXISTS mistake_journal (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,6 +202,8 @@ def init_database() -> None:
         content_text        TEXT DEFAULT '',
         external_url        TEXT DEFAULT '',
         notes               TEXT DEFAULT '',
+        material_section    TEXT DEFAULT 'Module',
+        module_name         TEXT DEFAULT '',
         display_order       INTEGER DEFAULT 0,
         estimated_minutes   INTEGER DEFAULT 0,
         is_active           INTEGER DEFAULT 1,
@@ -204,6 +213,18 @@ def init_database() -> None:
     );
 
     -- ── Material progress  (user-specific) ──────────────────────────────── --
+    CREATE TABLE IF NOT EXISTS course_modules (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        course_id        INTEGER NOT NULL,
+        name             TEXT NOT NULL,
+        normalized_name  TEXT DEFAULT '',
+        display_order    INTEGER DEFAULT 0,
+        is_active        INTEGER DEFAULT 1,
+        created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (course_id) REFERENCES courses(id)
+    );
+
     CREATE TABLE IF NOT EXISTS material_progress (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id     INTEGER NOT NULL,
@@ -231,6 +252,12 @@ def init_database() -> None:
     conn.commit()
     conn.close()
     _migrate_database()
+    # Responsive Layout Manager tables (lazy-init, safe to call here)
+    try:
+        from src.responsive_layout import init_responsive_tables
+        init_responsive_tables()
+    except Exception:
+        pass
 
 
 # ── Migration — safe, idempotent, runs on every startup ───────────────────────
@@ -242,9 +269,30 @@ def _migrate_database() -> None:
     - Add courses.normalized_title and back-fill it.
     - Add course_materials.normalized_title, display_order, estimated_minutes.
     - Add questions.content_hash and back-fill it.
+    - Create app_settings for shared integration credentials.
     - All existing migration steps are preserved.
     """
     conn = get_connection()
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS app_settings (
+               key        TEXT PRIMARY KEY,
+               value      TEXT DEFAULT '',
+               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS course_modules (
+               id               INTEGER PRIMARY KEY AUTOINCREMENT,
+               course_id        INTEGER NOT NULL,
+               name             TEXT NOT NULL,
+               normalized_name  TEXT DEFAULT '',
+               display_order    INTEGER DEFAULT 0,
+               is_active        INTEGER DEFAULT 1,
+               created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               FOREIGN KEY (course_id) REFERENCES courses(id)
+           )"""
+    )
 
     def cols(table: str) -> set:
         return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -296,6 +344,8 @@ def _migrate_database() -> None:
         ("created_by_user_id", "ALTER TABLE course_materials ADD COLUMN created_by_user_id INTEGER"),
         ("is_active",          "ALTER TABLE course_materials ADD COLUMN is_active INTEGER DEFAULT 1"),
         ("normalized_title",   "ALTER TABLE course_materials ADD COLUMN normalized_title TEXT DEFAULT ''"),
+        ("material_section",   "ALTER TABLE course_materials ADD COLUMN material_section TEXT DEFAULT 'Module'"),
+        ("module_name",        "ALTER TABLE course_materials ADD COLUMN module_name TEXT DEFAULT ''"),
         ("display_order",      "ALTER TABLE course_materials ADD COLUMN display_order INTEGER DEFAULT 0"),
         ("estimated_minutes",  "ALTER TABLE course_materials ADD COLUMN estimated_minutes INTEGER DEFAULT 0"),
     ]:
@@ -317,6 +367,21 @@ def _migrate_database() -> None:
             "UPDATE course_materials SET normalized_title = ? WHERE id = ?",
             (_normalize_title(row["title"]), row["id"]),
         )
+    conn.execute(
+        """UPDATE course_materials
+           SET material_section = 'Syllabus'
+           WHERE (material_section IS NULL OR material_section = '' OR material_section = 'Module')
+             AND (
+                LOWER(title) LIKE '%syllabus%'
+                OR LOWER(notes) LIKE '%syllabus%'
+                OR LOWER(material_type) = 'syllabus'
+             )"""
+    )
+    conn.execute(
+        """UPDATE course_materials
+           SET material_section = 'Module'
+           WHERE material_section IS NULL OR material_section = ''"""
+    )
     conn.commit()
 
     # ── 4c. questions.content_hash ────────────────────────────────────────────
@@ -1305,6 +1370,47 @@ def get_all_settings(user_id: int) -> dict:
     return result
 
 
+def get_app_setting(key: str, default: str = "") -> str:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key = ?",
+        (key,),
+    ).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_app_setting(key: str, value: str) -> None:
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO app_settings (key, value, updated_at)
+           VALUES (?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(key) DO UPDATE SET
+             value = excluded.value,
+             updated_at = CURRENT_TIMESTAMP""",
+        (key, str(value)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_app_settings(keys: list[str] | None = None) -> dict:
+    conn = get_connection()
+    if keys:
+        placeholders = ",".join("?" for _ in keys)
+        rows = conn.execute(
+            f"SELECT key, value FROM app_settings WHERE key IN ({placeholders})",
+            keys,
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    conn.close()
+    found = {r["key"]: r["value"] for r in rows}
+    if keys:
+        return {key: found.get(key, "") for key in keys}
+    return found
+
+
 # ── Mistake journal helpers ───────────────────────────────────────────────────
 def add_to_journal(user_id: int, question_id: int,
                    attempt_id, note: str = "") -> None:
@@ -1376,6 +1482,132 @@ MATERIAL_TYPES = [
     "Other",
 ]
 
+MATERIAL_SECTIONS = [
+    "Syllabus",
+    "Module",
+]
+
+
+def _ensure_material_modules(course_id: int, conn: sqlite3.Connection | None = None) -> None:
+    """Seed module rows from existing material module names."""
+    own_conn = conn is None
+    conn = conn or get_connection()
+    try:
+        module_count = conn.execute(
+            "SELECT COUNT(*) FROM course_modules WHERE course_id = ?",
+            (course_id,),
+        ).fetchone()[0]
+        if module_count:
+            return
+        existing = {
+            r["normalized_name"]
+            for r in conn.execute(
+                """SELECT normalized_name FROM course_modules
+                   WHERE course_id = ? AND (is_active IS NULL OR is_active = 1)""",
+                (course_id,),
+            ).fetchall()
+        }
+        max_order = conn.execute(
+            "SELECT COALESCE(MAX(display_order), -1) FROM course_modules WHERE course_id = ?",
+            (course_id,),
+        ).fetchone()[0]
+        rows = conn.execute(
+            """SELECT DISTINCT module_name FROM course_materials
+               WHERE course_id = ?
+                 AND (is_active IS NULL OR is_active = 1)
+                 AND COALESCE(material_section, 'Module') = 'Module'
+                 AND TRIM(COALESCE(module_name, '')) <> ''
+               ORDER BY module_name""",
+            (course_id,),
+        ).fetchall()
+        for row in rows:
+            name = (row["module_name"] or "").strip()
+            nt = _normalize_title(name)
+            if not nt or nt in existing:
+                continue
+            max_order += 1
+            conn.execute(
+                """INSERT INTO course_modules
+                   (course_id, name, normalized_name, display_order, is_active)
+                   VALUES (?, ?, ?, ?, 1)""",
+                (course_id, name, nt, max_order),
+            )
+            existing.add(nt)
+        if own_conn:
+            conn.commit()
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def get_course_modules(course_id: int) -> list:
+    _ensure_material_modules(course_id)
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT * FROM course_modules
+           WHERE course_id = ? AND (is_active IS NULL OR is_active = 1)
+           ORDER BY display_order ASC, created_at ASC, name ASC""",
+        (course_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def replace_course_modules(course_id: int, module_names: list[str]) -> tuple:
+    cleaned = []
+    seen = set()
+    for name in module_names:
+        clean = " ".join(str(name or "").strip().split())
+        nt = _normalize_title(clean)
+        if not clean or nt in seen:
+            continue
+        cleaned.append((clean, nt))
+        seen.add(nt)
+
+    conn = get_connection()
+    existing_rows = conn.execute(
+        "SELECT id, normalized_name FROM course_modules WHERE course_id = ?",
+        (course_id,),
+    ).fetchall()
+    existing = {r["normalized_name"]: r["id"] for r in existing_rows}
+
+    for order, (name, nt) in enumerate(cleaned):
+        if nt in existing:
+            conn.execute(
+                """UPDATE course_modules
+                   SET name = ?, display_order = ?, is_active = 1,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (name, order, existing[nt]),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO course_modules
+                   (course_id, name, normalized_name, display_order, is_active)
+                   VALUES (?, ?, ?, ?, 1)""",
+                (course_id, name, nt, order),
+            )
+
+    if cleaned:
+        placeholders = ",".join("?" for _ in cleaned)
+        conn.execute(
+            f"""UPDATE course_modules
+                SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+                WHERE course_id = ? AND normalized_name NOT IN ({placeholders})""",
+            [course_id] + [nt for _, nt in cleaned],
+        )
+    else:
+        conn.execute(
+            """UPDATE course_modules
+               SET is_active = 0, updated_at = CURRENT_TIMESTAMP
+               WHERE course_id = ?""",
+            (course_id,),
+        )
+
+    conn.commit()
+    conn.close()
+    return True, None
+
 
 def create_material(course_id: int, title: str,
                     material_type: str, content_text: str = "",
@@ -1383,7 +1615,9 @@ def create_material(course_id: int, title: str,
                     created_by_user_id=None,
                     display_order: int = 0,
                     estimated_minutes: int = 0,
-                    is_active: int = 1) -> tuple:
+                    is_active: int = 1,
+                    material_section: str = "Module",
+                    module_name: str = "") -> tuple:
     """
     Create a shared course material.
     Returns (material_id, None) on success.
@@ -1412,10 +1646,13 @@ def create_material(course_id: int, title: str,
         """INSERT INTO course_materials
            (course_id, created_by_user_id, title, normalized_title,
             material_type, content_text, external_url, notes,
+            material_section, module_name,
             display_order, estimated_minutes, is_active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (course_id, created_by_user_id, title.strip(), nt,
          material_type, content_text, external_url.strip(), notes,
+         material_section if material_section in MATERIAL_SECTIONS else "Module",
+         module_name.strip(),
          display_order, estimated_minutes, is_active),
     )
     mid = cur.lastrowid
@@ -1429,7 +1666,15 @@ def get_materials(course_id: int) -> list:
     rows = conn.execute(
         """SELECT * FROM course_materials
            WHERE course_id = ? AND (is_active IS NULL OR is_active = 1)
-           ORDER BY display_order ASC, created_at ASC""",
+           ORDER BY
+             CASE COALESCE(material_section, 'Module')
+               WHEN 'Syllabus' THEN 0
+               WHEN 'Module' THEN 1
+               ELSE 2
+             END,
+             COALESCE(module_name, '') ASC,
+             display_order ASC,
+             created_at ASC""",
         (course_id,),
     ).fetchall()
     conn.close()
@@ -1439,17 +1684,22 @@ def get_materials(course_id: int) -> list:
 def update_material(material_id: int, title: str, material_type: str,
                     content_text: str, external_url: str, notes: str,
                     display_order: int = 0,
-                    estimated_minutes: int = 0) -> None:
+                    estimated_minutes: int = 0,
+                    material_section: str = "Module",
+                    module_name: str = "") -> None:
     conn = get_connection()
     conn.execute(
         """UPDATE course_materials
            SET title = ?, normalized_title = ?, material_type = ?,
                content_text = ?, external_url = ?, notes = ?,
+               material_section = ?, module_name = ?,
                display_order = ?, estimated_minutes = ?,
                updated_at = CURRENT_TIMESTAMP
            WHERE id = ?""",
         (title.strip(), _normalize_title(title), material_type, content_text,
-         external_url.strip(), notes, display_order, estimated_minutes, material_id),
+         external_url.strip(), notes,
+         material_section if material_section in MATERIAL_SECTIONS else "Module",
+         module_name.strip(), display_order, estimated_minutes, material_id),
     )
     conn.commit()
     conn.close()

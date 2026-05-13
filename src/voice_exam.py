@@ -209,16 +209,27 @@ _PANEL_CSS = """
   transform:translateY(100%);transition:transform .30s cubic-bezier(.4,0,.2,1);
   box-shadow:0 -8px 40px rgba(0,0,0,.45);max-width:900px;margin:0 auto;}
 #sf-vep-panel.sf-open{transform:translateY(0);}
+#sf-vep-panel.sf-collapsed{
+  left:auto;right:92px;bottom:18px;width:min(360px,calc(100vw - 124px));
+  padding:10px 12px;border-radius:14px;transform:translateY(0);}
+#sf-vep-panel.sf-collapsed #sf-vep-header{margin-bottom:0;}
+#sf-vep-panel.sf-collapsed #sf-vep-title{white-space:nowrap;}
+#sf-vep-panel.sf-collapsed #sf-vep-status{text-align:left;}
+#sf-vep-panel.sf-collapsed #sf-vep-pgwrap,
+#sf-vep-panel.sf-collapsed #sf-vep-controls,
+#sf-vep-panel.sf-collapsed #sf-vep-microw,
+#sf-vep-panel.sf-collapsed #sf-vep-confirm,
+#sf-vep-panel.sf-collapsed #sf-vep-settings-row{display:none !important;}
 #sf-vep-header{display:flex;align-items:center;gap:10px;margin-bottom:11px;}
 #sf-vep-title{font-size:12px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
   color:#A78BFA;display:flex;align-items:center;gap:6px;}
 #sf-vep-qlabel{font-size:12px;font-weight:400;color:#6B7280;margin-left:2px;}
 #sf-vep-status{flex:1;font-size:12px;color:#9CA3AF;text-align:right;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-#sf-vep-close{background:none;border:none;color:#6B7280;cursor:pointer;
+#sf-vep-collapse,#sf-vep-close{background:none;border:none;color:#6B7280;cursor:pointer;
   font-size:18px;line-height:1;padding:4px 8px;border-radius:6px;
   transition:color .15s,background .15s;flex-shrink:0;}
-#sf-vep-close:hover{color:#f0f0f0;background:rgba(255,255,255,.09);}
+#sf-vep-collapse:hover,#sf-vep-close:hover{color:#f0f0f0;background:rgba(255,255,255,.09);}
 #sf-vep-pgwrap{height:3px;background:rgba(255,255,255,.08);border-radius:2px;
   margin-bottom:12px;overflow:hidden;}
 #sf-vep-pg{height:100%;background:linear-gradient(90deg,#7C3AED,#A78BFA);
@@ -277,6 +288,8 @@ _PANEL_CSS = """
   overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;}
 @media(max-width:600px){
   #sf-vep-panel{padding:12px 12px 16px;border-radius:14px 14px 0 0;}
+  #sf-vep-panel.sf-collapsed{right:70px;bottom:14px;width:calc(100vw - 88px);
+    padding:9px 10px;border-radius:12px;}
   .sf-btn{min-width:40px;min-height:40px;font-size:16px;}
   #sf-vep-settings-row{grid-template-columns:1fr;}
   #sf-vep-fab{bottom:82px;right:16px;width:46px;height:46px;font-size:19px;}}
@@ -318,7 +331,7 @@ function ensureTTSEngine(){
 /* ── State ───────────────────────────────────────────────────────────────── */
 if(!P[SK]){
   P[SK]={
-    panelOpen:false, speaking:false, paused:false,
+    panelOpen:false, panelCollapsed:false, speaking:false, paused:false,
     _shouldStop:false, _pausedAt:0, _speakOffset:0,
     speed:1.0, fullText:'', charIdx:0,
     listening:false, recognition:null,
@@ -329,6 +342,7 @@ if(!P[SK]){
 }
 var S=P[SK];
 S.destroyed=false;
+if(typeof S.panelCollapsed==='undefined') S.panelCollapsed=false;
 S._cbProgress=function(){updateProg();};
 S._cbEnd=function(){setStatus('Finished');updateCtrl();updateProg();};
 S._cbError=function(err){setStatus('TTS error: '+err);S.speaking=false;updateCtrl();};
@@ -351,6 +365,7 @@ function panelHTML(){
     +'<div id="sf-vep-title"><span>\uD83C\uDFA7</span><span>Voice Mode</span>'
     +'<span id="sf-vep-qlabel">Q '+(Q.idx+1)+' / '+Q.total+'</span></div>'
     +'<span id="sf-vep-status" role="status" aria-live="polite">Ready</span>'
+    +'<button id="sf-vep-collapse" aria-label="Collapse voice panel" title="Collapse voice panel">\u2212</button>'
     +'<button id="sf-vep-close" aria-label="Close voice panel">\u2715</button></div>'
     +'<div id="sf-vep-pgwrap" aria-hidden="true"><div id="sf-vep-pg"></div></div>'
     +'<div id="sf-vep-controls" role="group" aria-label="Playback controls">'
@@ -411,7 +426,11 @@ function wirePanel(panel){
   panel.dataset.wired='1';
 
   $('sf-vep-close').addEventListener('click',function(){
-    S.panelOpen=false; applyPanelState(); hardStop(); stopSTT();
+    S.panelOpen=false; S.panelCollapsed=false; applyPanelState(); hardStop(); stopSTT();
+  });
+  $('sf-vep-collapse').addEventListener('click',function(){
+    S.panelOpen=true; S.panelCollapsed=!S.panelCollapsed; applyPanelState();
+    if(S.panelCollapsed){hardStop(); stopSTT(); setStatus('Collapsed');}
   });
   $('sf-vep-play').addEventListener('click',function(){
     S._shouldStop=false;
@@ -691,15 +710,25 @@ function syncSettings(){
 function syncQLabel(){var el=$('sf-vep-qlabel');if(el)el.textContent='Q '+(Q.idx+1)+' / '+Q.total;}
 function applyPanelState(){
   var panel=$('sf-vep-panel'),fab=$('sf-vep-fab');if(!panel||!fab)return;
+  var collapse=$('sf-vep-collapse');
+  panel.classList.toggle('sf-collapsed',!!S.panelCollapsed);
+  if(collapse){
+    collapse.innerHTML=S.panelCollapsed?'\u25A1':'\u2212';
+    collapse.setAttribute('aria-label',S.panelCollapsed?'Expand voice panel':'Collapse voice panel');
+    collapse.setAttribute('title',S.panelCollapsed?'Expand voice panel':'Collapse voice panel');
+  }
   if(S.panelOpen){panel.classList.add('sf-open');fab.setAttribute('aria-expanded','true');
-    fab.innerHTML='\u2715';fab.setAttribute('aria-label','Close Voice Exam Mode');}
-  else{panel.classList.remove('sf-open');fab.setAttribute('aria-expanded','false');
+    fab.innerHTML=S.panelCollapsed?'\uD83C\uDFA4':'\u2715';
+    fab.setAttribute('aria-label',S.panelCollapsed?'Expand Voice Exam Mode':'Close Voice Exam Mode');}
+  else{panel.classList.remove('sf-open');panel.classList.remove('sf-collapsed');fab.setAttribute('aria-expanded','false');
     fab.innerHTML='\uD83C\uDFA4';fab.setAttribute('aria-label','Open Voice Exam Mode');}
 }
 function togglePanel(){
-  S.panelOpen=!S.panelOpen;applyPanelState();
+  if(S.panelOpen&&S.panelCollapsed){S.panelCollapsed=false;}
+  else{S.panelOpen=!S.panelOpen;if(!S.panelOpen)S.panelCollapsed=false;}
+  applyPanelState();
   if(S.panelOpen){syncQLabel();syncSettings();
-    if(S.autoRead&&hasTTS)setTimeout(function(){S._shouldStop=false;speakQuestion();},350);}
+    if(!S.panelCollapsed&&S.autoRead&&hasTTS)setTimeout(function(){S._shouldStop=false;speakQuestion();},350);}
   else{hardStop();stopSTT();}
 }
 
@@ -718,7 +747,7 @@ function onNewQuestion(){
   S.currentIdx=Q.idx;S.pendingAnswer=null;S.charIdx=0;S.fullText=buildFull();
   var conf=$('sf-vep-confirm');if(conf)conf.style.display='none';
   syncQLabel();updateProg();
-  if(S.panelOpen&&S.autoRead&&hasTTS){
+  if(S.panelOpen&&!S.panelCollapsed&&S.autoRead&&hasTTS){
     setTimeout(function(){S._shouldStop=false;hardStop();speakQuestion();},420);}
 }
 

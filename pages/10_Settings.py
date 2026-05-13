@@ -10,8 +10,11 @@ import sqlite3
 import hashlib
 
 from src.auth     import require_login
-from src.utils    import page_header, sidebar_nav
-from src.database import get_all_settings, set_setting, get_connection, DB_PATH
+from src.utils    import page_header, sidebar_nav, get_effective_admin
+from src.database import (
+    get_all_settings, set_setting, get_connection, DB_PATH,
+    get_app_settings, set_app_setting,
+)
 
 st.set_page_config(page_title="Settings · StudyForge", page_icon="⚙️", layout="wide")
 
@@ -21,6 +24,7 @@ sidebar_nav(username)
 page_header("⚙️ Settings", "Configure difficulty, timing, and your account")
 
 settings = get_all_settings(user_id)
+real_admin, admin = get_effective_admin(user_id)
 
 tab_general, tab_hard, tab_account, tab_backup = st.tabs(
     ["🎛 General", "⚡ Hard Mode", "👤 Account", "💾 Backup"]
@@ -119,6 +123,49 @@ with tab_account:
     from src.auth import SECURITY_QUESTIONS, save_security_question
 
     st.markdown(f"### Account: `{username}`")
+
+    if admin:
+        st.markdown("#### Resource Discovery Integrations")
+        st.caption(
+            "These app-wide keys are used by admins to find course videos and articles. "
+            "Learners cannot see or edit them."
+        )
+        integration_keys = [
+            "youtube_api_key",
+            "google_custom_search_api_key",
+            "google_custom_search_engine_id",
+        ]
+        app_settings = get_app_settings(integration_keys)
+        with st.form("resource_discovery_integrations"):
+            youtube_key = st.text_input(
+                "YouTube Data API key",
+                value=app_settings.get("youtube_api_key", ""),
+                type="password",
+                help="Used for YouTube video search and duration metadata.",
+            )
+            google_key = st.text_input(
+                "Google Custom Search API key",
+                value=app_settings.get("google_custom_search_api_key", ""),
+                type="password",
+                help="Used for article discovery.",
+            )
+            google_cx = st.text_input(
+                "Google Custom Search Engine ID",
+                value=app_settings.get("google_custom_search_engine_id", ""),
+                help="The Programmable Search Engine ID (cx).",
+            )
+            save_integrations = st.form_submit_button(
+                "Save Integration Settings",
+                use_container_width=True,
+            )
+
+        if save_integrations:
+            set_app_setting("youtube_api_key", youtube_key.strip())
+            set_app_setting("google_custom_search_api_key", google_key.strip())
+            set_app_setting("google_custom_search_engine_id", google_cx.strip())
+            st.success("Integration settings saved.")
+
+        st.divider()
 
     # Change password
     st.markdown("#### 🔑 Change Password")
