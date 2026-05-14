@@ -10,7 +10,6 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from src.database import init_database
 from src.auth     import (
@@ -54,7 +53,7 @@ def main():
     restore_session_from_cookie()
     if cookie_load_is_pending() and not st.session_state.get("_sf_waited_for_cookie_load"):
         st.session_state["_sf_waited_for_cookie_load"] = True
-        st_autorefresh(interval=300, limit=1, key="home_auth_cookie_load_refresh")
+        st.rerun()
         st.stop()
 
     if not is_logged_in():

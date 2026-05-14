@@ -22,7 +22,6 @@ import hashlib
 from datetime import datetime, timedelta
 
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 from src.database import (
     create_user, get_user_by_username,
@@ -145,7 +144,7 @@ def require_login() -> int:
     if not is_logged_in():
         if cookie_load_is_pending() and not st.session_state.get(COOKIE_LOAD_WAIT_KEY):
             st.session_state[COOKIE_LOAD_WAIT_KEY] = True
-            st_autorefresh(interval=300, limit=1, key="auth_cookie_load_refresh")
+            st.rerun()
             st.stop()
         st.warning("Please log in from the Home page.")
         st.stop()
@@ -278,7 +277,7 @@ def login_register_form() -> None:
             ok, msg = login_user(uname, pwd)
             if ok:
                 st.success(msg)
-                st_autorefresh(interval=300, limit=1, key="post_login_refresh")
+                st.rerun()
                 st.stop()
             else:
                 st.error(msg)
