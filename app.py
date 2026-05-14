@@ -112,8 +112,8 @@ def main():
             _, eff_adm = get_effective_admin(user_id)
             if eff_adm:
                 st.info(
-                    "🔑 You are an **admin**. You can create courses, upload question banks, "
-                    "and add materials in **Course Manager** and **Question Bank Manager**."
+                    "🔑 You are an **admin**. You can upload question banks and "
+                    "add materials for the active course."
                 )
 
         st.markdown(
@@ -123,11 +123,10 @@ def main():
         st.markdown("Use the **sidebar** to navigate.")
         st.divider()
 
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3 = st.columns(3)
         col1.info("📊 **Dashboard**\nYour private progress per course")
-        col2.info("📚 **Course Manager**\nBrowse & enroll in courses")
-        col3.info("📖 **Course Materials**\nShared readings & videos")
-        col4.info("🗂 **Question Bank**\nShared questions per course")
+        col2.info("📖 **Course Materials**\nShared readings & videos")
+        col3.info("🗂 **Question Bank**\nShared questions per course")
 
         st.markdown("")
         col5, col6, col7, col8 = st.columns(4)

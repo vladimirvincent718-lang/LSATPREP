@@ -23,7 +23,7 @@ course_id = course_selector(user_id)
 
 if course_id is None:
     page_header("📊 Dashboard", "Your performance at a glance")
-    st.info("Create a course in **Course Manager** to start tracking your progress.")
+    st.info("Choose an active course from the sidebar to start tracking your progress.")
     st.stop()
 
 from src.database import get_course

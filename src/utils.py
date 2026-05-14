@@ -700,7 +700,7 @@ def course_selector(user_id: int, label: str = "📚 Active Course") -> int | No
     if not enrolled:
         with st.sidebar:
             st.warning("Not enrolled in any courses.")
-            st.caption("Go to **Course Manager** to enroll.")
+            st.caption("No active courses are available for your account yet.")
         return None
 
     options    = {c["id"]: c["title"] for c in enrolled}
@@ -736,7 +736,7 @@ def require_course(user_id: int) -> int:
     if cid is None:
         st.warning(
             "You are not enrolled in any courses yet. "
-            "Go to **Course Manager** in the sidebar to browse and enroll."
+            "No active courses are available for your account yet."
         )
         st.stop()
     return cid

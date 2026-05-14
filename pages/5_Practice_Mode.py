@@ -8,9 +8,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import streamlit as st
 
 from src.auth         import require_login
-from src.utils        import (page_header, sidebar_nav, require_course,
+from src.utils        import (page_header, sidebar_nav,
                                render_question, render_score_card, DIFFICULTY_LABELS)
-from src.database     import get_all_questions, get_all_settings, get_distinct_values, get_course
+from src.database     import (
+    get_all_questions, get_all_settings, get_distinct_values,
+    get_enrolled_courses, get_course_question_count,
+)
 from src.exam_engine  import (
     start_quiz, clear_quiz, is_active, current_question, next_question,
     prev_question, record_answer, submit_section, _st, _set, _K,
@@ -23,12 +26,24 @@ user_id  = require_login()
 username = st.session_state.get("username", "")
 sidebar_nav(username)
 
-from src.utils import course_selector
-course_id    = require_course(user_id)
-course       = get_course(course_id)
-course_title = course["title"] if course else "Unknown"
+enrolled_courses = get_enrolled_courses(user_id)
+if not enrolled_courses:
+    st.warning(
+        "You are not enrolled in any courses yet. "
+        "Choose an active course from the sidebar first."
+    )
+    st.stop()
 
-page_header("✏️ Practice Mode", f"Drill questions at your own pace — {course_title}")
+course_titles = {c["id"]: c["title"] for c in enrolled_courses}
+course_counts = {c["id"]: get_course_question_count(c["id"]) for c in enrolled_courses}
+active_course_id = st.session_state.get("active_course_id")
+default_course_ids = (
+    [active_course_id]
+    if active_course_id in course_titles
+    else [enrolled_courses[0]["id"]]
+)
+
+page_header("✏️ Practice Mode", "Drill questions at your own pace")
 
 settings  = get_all_settings(user_id)
 hard_mode = settings.get("hard_mode", "false") == "true"
@@ -38,17 +53,26 @@ show_exp  = settings.get("show_explanations", "always")
 if not is_active():
     st.subheader("Set Up Your Practice Session")
 
-    # Get section/question types specific to this course
-    course_sections = get_distinct_values("section_type", course_id=course_id)
-    course_qtypes   = get_distinct_values("question_type", course_id=course_id)
+    selected_course_ids = st.multiselect(
+        "Courses",
+        options=list(course_titles.keys()),
+        default=default_course_ids,
+        format_func=lambda cid: f"{course_titles[cid]} ({course_counts.get(cid, 0)} Q)",
+        help="Type to search, then select one or more courses for this practice session.",
+    )
 
-    section_opts = ["All"] + (course_sections if course_sections else [])
-    qtype_opts   = ["All"] + (course_qtypes   if course_qtypes   else [])
+    selected_course_ids = [cid for cid in selected_course_ids if cid in course_titles]
+    course_qtypes = sorted({
+        val
+        for cid in selected_course_ids
+        for val in get_distinct_values("question_type", course_id=cid)
+    })
+
+    qtype_opts = ["All"] + course_qtypes
 
     with st.form("practice_setup"):
         col1, col2 = st.columns(2)
         with col1:
-            section_filter = st.selectbox("Section Type", section_opts)
             qtype_filter   = st.selectbox("Question Type", qtype_opts)
         with col2:
             diff_min    = st.slider("Min Difficulty", 1, 5, 1)
@@ -68,23 +92,31 @@ if not is_active():
         submitted = st.form_submit_button("▶ Start Practice", use_container_width=True)
 
     if submitted:
-        pool = get_all_questions(
-            section_type=None  if section_filter == "All" else section_filter,
-            question_type=None if qtype_filter   == "All" else qtype_filter,
-            min_difficulty=diff_min,
-            max_difficulty=diff_max,
-            course_id=course_id,
-        )
+        if not selected_course_ids:
+            st.error("Select at least one course for practice.")
+            st.stop()
+
+        pool = []
+        for cid in selected_course_ids:
+            pool.extend(get_all_questions(
+                question_type=None if qtype_filter   == "All" else qtype_filter,
+                min_difficulty=diff_min,
+                max_difficulty=diff_max,
+                course_id=cid,
+            ))
+
         if not pool:
+            selected_names = ", ".join(course_titles[cid] for cid in selected_course_ids)
             st.error(
-                f"No questions match those filters in **{course_title}**. "
+                f"No questions match those filters in **{selected_names}**. "
                 "Upload more questions or adjust your filters."
             )
             st.stop()
 
+        attempt_course_id = selected_course_ids[0] if len(selected_course_ids) == 1 else None
         if use_weakness:
             questions = get_weakness_weighted_questions(
-                user_id, pool, n=int(n_questions), course_id=course_id
+                user_id, pool, n=int(n_questions), course_id=attempt_course_id
             )
         else:
             import random
@@ -96,10 +128,10 @@ if not is_active():
             user_id=user_id,
             mode="practice",
             questions=questions,
-            section_type=section_filter,
+            section_type="All",
             hard_mode=hard_mode,
             time_limit_seconds=time_limit,
-            course_id=course_id,
+            course_id=attempt_course_id,
         )
         st.session_state["practice_instant_fb"] = (show_exp == "always")
         st.rerun()

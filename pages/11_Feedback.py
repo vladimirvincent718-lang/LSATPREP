@@ -44,7 +44,7 @@ page_header("💬 Feedback & Suggestions",
 # effective_admin → controls whether the Admin Panel tab is *visible* in the UI
 real_admin, effective_admin = get_effective_admin(user_id)
 FEEDBACK_TYPES  = ["Bug", "Feature Request", "Improvement", "Content Issue", "Other"]
-AREAS           = ["", "Dashboard", "Course Manager", "Curriculum Builder",
+AREAS           = ["", "Dashboard", "Curriculum Builder",
                    "Course Materials", "Question Bank", "Practice Mode",
                    "Timed Exam", "Full Exam", "Curriculum Exam",
                    "Score History", "Review Mistakes", "Settings", "Other"]
