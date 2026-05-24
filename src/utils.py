@@ -3,10 +3,17 @@ utils.py — Shared UI helpers, course selector, and small utilities.
 """
 
 from __future__ import annotations
+from html import escape
 import streamlit as st
 import streamlit.components.v1 as _components
 
-DIFFICULTY_LABELS = {1: "Easy", 2: "Medium-Easy", 3: "Medium", 4: "Hard", 5: "Brutal"}
+DIFFICULTY_LABELS = {
+    1: "Intuition & Estimation",
+    2: "Beginner Calculations",
+    3: "Intermediate Calculations",
+    4: "Advanced Calculations",
+    5: "Stretch Problems",
+}
 ANSWER_LETTERS    = ["A", "B", "C", "D", "E"]
 
 SECTION_TYPES  = ["Logical Reasoning", "Reading Comprehension"]
@@ -359,14 +366,14 @@ _FEEDBACK_BTN_CSS = """
 }
 
 #sf-feedback-fab-container button {
-    background: linear-gradient(135deg, #FFB000 0%, #FF6B00 100%) !important;
+    background: linear-gradient(135deg, #1D4ED8 0%, #0F766E 100%) !important;
     color: #ffffff !important;
     border: 1px solid rgba(255,255,255,0.42) !important;
     border-radius: 50px !important;
     padding: 10px 20px !important;
     font-size: 14px !important;
     font-weight: 700 !important;
-    box-shadow: 0 6px 20px rgba(255,107,0,0.42), 0 2px 8px rgba(0,0,0,0.18) !important;
+    box-shadow: 0 6px 20px rgba(29,78,216,0.42), 0 2px 8px rgba(0,0,0,0.18) !important;
     cursor: pointer !important;
     white-space: nowrap !important;
     letter-spacing: 0 !important;
@@ -375,14 +382,14 @@ _FEEDBACK_BTN_CSS = """
 }
 
 #sf-feedback-fab-container button:hover {
-    background: linear-gradient(135deg, #FFC233 0%, #FF7A1A 100%) !important;
-    box-shadow: 0 8px 26px rgba(255,107,0,0.52), 0 4px 12px rgba(0,0,0,0.20) !important;
+    background: linear-gradient(135deg, #2563EB 0%, #14B8A6 100%) !important;
+    box-shadow: 0 8px 26px rgba(29,78,216,0.52), 0 4px 12px rgba(0,0,0,0.20) !important;
     transform: translateY(-2px) !important;
 }
 
 #sf-feedback-fab-container button:active {
     transform: translateY(0) scale(0.98) !important;
-    box-shadow: 0 3px 12px rgba(255,107,0,0.45), 0 1px 5px rgba(0,0,0,0.18) !important;
+    box-shadow: 0 3px 12px rgba(29,78,216,0.45), 0 1px 5px rgba(0,0,0,0.18) !important;
 }
 
 /* Pin the element-container that wraps the FAB button */
@@ -400,14 +407,14 @@ _FEEDBACK_BTN_CSS = """
 /* Style the button itself */
 [data-testid="element-container"]:has(#sf-feedback-fab-marker)
   + [data-testid="element-container"] button {
-    background: linear-gradient(135deg, #FFB000 0%, #FF6B00 100%) !important;
+    background: linear-gradient(135deg, #1D4ED8 0%, #0F766E 100%) !important;
     color: #ffffff !important;
     border: 1px solid rgba(255,255,255,0.42) !important;
     border-radius: 50px !important;
     padding: 10px 20px !important;
     font-size: 14px !important;
     font-weight: 700 !important;
-    box-shadow: 0 6px 20px rgba(255,107,0,0.42), 0 2px 8px rgba(0,0,0,0.18) !important;
+    box-shadow: 0 6px 20px rgba(29,78,216,0.42), 0 2px 8px rgba(0,0,0,0.18) !important;
     cursor: pointer !important;
     white-space: nowrap !important;
     letter-spacing: 0 !important;
@@ -416,14 +423,14 @@ _FEEDBACK_BTN_CSS = """
 }
 [data-testid="element-container"]:has(#sf-feedback-fab-marker)
   + [data-testid="element-container"] button:hover {
-    background: linear-gradient(135deg, #FFC233 0%, #FF7A1A 100%) !important;
-    box-shadow: 0 8px 26px rgba(255,107,0,0.52), 0 4px 12px rgba(0,0,0,0.20) !important;
+    background: linear-gradient(135deg, #2563EB 0%, #14B8A6 100%) !important;
+    box-shadow: 0 8px 26px rgba(29,78,216,0.52), 0 4px 12px rgba(0,0,0,0.20) !important;
     transform: translateY(-2px) !important;
 }
 [data-testid="element-container"]:has(#sf-feedback-fab-marker)
   + [data-testid="element-container"] button:active {
     transform: translateY(0) scale(0.98) !important;
-    box-shadow: 0 3px 12px rgba(255,107,0,0.45), 0 1px 5px rgba(0,0,0,0.18) !important;
+    box-shadow: 0 3px 12px rgba(29,78,216,0.45), 0 1px 5px rgba(0,0,0,0.18) !important;
 }
 
 /* Hide the sidebar auto-generated Feedback entry */
@@ -440,9 +447,9 @@ _FEEDBACK_BTN_CSS = """
     padding: 10px 20px !important;
     border: 1px solid rgba(255,255,255,0.42) !important;
     border-radius: 999px !important;
-    background: linear-gradient(135deg, #FFB000 0%, #FF6B00 100%) !important;
+    background: linear-gradient(135deg, #1D4ED8 0%, #0F766E 100%) !important;
     color: #ffffff !important;
-    box-shadow: 0 6px 20px rgba(255,107,0,0.42), 0 2px 8px rgba(0,0,0,0.18) !important;
+    box-shadow: 0 6px 20px rgba(29,78,216,0.42), 0 2px 8px rgba(0,0,0,0.18) !important;
     cursor: pointer !important;
     font: 700 14px/1.2 sans-serif !important;
     letter-spacing: 0 !important;
@@ -451,14 +458,14 @@ _FEEDBACK_BTN_CSS = """
 }
 
 #sf-feedback-fab:hover {
-    background: linear-gradient(135deg, #FFC233 0%, #FF7A1A 100%) !important;
-    box-shadow: 0 8px 26px rgba(255,107,0,0.52), 0 4px 12px rgba(0,0,0,0.20) !important;
+    background: linear-gradient(135deg, #2563EB 0%, #14B8A6 100%) !important;
+    box-shadow: 0 8px 26px rgba(29,78,216,0.52), 0 4px 12px rgba(0,0,0,0.20) !important;
     transform: translateY(-2px) !important;
 }
 
 #sf-feedback-fab:active {
     transform: translateY(0) scale(0.98) !important;
-    box-shadow: 0 3px 12px rgba(255,107,0,0.45), 0 1px 5px rgba(0,0,0,0.18) !important;
+    box-shadow: 0 3px 12px rgba(29,78,216,0.45), 0 1px 5px rgba(0,0,0,0.18) !important;
 }
 
 #sf-feedback-fab:focus-visible {
@@ -626,13 +633,25 @@ def get_effective_admin(user_id: int) -> tuple[bool, bool]:
 
 # ── Page chrome ───────────────────────────────────────────────────────────────
 def page_header(title: str, subtitle: str = "") -> None:
-    st.markdown(f"## {title}")
-    if subtitle:
-        st.caption(subtitle)
-    st.divider()
+    safe_title = escape(title)
+    safe_subtitle = escape(subtitle)
+    subtitle_html = f'<p class="sf-page-subtitle">{safe_subtitle}</p>' if subtitle else ""
+    st.markdown(
+        f"""
+<section class="sf-page-header">
+  <p class="sf-page-eyebrow">StudyForge</p>
+  <h1 class="sf-page-title">{safe_title}</h1>
+  {subtitle_html}
+</section>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 def sidebar_nav(username: str) -> None:
+    from src.ui_theme import inject_modern_theme
+
+    inject_modern_theme()
     inject_sidebar_page_labels()
     # Inject collapsible-sidebar (CSS via markdown, JS via iframe component)
     _inject_sidebar_toggle()
@@ -750,7 +769,11 @@ def render_question(
     selected: str = "",
     show_answer: bool = False,
     is_flagged: bool = False,
+    auto_expand_answer: bool = False,
 ) -> str | None:
+    from src.question_loader import is_open_ended_question
+
+    review_state = q.get("_smart_review_state") or {}
     correct = (q.get("correct_answer") or "").upper()
     choices = {
         k: q.get(f"choice_{k.lower()}", "")
@@ -761,22 +784,115 @@ def render_question(
     col_l, col_r = st.columns([5, 1])
     with col_l:
         diff = q.get("difficulty", 3)
-        st.caption(
-            f"Question {idx + 1} of {total}  ·  "
-            f"{q.get('section_type', '')}  ·  "
-            f"{q.get('question_type', '')}  ·  "
+        meta = (
+            f"Question {idx + 1} of {total} | "
+            f"{q.get('section_type', '')} | "
+            f"{q.get('question_type', '')} | "
             f"Difficulty: {DIFFICULTY_LABELS.get(diff, diff)}"
         )
+        st.markdown(
+            f'<div class="sf-question-meta">{escape(meta)}</div>',
+            unsafe_allow_html=True,
+        )
+        if review_state:
+            review_bits = [
+                f"seen {int(review_state.get('times_seen') or 0)}x",
+                f"misses {int(review_state.get('misses') or 0)}",
+                f"streak {int(review_state.get('correct_streak') or 0)}",
+                f"mastery {int(review_state.get('mastery_level') or 0)}/5",
+            ]
+            st.info(
+                "Smart Review Queue: this question is returning from your prior "
+                f"work ({', '.join(review_bits)})."
+            )
     with col_r:
         flag_label = "🚩 Flagged" if is_flagged else "🏳️ Flag"
         st.button(flag_label, key=f"flag_btn_{idx}", on_click=_flag_cb, args=(idx,))
+        report_key = f"question_report_open_{q.get('id', idx)}_{idx}"
+        if st.button("Report Issue", key=f"report_issue_btn_{idx}"):
+            st.session_state[report_key] = True
+
+    if st.session_state.get(report_key):
+        issue_types = [
+            "Incorrect answer key",
+            "Bad explanation",
+            "Weak or mismatched answer choices",
+            "Typo or formatting issue",
+            "Ambiguous wording",
+            "Wrong category/type",
+            "Passage or answer choice missing",
+            "Other",
+        ]
+        with st.form(f"question_report_form_{q.get('id', idx)}_{idx}"):
+            st.markdown("**Report Issue**")
+            issue_type = st.selectbox("Issue type", issue_types)
+            note = st.text_area(
+                "Optional note",
+                placeholder="Example: I think B and D both work here.",
+                height=90,
+            )
+            form_cols = st.columns(2)
+            submit_report = form_cols[0].form_submit_button(
+                "Submit Report", type="primary", use_container_width=True
+            )
+            cancel_report = form_cols[1].form_submit_button(
+                "Cancel", use_container_width=True
+            )
+        if submit_report:
+            from src.database import create_question_issue_report
+
+            report_id, err = create_question_issue_report(
+                user_id=st.session_state.get("user_id"),
+                question_id=q.get("id"),
+                attempt_id=st.session_state.get("exam_attempt_id"),
+                issue_type=issue_type,
+                note=note,
+                selected_answer=selected or "",
+                mode=st.session_state.get("exam_mode", ""),
+            )
+            if err:
+                st.error(f"Could not save report: {err}")
+            else:
+                st.session_state.pop(report_key, None)
+                st.success(f"Report submitted. Reference #{report_id}.")
+                st.rerun()
+        if cancel_report:
+            st.session_state.pop(report_key, None)
+            st.rerun()
 
     if q.get("passage"):
         with st.expander("📖 Read Passage", expanded=True):
             st.markdown(q["passage"])
 
-    st.markdown(f"**{q.get('stimulus', '')}**")
-    st.markdown("")
+    st.markdown(
+        f'<div class="sf-stimulus-card">{escape(str(q.get("stimulus", "")))}</div>',
+        unsafe_allow_html=True,
+    )
+
+    if is_open_ended_question(q):
+        sample_answer = str(q.get("_sample_answer") or "").strip()
+        if not sample_answer and correct in choices:
+            sample_answer = str(choices.get(correct) or "").strip()
+        if not sample_answer:
+            sample_answer = str(q.get("correct_answer") or "").strip()
+        if show_answer:
+            if selected:
+                st.markdown("**Your response:**")
+                st.info(selected)
+            if sample_answer:
+                with st.expander("Sample answer / rubric", expanded=auto_expand_answer):
+                    st.success(sample_answer)
+            if q.get("explanation"):
+                with st.expander("Explanation", expanded=auto_expand_answer):
+                    st.info(q["explanation"])
+            return selected
+
+        return st.text_area(
+            "Write your answer:",
+            value=selected or "",
+            height=180,
+            key=f"q_open_ended_{idx}",
+        ).strip()
 
     option_keys = list(choices.keys())
 
@@ -791,7 +907,7 @@ def render_question(
             else:
                 st.write(f"**{letter}.** {text}")
         if q.get("explanation"):
-            with st.expander("💡 Explanation"):
+            with st.expander("💡 Explanation", expanded=auto_expand_answer):
                 st.info(q["explanation"])
                 for letter in ["A", "B", "C", "D", "E"]:
                     note = q.get(f"wrong_answer_{letter.lower()}", "")
@@ -817,7 +933,10 @@ def _flag_cb(idx: int) -> None:
 
 # ── Score display ─────────────────────────────────────────────────────────────
 def render_score_card(report: dict, title: str = "Score Report") -> None:
-    st.markdown(f"### {title}")
+    st.markdown(
+        f'<section class="sf-score-shell"><h2 class="sf-score-title">{escape(title)}</h2></section>',
+        unsafe_allow_html=True,
+    )
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Raw Score",   f"{report['correct']} / {report['total']}")
     c2.metric("% Correct",   f"{report['percent_correct']}%")
@@ -838,7 +957,47 @@ def render_score_card(report: dict, title: str = "Score Report") -> None:
 
 
 # ── Timer bar ─────────────────────────────────────────────────────────────────
-def render_timer(seconds: float, total_seconds: float) -> None:
+def render_timer(
+    seconds: float,
+    total_seconds: float,
+    key_prefix: str = "exam_timer",
+    allow_pause: bool = True,
+) -> None:
+    from src.exam_engine import (
+        is_timer_paused, is_timer_visible,
+        toggle_timer_pause, toggle_timer_visibility,
+    )
+
     pct  = max(0.0, min(1.0, seconds / total_seconds)) if total_seconds else 0
     m, s = divmod(int(seconds), 60)
-    st.progress(pct, text=f"⏱ {m:02d}:{s:02d} remaining")
+    paused = is_timer_paused()
+    visible = is_timer_visible()
+
+    c_time, c_show, c_pause = st.columns([4, 1, 1])
+    with c_time:
+        if visible:
+            suffix = "paused" if paused else "remaining"
+            st.markdown(
+                f'<div class="sf-timer-card"><div class="sf-timer-label">{m:02d}:{s:02d} {suffix}</div></div>',
+                unsafe_allow_html=True,
+            )
+            st.progress(pct)
+        else:
+            st.caption("Timer hidden. You can turn it back on from any question.")
+    with c_show:
+        show_label = "Hide Timer" if visible else "Show Timer"
+        if st.button(show_label, key=f"{key_prefix}_show", use_container_width=True):
+            toggle_timer_visibility()
+            st.rerun()
+    with c_pause:
+        pause_label = "Resume Timer" if paused else "Pause Timer"
+        if st.button(
+            pause_label,
+            key=f"{key_prefix}_pause",
+            use_container_width=True,
+            disabled=not allow_pause,
+        ):
+            toggle_timer_pause()
+            st.rerun()
+        if not allow_pause:
+            st.caption("Hard Mode")

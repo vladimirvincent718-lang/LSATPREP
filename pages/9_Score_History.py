@@ -12,6 +12,7 @@ import io
 
 from src.auth      import require_login
 from src.utils     import page_header, sidebar_nav, require_course
+from src.ui_theme  import apply_plotly_theme
 from src.analytics import get_score_history
 from src.database  import get_attempt_answers, get_course
 
@@ -54,6 +55,7 @@ fig = px.line(
     markers=True, labels={"Date": "Date", "% Correct": "% Correct"},
 )
 fig.update_layout(yaxis_range=[0, 100], margin=dict(l=0, r=0, t=20, b=0))
+apply_plotly_theme(fig)
 fig.add_hline(y=75, line_dash="dot", line_color="orange", annotation_text="75% target")
 st.plotly_chart(fig, use_container_width=True)
 
@@ -68,6 +70,7 @@ with col_a:
     mode_counts.columns = ["Mode", "Count"]
     fig2 = px.pie(mode_counts, names="Mode", values="Count", hole=0.4)
     fig2.update_layout(margin=dict(l=0, r=0, t=10, b=0))
+    apply_plotly_theme(fig2)
     st.plotly_chart(fig2, use_container_width=True)
 
 with col_b:
@@ -75,6 +78,7 @@ with col_b:
     fig3 = px.histogram(df, x="% Correct", nbins=10,
                         labels={"% Correct": "% Correct", "count": "Sessions"})
     fig3.update_layout(margin=dict(l=0, r=0, t=10, b=0))
+    apply_plotly_theme(fig3)
     st.plotly_chart(fig3, use_container_width=True)
 
 st.divider()

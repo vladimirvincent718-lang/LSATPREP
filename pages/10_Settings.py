@@ -10,7 +10,7 @@ import sqlite3
 import hashlib
 
 from src.auth     import require_login
-from src.utils    import page_header, sidebar_nav, get_effective_admin
+from src.utils    import page_header, sidebar_nav, get_effective_admin, DIFFICULTY_LABELS
 from src.database import (
     get_all_settings, set_setting, get_connection, DB_PATH,
     get_app_settings, set_app_setting,
@@ -47,6 +47,7 @@ with tab_general:
                 int(settings.get("min_difficulty", "1")),
                 int(settings.get("max_difficulty", "5")),
             ),
+            format_func=lambda x: f"{x} - {DIFFICULTY_LABELS.get(x, x)}",
         )
         show_exp = st.selectbox(
             "Show Explanations",
@@ -64,7 +65,14 @@ with tab_general:
             "Default Question Mix",
             options=["balanced", "weakness"],
             index=0 if settings.get("question_mix", "balanced") == "balanced" else 1,
-            help="Weakness mode prioritises your weakest question types.",
+            format_func=lambda value: {
+                "balanced": "Balanced",
+                "weakness": "Smart Review Queue",
+            }.get(value, value),
+            help=(
+                "Smart Review Queue brings missed or due questions back sooner "
+                "and spaces them out after repeated correct answers."
+            ),
         )
         save_general = st.form_submit_button("💾 Save General Settings",
                                               use_container_width=True)
@@ -97,7 +105,7 @@ with tab_hard:
         st.markdown("**What Hard Mode does:**")
         st.markdown("""
         - ⏱ Shorter timer (set above)
-        - 💪 Biases toward difficulty 4–5 questions
+        - 💪 Biases toward Advanced Calculations and Stretch Problems
         - 🚫 Disables the Quit button during timed sessions
         - 🔒 Hides explanations until the section is submitted
         """)

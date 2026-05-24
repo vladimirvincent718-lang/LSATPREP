@@ -608,7 +608,7 @@ with col_preview:
       <!-- Main content -->
       <div class="sf-main main">
         <div class="sf-page-title">📊 Dashboard</div>
-        <div class="sf-page-sub">Course: LSAT Master Class</div>
+        <div class="sf-page-sub">Course: Biology Foundations</div>
         <div class="sf-divider"></div>
 
         <!-- KPI Grid -->

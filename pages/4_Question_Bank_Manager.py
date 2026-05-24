@@ -4,9 +4,10 @@ All enrolled users can browse questions.
 Only admins can upload or delete questions.
 
 Changes in this version:
-  - Upload summary now shows: rows read, valid, inserted, skipped-by-ID,
+  - Upload summary now shows: rows read, valid, inserted, skipped-by-generated-ID,
     skipped-by-content (identical question, different ID), invalid rows, errors.
   - Content-hash duplicate detection flags questions with identical text.
+  - Uploaded question_id values are ignored; course-scoped IDs are generated.
 """
 
 import sys, os
@@ -15,6 +16,43 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import streamlit as st
 import pandas as pd
 import io
+import re
+from datetime import datetime
+
+
+def _clean_module_label(value: str) -> str:
+    label = " ".join(str(value or "").split())
+    return label or "Unassigned"
+
+
+def _module_sort_key(label: str) -> tuple[int, int, str]:
+    match = re.search(r"\b(?:module|week|unit|lesson|chapter)\s*#?\s*(\d+)", label, re.I)
+    if match:
+        return (0, int(match.group(1)), label.lower())
+    if label == "Unassigned":
+        return (2, 0, label.lower())
+    return (1, 0, label.lower())
+
+
+def _question_bank_analytics_rows(selected_course_ids: list[int],
+                                  course_titles: dict[int, str]) -> list[dict]:
+    rows = []
+    for cid in selected_course_ids:
+        saved_modules = [_clean_module_label(m.get("name", "")) for m in get_course_modules(cid)]
+        questions_for_course = get_all_questions(course_id=cid)
+
+        counts: dict[str, int] = {module_name: 0 for module_name in saved_modules}
+        for q in questions_for_course:
+            module_name = _clean_module_label(q.get("section_type", ""))
+            counts[module_name] = counts.get(module_name, 0) + 1
+
+        for module_name in sorted(counts, key=_module_sort_key):
+            rows.append({
+                "Course": course_titles.get(cid, ""),
+                "Module": module_name,
+                "Question Count": counts[module_name],
+            })
+    return rows
 
 from src.auth            import require_login
 from src.utils           import page_header, sidebar_nav, require_course, DIFFICULTY_LABELS, get_effective_admin
@@ -22,8 +60,16 @@ from src.database        import (
     get_all_questions, get_course_question_count, delete_question,
     bulk_delete_questions,
     get_distinct_values, get_course, is_admin, get_all_courses,
+    get_enrolled_courses, get_course_modules,
+    QUESTION_REPORT_STATUSES, get_question_issue_metrics,
+    get_question_issue_reports, update_question_issue_report,
 )
-from src.question_loader import process_upload, make_template_csv
+from src.question_loader import (
+    process_upload,
+    make_template_csv,
+    make_template_xlsx,
+    is_open_ended_question,
+)
 
 st.set_page_config(page_title="Question Bank · StudyForge",
                    page_icon="🗂", layout="wide")
@@ -38,27 +84,57 @@ course_title = course["title"] if course else "Unknown"
 real_admin, admin = get_effective_admin(user_id)
 
 page_header("🗂 Question Bank Manager",
-            f"Shared questions — Course: {course_title}")
+            "Shared questions across active courses")
 
 # ── Build tabs based on role ──────────────────────────────────────────────────
 if admin:
-    tab_browse, tab_upload, tab_template = st.tabs(
-        ["🔎 Browse Questions", "⬆️ Upload CSV", "📄 Download Template"]
+    tab_browse, tab_reports, tab_upload, tab_template = st.tabs(
+        ["🔎 Browse Questions", "Report Issues", "⬆️ Upload Files", "📄 Download Template"]
     )
 else:
     tab_browse, tab_template = st.tabs(
         ["🔎 Browse Questions", "📄 Download Template"]
     )
     tab_upload = None
+    tab_reports = None
 
 
 # ── Tab: Browse ───────────────────────────────────────────────────────────────
 with tab_browse:
-    total = get_course_question_count(course_id)
-    st.metric(f"Questions in {course_title}", total)
+    browse_courses = get_all_courses() if admin else get_enrolled_courses(user_id)
+    course_titles = {c["id"]: c["title"] for c in browse_courses}
+    course_counts = {c["id"]: get_course_question_count(c["id"]) for c in browse_courses}
+    default_course_ids = (
+        [course_id]
+        if course_id in course_titles
+        else ([browse_courses[0]["id"]] if browse_courses else [])
+    )
+
+    selected_course_ids = st.multiselect(
+        "Active Courses",
+        options=list(course_titles.keys()),
+        default=default_course_ids,
+        format_func=lambda cid: f"{course_titles[cid]} ({course_counts.get(cid, 0)} Q)",
+        help="Type to search, then select one or more courses to browse.",
+        key="qbm_browse_courses",
+    )
+    selected_course_ids = [cid for cid in selected_course_ids if cid in course_titles]
+
+    if not selected_course_ids:
+        st.warning("Select at least one active course to browse its question bank.")
+        st.stop()
+
+    total = sum(course_counts.get(cid, 0) for cid in selected_course_ids)
+    metric_label = (
+        f"Questions in {course_titles[selected_course_ids[0]]}"
+        if len(selected_course_ids) == 1
+        else "Questions in selected courses"
+    )
+    st.metric(metric_label, total)
 
     if total == 0:
-        msg = f"No questions in **{course_title}** yet."
+        selected_names = ", ".join(course_titles[cid] for cid in selected_course_ids)
+        msg = f"No questions in **{selected_names}** yet."
         if admin:
             msg += " Use the **Upload CSV** tab above to add questions."
         else:
@@ -70,22 +146,43 @@ with tab_browse:
         # ── Filters ───────────────────────────────────────────────────────────
         col1, col2, col3 = st.columns(3)
         with col1:
-            sec_opts = ["All"] + get_distinct_values("section_type", course_id=course_id)
+            sec_opts = ["All"] + sorted({
+                val
+                for cid in selected_course_ids
+                for val in get_distinct_values("section_type", course_id=cid)
+            })
             f_sec    = st.selectbox("Section Type", sec_opts, key="b_sec")
         with col2:
-            type_opts = ["All"] + get_distinct_values("question_type", course_id=course_id)
+            type_opts = ["All"] + sorted({
+                val
+                for cid in selected_course_ids
+                for val in get_distinct_values("question_type", course_id=cid)
+            })
             f_type    = st.selectbox("Question Type", type_opts, key="b_type")
         with col3:
             d_min, d_max = st.select_slider(
-                "Difficulty Range", options=[1,2,3,4,5], value=(1,5), key="b_diff"
+                "Difficulty Range",
+                options=[1,2,3,4,5],
+                value=(1,5),
+                format_func=lambda x: f"{x} - {DIFFICULTY_LABELS.get(x, x)}",
+                key="b_diff",
             )
 
-        questions = get_all_questions(
-            section_type=None  if f_sec  == "All" else f_sec,
-            question_type=None if f_type == "All" else f_type,
-            min_difficulty=d_min,
-            max_difficulty=d_max,
-            course_id=course_id,
+        questions = []
+        for cid in selected_course_ids:
+            questions.extend(get_all_questions(
+                section_type=None  if f_sec  == "All" else f_sec,
+                question_type=None if f_type == "All" else f_type,
+                min_difficulty=d_min,
+                max_difficulty=d_max,
+                course_id=cid,
+            ))
+        questions.sort(
+            key=lambda q: (
+                course_titles.get(q.get("course_id"), ""),
+                q.get("question_id") or "",
+                q.get("id") or 0,
+            )
         )
 
         st.caption(f"{len(questions)} question(s) match the filters")
@@ -93,6 +190,45 @@ with tab_browse:
         if not questions:
             st.info("No questions match those filters.")
         else:
+            export_rows = []
+            for q in questions:
+                export_rows.append({
+                    "course": course_titles.get(q.get("course_id"), ""),
+                    "course_id": q.get("course_id", ""),
+                    "question_id": q.get("question_id", ""),
+                    "section_type": q.get("section_type", ""),
+                    "question_type": q.get("question_type", ""),
+                    "difficulty": q.get("difficulty", ""),
+                    "difficulty_label": DIFFICULTY_LABELS.get(q.get("difficulty", 3), ""),
+                    "passage": q.get("passage", ""),
+                    "stimulus": q.get("stimulus", ""),
+                    "choice_a": q.get("choice_a", ""),
+                    "choice_b": q.get("choice_b", ""),
+                    "choice_c": q.get("choice_c", ""),
+                    "choice_d": q.get("choice_d", ""),
+                    "choice_e": q.get("choice_e", ""),
+                    "correct_answer": q.get("correct_answer", ""),
+                    "explanation": q.get("explanation", ""),
+                    "wrong_answer_a": q.get("wrong_answer_a", ""),
+                    "wrong_answer_b": q.get("wrong_answer_b", ""),
+                    "wrong_answer_c": q.get("wrong_answer_c", ""),
+                    "wrong_answer_d": q.get("wrong_answer_d", ""),
+                    "wrong_answer_e": q.get("wrong_answer_e", ""),
+                    "source": q.get("source", ""),
+                    "tags": q.get("tags", ""),
+                })
+
+            export_df = pd.DataFrame(export_rows)
+            filename_stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+            st.download_button(
+                "Download Full CSV",
+                data=export_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"question_bank_full_{filename_stamp}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="qbm_full_csv_download",
+                help="Exports the full filtered questions, including answers and explanations.",
+            )
             # ── Selection state — managed entirely in our own key, never
             #    touching the data_editor widget key (Streamlit forbids that).
             #    _qbm_selected_ids is a set of integer question IDs.
@@ -122,11 +258,20 @@ with tab_browse:
                 rows.append({
                     "Select":      q["id"] in selected_set,   # driven by our state
                     "ID":          q["id"],
-                    "question_id": q.get("question_id", ""),
+                    "Master ID":   q.get("question_id", ""),
+                    "Course":      course_titles.get(q.get("course_id"), ""),
                     "Section":     q.get("section_type", ""),
                     "Type":        q.get("question_type", ""),
                     "Difficulty":  DIFFICULTY_LABELS.get(q.get("difficulty", 3), ""),
-                    "Stimulus":    s[:80] + "…" if len(s) > 80 else s,
+                    "Passage":     q.get("passage", ""),
+                    "Stimulus":    s,
+                    "Choice A":    q.get("choice_a", ""),
+                    "Choice B":    q.get("choice_b", ""),
+                    "Choice C":    q.get("choice_c", ""),
+                    "Choice D":    q.get("choice_d", ""),
+                    "Choice E":    q.get("choice_e", ""),
+                    "Answer":      q.get("correct_answer", ""),
+                    "Explanation": q.get("explanation", ""),
                     "Source":      q.get("source", ""),
                 })
             df_all = pd.DataFrame(rows)
@@ -149,7 +294,11 @@ with tab_browse:
                         width="small",
                     ),
                 },
-                disabled=["question_id","Section","Type","Difficulty","Stimulus","Source"],
+                disabled=[
+                    "Master ID", "Course", "Section", "Type", "Difficulty",
+                    "Passage", "Stimulus", "Choice A", "Choice B", "Choice C",
+                    "Choice D", "Choice E", "Answer", "Explanation", "Source",
+                ],
                 key="qbm_question_editor",
             )
 
@@ -221,6 +370,7 @@ with tab_browse:
             q_ids    = [q["id"] for q in questions]
             q_labels = {
                 q["id"]: f"#{q['id']} · {q.get('question_id','')} · "
+                         f"{course_titles.get(q.get('course_id'), '')} · "
                          f"{str(q.get('stimulus',''))[:50]}"
                 for q in questions
             }
@@ -232,6 +382,7 @@ with tab_browse:
                 if q:
                     with st.expander("📋 Full Question Details", expanded=True):
                         st.markdown(
+                            f"**Course:** {course_titles.get(q.get('course_id'), '')}  |  "
                             f"**Section:** {q.get('section_type')}  |  "
                             f"**Type:** {q.get('question_type')}  |  "
                             f"**Difficulty:** {DIFFICULTY_LABELS.get(q.get('difficulty',3))}"
@@ -245,6 +396,9 @@ with tab_browse:
                             if c:
                                 prefix = "✅ " if letter == q.get("correct_answer","") else ""
                                 st.write(f"{prefix}**{letter}.** {c}")
+                        if is_open_ended_question(q) and q.get("correct_answer"):
+                            st.markdown("**Sample answer / rubric:**")
+                            st.info(q.get("correct_answer"))
                         if q.get("explanation"):
                             st.info(f"💡 {q['explanation']}")
                         if q.get("tags"):
@@ -259,6 +413,150 @@ with tab_browse:
 
 
 # ── Tab: Upload (admin only) ──────────────────────────────────────────────────
+            st.divider()
+            with st.expander("Question Bank Analytics", expanded=False):
+                analytics_rows = _question_bank_analytics_rows(selected_course_ids, course_titles)
+                if analytics_rows:
+                    analytics_df = pd.DataFrame(analytics_rows)
+                    total_modules = len(analytics_df)
+                    total_questions_in_modules = int(analytics_df["Question Count"].sum())
+
+                    a_col1, a_col2 = st.columns(2)
+                    a_col1.metric("Modules", total_modules)
+                    a_col2.metric("Questions", total_questions_in_modules)
+
+                    if len(selected_course_ids) == 1:
+                        analytics_df = analytics_df.drop(columns=["Course"])
+
+                    st.dataframe(
+                        analytics_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Question Count": st.column_config.NumberColumn(
+                                "Question Count",
+                                format="%d",
+                            ),
+                        },
+                    )
+                else:
+                    st.info("No modules or questions are available for the selected course.")
+
+if tab_reports is not None:
+    with tab_reports:
+        st.markdown("### Reported Question Issues")
+
+        admin_courses = get_all_courses()
+        admin_course_ids = [c["id"] for c in admin_courses]
+        admin_course_titles = {c["id"]: c["title"] for c in admin_courses}
+        metrics = get_question_issue_metrics(admin_course_ids)
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total", metrics.get("total", 0))
+        m2.metric("New", metrics.get("new_count", 0))
+        m3.metric("Reviewing", metrics.get("reviewing_count", 0))
+        m4.metric("Resolved", metrics.get("resolved_count", 0))
+        m5.metric("Dismissed", metrics.get("dismissed_count", 0))
+
+        st.divider()
+        f1, f2, f3 = st.columns([1.2, 2, 2])
+        with f1:
+            status_filter = st.selectbox(
+                "Status",
+                ["All"] + QUESTION_REPORT_STATUSES,
+                key="qir_status_filter",
+            )
+        with f2:
+            report_course_ids = st.multiselect(
+                "Courses",
+                options=admin_course_ids,
+                default=admin_course_ids,
+                format_func=lambda cid: admin_course_titles.get(cid, str(cid)),
+                key="qir_course_filter",
+            )
+        with f3:
+            report_search = st.text_input(
+                "Search",
+                placeholder="note, user, stimulus, master ID...",
+                key="qir_search",
+            )
+
+        reports = get_question_issue_reports(
+            status=None if status_filter == "All" else status_filter,
+            course_ids=report_course_ids,
+            search=report_search.strip() or None,
+        )
+        st.caption(f"Showing {len(reports)} report(s)")
+
+        if not reports:
+            st.info("No question issue reports match the current filters.")
+        else:
+            for report in reports:
+                created = str(report.get("created_at") or "")[:16] or "-"
+                label = (
+                    f"#{report['id']} | {report['status']} | "
+                    f"{report.get('issue_type', 'Other')} | "
+                    f"{report.get('course_title') or 'Unknown course'} | "
+                    f"Q{report.get('question_id')} | {created}"
+                )
+                with st.expander(label, expanded=report.get("status") == "New"):
+                    detail_cols = st.columns([2, 1])
+                    with detail_cols[0]:
+                        st.markdown("**Reported note**")
+                        st.info(report.get("note") or "No note provided.")
+                        st.markdown("**Question stimulus**")
+                        st.markdown(report.get("stimulus") or "")
+                        if report.get("passage"):
+                            with st.expander("Passage", expanded=False):
+                                st.markdown(report["passage"])
+                        for letter in ["A", "B", "C", "D", "E"]:
+                            choice = report.get(f"choice_{letter.lower()}")
+                            if choice:
+                                marker = " (correct)" if letter == report.get("correct_answer") else ""
+                                st.write(f"**{letter}.** {choice}{marker}")
+                        if report.get("explanation"):
+                            with st.expander("Explanation", expanded=False):
+                                st.info(report["explanation"])
+                    with detail_cols[1]:
+                        st.markdown(f"**Submitted by:** {report.get('username', '-')}")
+                        st.markdown(f"**Issue type:** {report.get('issue_type', '-')}")
+                        st.markdown(f"**Selected answer:** {report.get('selected_answer') or '-'}")
+                        st.markdown(f"**Mode:** {report.get('mode') or '-'}")
+                        st.markdown(f"**Master ID:** {report.get('master_question_id') or '-'}")
+                        st.markdown(f"**Section:** {report.get('section_type') or '-'}")
+                        st.markdown(f"**Type:** {report.get('question_type') or '-'}")
+
+                    st.divider()
+                    with st.form(f"qir_admin_update_{report['id']}"):
+                        edit_cols = st.columns([1, 2])
+                        with edit_cols[0]:
+                            new_status = st.selectbox(
+                                "Status",
+                                QUESTION_REPORT_STATUSES,
+                                index=QUESTION_REPORT_STATUSES.index(report["status"])
+                                if report.get("status") in QUESTION_REPORT_STATUSES else 0,
+                            )
+                        with edit_cols[1]:
+                            admin_notes = st.text_area(
+                                "Admin notes",
+                                value=report.get("admin_notes") or "",
+                                height=100,
+                            )
+                        save_report = st.form_submit_button(
+                            "Save Review", type="primary"
+                        )
+                    if save_report:
+                        if not real_admin:
+                            st.error("Permission denied. Real admin access required.")
+                            st.stop()
+                        update_question_issue_report(
+                            report_id=report["id"],
+                            status=new_status,
+                            admin_notes=admin_notes,
+                        )
+                        st.success("Report updated.")
+                        st.rerun()
+
+
 if tab_upload is not None:
     with tab_upload:
         st.markdown("### Upload Questions to a Shared Course")
@@ -282,72 +580,101 @@ if tab_upload is not None:
         )
         target_title = course_map.get(target_id, "")
 
-        uploaded = st.file_uploader("Choose a CSV file", type=["csv"],
-                                    key="qbank_upload")
+        if "qbank_upload_nonce" not in st.session_state:
+            st.session_state["qbank_upload_nonce"] = 0
 
-        if uploaded is not None:
-            st.markdown(f"**File:** {uploaded.name}  ({uploaded.size:,} bytes)")
+        last_upload = st.session_state.get("qbank_last_upload")
+        if last_upload:
+            totals = last_upload["totals"]
+            st.success(
+                f"✅ Import complete: **{totals['inserted']}** new question(s) "
+                f"added to **{last_upload['course_title']}** from "
+                f"**{last_upload['file_count']}** file(s)."
+            )
+
+            with st.expander("Last upload summary", expanded=True):
+                mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+                mc1.metric("Rows in files", totals["rows_read"])
+                mc2.metric("✅ Inserted", totals["inserted"])
+                mc3.metric("⏭ Skipped (ID conflict)", totals["skipped_id"])
+                mc4.metric("⏭ Skipped (same content)", totals["skipped_content"])
+                mc5.metric("❌ Invalid rows", totals["invalid"])
+
+                if last_upload["results"]:
+                    st.markdown("**Per-file results**")
+                    for file_name, result in last_upload["results"]:
+                        st.caption(
+                            f"**{file_name}**: "
+                            f"{result['rows_read']} row(s), "
+                            f"{result['inserted']} inserted, "
+                            f"{result['skipped_content']} duplicate content, "
+                            f"{result['invalid']} invalid"
+                        )
+
+                if totals["errors"]:
+                    st.markdown("**Validation errors**")
+                    for e in totals["errors"][:30]:
+                        st.caption(f"• {e}")
+                    if len(totals["errors"]) > 30:
+                        st.caption(
+                            f"… and {len(totals['errors']) - 30} more. "
+                            "Fix these in your files and re-upload."
+                        )
+
+        uploaded_files = st.file_uploader(
+            "Choose CSV or Excel files",
+            type=["csv", "xlsx", "xlsm", "xls"],
+            accept_multiple_files=True,
+            help="Select one file, or hold Ctrl/Shift to select a batch.",
+            key=f"qbank_upload_{st.session_state['qbank_upload_nonce']}",
+        )
+
+        if uploaded_files:
+            total_size = sum(file.size for file in uploaded_files)
+            st.markdown(
+                f"**Selected:** {len(uploaded_files)} file(s) "
+                f"({total_size:,} bytes total)"
+            )
+            with st.expander("Selected files", expanded=len(uploaded_files) <= 5):
+                for file in uploaded_files:
+                    st.caption(f"• {file.name} ({file.size:,} bytes)")
 
             if st.button("✅ Import Questions", type="primary"):
-                with st.spinner("Processing CSV…"):
-                    result = process_upload(uploaded, course_id=target_id)
+                results = []
+                totals = {
+                    "rows_read": 0,
+                    "valid_rows": 0,
+                    "inserted": 0,
+                    "skipped_id": 0,
+                    "skipped_content": 0,
+                    "invalid": 0,
+                    "errors": [],
+                }
 
-                st.divider()
-                st.markdown("#### 📊 Upload Summary")
+                with st.spinner("Processing selected files…"):
+                    for file in uploaded_files:
+                        result = process_upload(file, course_id=target_id)
+                        results.append((file.name, result))
+                        for key in [
+                            "rows_read",
+                            "valid_rows",
+                            "inserted",
+                            "skipped_id",
+                            "skipped_content",
+                            "invalid",
+                        ]:
+                            totals[key] += result[key]
+                        totals["errors"].extend(
+                            f"{file.name}: {error}" for error in result["errors"]
+                        )
 
-                # Metrics row
-                mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-                mc1.metric("Rows in file",     result["rows_read"])
-                mc2.metric("✅ Inserted",       result["inserted"],
-                           help="New questions added to the course")
-                mc3.metric("⏭ Skipped (same ID)",
-                           result["skipped_id"],
-                           help="question_id already exists — skipped safely")
-                mc4.metric("⏭ Skipped (same content)",
-                           result["skipped_content"],
-                           help="Identical question text already in this course "
-                                "(same stimulus + choices + answer)")
-                mc5.metric("❌ Invalid rows",   result["invalid"],
-                           help="Rows with missing required fields or bad values")
-
-                # Result message
-                if result["inserted"]:
-                    st.success(
-                        f"✅ **{result['inserted']}** new question(s) added to "
-                        f"**{target_title}**. All enrolled users can practise them now."
-                    )
-                elif result["skipped_id"] + result["skipped_content"] > 0:
-                    st.info(
-                        "All rows in this file are already in the database — "
-                        "nothing new was added. "
-                        f"({result['skipped_id']} matched by ID, "
-                        f"{result['skipped_content']} matched by content)"
-                    )
-                else:
-                    st.warning("No questions were imported. Check the errors below.")
-
-                if result["skipped_content"] > 0:
-                    st.warning(
-                        f"⚠️ **{result['skipped_content']} question(s)** were skipped "
-                        "because their content (stimulus + answer choices) is identical "
-                        "to questions already in this course, even though the question_id "
-                        "may differ. This usually means you uploaded the same questions "
-                        "under new IDs."
-                    )
-
-                if result["errors"]:
-                    with st.expander(
-                        f"⚠️ {len(result['errors'])} validation error(s) — click to view",
-                        expanded=True,
-                    ):
-                        for e in result["errors"][:30]:
-                            st.caption(f"• {e}")
-                        if len(result["errors"]) > 30:
-                            st.caption(
-                                f"… and {len(result['errors']) - 30} more. "
-                                "Fix these in your CSV and re-upload."
-                            )
-
+                st.session_state["qbank_last_upload"] = {
+                    "course_title": target_title,
+                    "file_count": len(uploaded_files),
+                    "totals": totals,
+                    "results": results,
+                }
+                st.session_state["qbank_upload_nonce"] += 1
                 st.rerun()
 
         st.divider()
@@ -361,13 +688,14 @@ if tab_upload is not None:
             st.markdown("""
 **Two layers of duplicate detection:**
 
-1. **Same question_id** — if a row's `question_id` already exists in the database
-   (across any course), it is skipped.  The `question_id` column is globally unique.
+1. **Generated master ID** — uploaded `question_id` values are ignored. The app
+   assigns a new ID using the selected course abbreviation plus a number, such as
+   `BIO-0001`. That ID is unique inside the course.
 
 2. **Same content** — a fingerprint (hash) is computed from the question's
    *stimulus + all five choices + correct answer*.  If an identical fingerprint
    already exists in the **same course**, the row is skipped — even if it has a
-   different `question_id`.  This catches re-uploaded batches with renamed IDs.
+   different uploaded ID.  This catches re-uploaded batches.
 
 **Re-uploading the same CSV** will always result in 0 inserted and all rows
 being skipped by one of the two checks above — no duplicates are created.
@@ -376,24 +704,35 @@ being skipped by one of the two checks above — no duplicates are created.
 
 # ── Tab: Template ─────────────────────────────────────────────────────────────
 with tab_template:
-    st.markdown("### CSV Template")
+    st.markdown("### Question Bank Template")
     st.markdown("""
 Download this template, fill in your questions, and upload via the **Upload CSV** tab.
 
 **Required columns:**  
-`question_id`, `stimulus`, `choice_a` through `choice_e`, `correct_answer`
+`stimulus`, `question_type`
 
 **Optional but useful:**  
-`section_type`, `question_type`, `difficulty` (1–5), `passage`, `explanation`,  
+`question_id` (ignored on import), `section_type`, `question_type`, `difficulty` (1–5), `passage`, `explanation`,  
 `wrong_answer_a–e`, `source`, `tags`
 
 `section_type` — any text: `Logical Reasoning`, `Python Basics`, `Chapter 3`, etc.  
 `question_type` — any text: `Weaken`, `Multiple Choice`, `True/False`, etc.  
 `correct_answer` — must be `A`, `B`, `C`, `D`, or `E`  
-`difficulty` — 1 (Easy) to 5 (Brutal), default 3
+`difficulty` — 1 Intuition & Estimation, 2 Beginner Calculations, 3 Intermediate Calculations, 4 Advanced Calculations, 5 Stretch Problems; default 3
     """)
 
     csv_str = make_template_csv()
+    st.info(
+        "For open-ended questions, set question_type to Open-Ended. "
+        "Choices can be blank, and correct_answer can hold a sample answer or rubric."
+    )
+    st.download_button(
+        "Download Excel template with dropdowns",
+        data=make_template_xlsx(),
+        file_name="question_bank_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
     st.download_button(
         "⬇️ Download question_bank_template.csv",
         data=csv_str,

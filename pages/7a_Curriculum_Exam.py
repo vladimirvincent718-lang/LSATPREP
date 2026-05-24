@@ -27,14 +27,16 @@ from src.database   import (
 )
 from src.exam_engine import (
     start_quiz, submit_section, is_active, current_question,
-    next_question, prev_question, record_answer, toggle_flag,
+    next_question, prev_question, record_answer, record_self_grade, toggle_flag,
     seconds_remaining, is_timed_out, clear_quiz,
-    _K, _st, _set, format_time,
+    persist_current_exam, restore_exam_draft, _K, _st, _set, format_time,
 )
+from src.question_loader import is_open_ended_question
 from src.curriculum_allocation import (
     equal_allocation, preset_allocation, manual_allocation, random_allocation,
     AllocationResult,
 )
+from src.pdf_export import generate_exam_pdf, make_pdf_filename
 from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Curriculum Exam · StudyForge",
@@ -44,6 +46,7 @@ init_curriculum_tables()
 user_id  = require_login()
 username = st.session_state.get("username", "")
 sidebar_nav(username)
+restore_exam_draft(user_id, modes={"curriculum_exam"})
 page_header("📝 Curriculum Exam Builder",
             "Build exams from a single course, multiple courses, or a full curriculum")
 
@@ -51,6 +54,13 @@ KEY_STAGE        = "ceb_stage"
 KEY_EXAM_SOURCE  = "ceb_exam_source"
 KEY_REPORT       = "ceb_report"
 KEY_DISTRIBUTION = "ceb_distribution"
+KEY_EXAM_PDF     = "ceb_exam_pdf"
+KEY_EXAM_PDF_NAME = "ceb_exam_pdf_name"
+KEY_CONFIRM_SUBMIT = "ceb_confirm_submit"
+KEY_OPEN_ENDED_MODE = "ceb_open_ended_mode"
+
+if st.session_state.pop("_exam_restored_notice", False):
+    st.success("Your in-progress exam was restored with your saved answers and remaining time.")
 
 def get_stage():  return st.session_state.get(KEY_STAGE, "setup")
 def set_stage(s): st.session_state[KEY_STAGE] = s
@@ -60,15 +70,24 @@ def _launch_exam(uid, questions, label, timed, mins, course_id, dist):
     if not questions:
         st.error("No questions assembled. Check settings and try again.")
         return
+    st.session_state[KEY_EXAM_PDF] = generate_exam_pdf(
+        questions=questions,
+        title=label,
+        subtitle="Generated practice test",
+        distribution=dist,
+    )
+    st.session_state[KEY_EXAM_PDF_NAME] = make_pdf_filename(label)
     start_quiz(
         user_id=uid, mode="curriculum_exam", questions=questions,
         section_type="Mixed", hard_mode=False,
         time_limit_seconds=(mins * 60) if timed else 0,
         section_num=1, course_id=course_id,
+        open_ended_mode=st.session_state.get(KEY_OPEN_ENDED_MODE, False),
     )
     st.session_state[KEY_EXAM_SOURCE]  = label
     st.session_state[KEY_DISTRIBUTION] = dist
     set_stage("running")
+    persist_current_exam(uid)
     st.rerun()
 
 
@@ -89,6 +108,19 @@ def _show_allocation_table(result: AllocationResult, total_q: int):
     st.caption(
         f"**Total questions that will be generated: {result.final_total}** "
         f"(requested: {total_q})"
+    )
+
+
+def _render_pdf_download(label: str = "Download Exam PDF") -> None:
+    pdf_bytes = st.session_state.get(KEY_EXAM_PDF)
+    if not pdf_bytes:
+        return
+    st.download_button(
+        label,
+        data=pdf_bytes,
+        file_name=st.session_state.get(KEY_EXAM_PDF_NAME, "generated_exam.pdf"),
+        mime="application/pdf",
+        use_container_width=True,
     )
 
 
@@ -128,8 +160,9 @@ if get_stage() == "complete":
                 )
                 st.caption(str(row["stimulus"])[:200])
                 if row.get("explanation"): st.info(row["explanation"])
+    _render_pdf_download("Download Exam PDF")
     if st.button("Build Another Exam", type="primary", use_container_width=True):
-        for k in [KEY_STAGE, KEY_EXAM_SOURCE, KEY_REPORT, KEY_DISTRIBUTION]:
+        for k in [KEY_STAGE, KEY_EXAM_SOURCE, KEY_REPORT, KEY_DISTRIBUTION, KEY_EXAM_PDF, KEY_EXAM_PDF_NAME]:
             st.session_state.pop(k, None)
         clear_quiz(); st.rerun()
     st.stop()
@@ -153,12 +186,14 @@ if get_stage() == "running":
     timed        = total_secs > 0
     if timed and is_timed_out():
         st.warning("Time is up!")
+        st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
         report = submit_section(user_id)
         st.session_state[KEY_REPORT] = report
         set_stage("complete"); st.rerun()
     src_lbl = st.session_state.get(KEY_EXAM_SOURCE, "Exam")
     st.markdown(f"### {src_lbl}")
-    if timed: render_timer(remaining, total_secs)
+    _render_pdf_download()
+    if timed: render_timer(remaining, total_secs, key_prefix="curriculum_exam_timer")
     st.progress(answered/total if total else 0, text=f"{answered}/{total} answered")
     n1,n2,n3,n4 = st.columns([1,1,4,2])
     with n1:
@@ -172,7 +207,9 @@ if get_stage() == "running":
                             index=current_idx, label_visibility="collapsed", key="ceb_jump")
         tidx = int(jump[1:])-1
         if tidx != current_idx:
-            st.session_state[_K["current_idx"]] = tidx; st.rerun()
+            st.session_state[_K["current_idx"]] = tidx
+            persist_current_exam(user_id)
+            st.rerun()
     with n4:
         flabel = "Unflag" if current_idx in flagged_set else "Flag"
         if st.button(flabel, key="ceb_flag"): toggle_flag(current_idx); st.rerun()
@@ -183,9 +220,25 @@ if get_stage() == "running":
         from src.voice_exam import render_voice_exam_panel
         render_voice_exam_panel(q, current_idx, total)
 
+        open_ended = is_open_ended_question(q)
+        if open_ended:
+            existing_grade = (_st("self_grades") or {}).get(current_idx, True)
+            self_grade_choice = st.radio(
+                "Self-grade this written response before scoring:",
+                options=["Correct", "Incorrect"],
+                index=0 if existing_grade else 1,
+                horizontal=True,
+                key=f"ceb_self_grade_{current_idx}",
+            )
+            record_self_grade(current_idx, self_grade_choice == "Correct")
+
         picked = render_question(q=q, idx=current_idx, total=total,
                                  selected=answers_dict.get(current_idx,""),
                                  show_answer=False, is_flagged=(current_idx in flagged_set))
+        if picked and picked != answers_dict.get(current_idx, ""):
+            record_answer(current_idx, picked)
+            answers_dict = _st("answers") or {}
+            answered = len(answers_dict)
         if st.button("Record Answer", type="primary", use_container_width=True, key="ceb_rec"):
             if not picked: st.warning("Select an answer first.")
             else:
@@ -197,18 +250,32 @@ if get_stage() == "running":
     c_submit, c_quit = st.columns(2)
     with c_submit:
         if st.button("Submit Exam", type="primary", use_container_width=True):
-            if unanswered > 0 and not st.session_state.get("ceb_confirm_submit"):
-                st.session_state["ceb_confirm_submit"] = True
-                st.warning(f"{unanswered} unanswered. Click again to confirm.")
-            else:
-                st.session_state.pop("ceb_confirm_submit", None)
+            st.session_state[KEY_CONFIRM_SUBMIT] = True
+            st.rerun()
+    with c_quit:
+        if st.button("Quit", use_container_width=True):
+            set_stage("setup")
+            for k in [KEY_DISTRIBUTION, KEY_EXAM_PDF, KEY_EXAM_PDF_NAME]:
+                st.session_state.pop(k, None)
+            st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
+            clear_quiz(); st.rerun()
+    if st.session_state.get(KEY_CONFIRM_SUBMIT):
+        detail = (
+            f" {unanswered} question(s) are unanswered."
+            if unanswered > 0 else ""
+        )
+        st.warning(f"Are you sure you want to submit this exam?{detail}")
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button("Yes, submit exam", type="primary", use_container_width=True):
+                st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
                 report = submit_section(user_id)
                 st.session_state[KEY_REPORT] = report
                 set_stage("complete"); st.rerun()
-    with c_quit:
-        if st.button("Quit", use_container_width=True):
-            set_stage("setup"); st.session_state.pop(KEY_DISTRIBUTION, None)
-            clear_quiz(); st.rerun()
+        with cancel_col:
+            if st.button("Cancel", use_container_width=True):
+                st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
+                st.rerun()
     with st.sidebar:
         st.markdown("**Question Map**")
         st.caption("Green=Answered  White=Skipped  Flag=Flagged")
@@ -237,6 +304,14 @@ source = st.radio("What should the exam draw questions from?", SOURCE_OPTIONS,
 st.divider()
 all_courses = get_all_courses()
 curriculums = get_all_curriculums()
+st.checkbox(
+    "Open-ended challenge - hide answer choices",
+    key=KEY_OPEN_ENDED_MODE,
+    help=(
+        "Multiple choice is the default. Turn this on when you want to "
+        "remove the options and self-grade your written response."
+    ),
+)
 
 
 # ── A: Single Course ──────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ from src.auth     import (
     restore_session_from_cookie,
 )
 from src.utils import inject_sidebar_page_labels
+from src.ui_theme import feature_grid, hero, inject_modern_theme
 
 if __name__ == "__main__" and get_script_run_ctx() is None:
     subprocess.run(
@@ -43,6 +44,7 @@ st.set_page_config(
 )
 
 init_database()
+inject_modern_theme()
 inject_sidebar_page_labels()
 
 
@@ -57,6 +59,23 @@ def main():
         st.stop()
 
     if not is_logged_in():
+        hero(
+            "StudyForge",
+            "A modern learning workspace for courses, materials, practice, exams, feedback, and private progress tracking.",
+        )
+        feature_grid(
+            [
+                ("Courses", "Shared learning spaces", "Enroll learners in course hubs with common materials and question banks."),
+                ("Practice", "Adaptive study workflows", "Support untimed drills, timed sections, full exams, and mistake review."),
+                ("Progress", "Private analytics", "Keep individual scores, trends, and completion history visible only to each learner."),
+            ]
+        )
+        st.info(
+            "How it works: course resources are shared with enrolled learners, while scores, progress, and mistakes stay private."
+        )
+        st.divider()
+        login_register_form()
+        st.stop()
         st.markdown("# 🔐 Sign In to StudyForge")
         st.markdown(
             "Your shared study platform — enroll in courses, practise with shared "
@@ -105,7 +124,10 @@ def main():
         from src.utils import _inject_feedback_button, get_effective_admin
         _inject_feedback_button()
 
-        st.markdown(f"# 🎓 Welcome back, {username}!")
+        hero(
+            f"Welcome back, {username}",
+            "Jump into your active courses, continue practice, review materials, or inspect your learning progress.",
+        )
 
         if user_id:
             _, eff_adm = get_effective_admin(user_id)
@@ -119,6 +141,17 @@ def main():
             "Courses are **shared** — everyone enrolled in a course studies the "
             "same materials and question bank. Your scores and progress are always **private to you**."
         )
+        feature_grid(
+            [
+                ("Dashboard", "Progress at a glance", "Review private course performance, trends, and weak areas."),
+                ("Materials", "Shared course library", "Readings, videos, documents, and module progress stay organized."),
+                ("Question Bank", "Reusable assessment content", "Admins manage course questions while learners practice."),
+                ("Practice", "Flexible study sessions", "Drill questions at your pace with optional feedback and timers."),
+                ("Exam Modes", "Timed simulations", "Run timed sections, full exams, and curriculum-based assessments."),
+                ("Review", "Mistake journal", "Return to missed questions and explanations when it is time to improve."),
+            ]
+        )
+        st.stop()
         st.markdown("Use the **sidebar** to navigate.")
         st.divider()
 

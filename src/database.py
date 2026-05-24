@@ -21,6 +21,7 @@ import sqlite3
 import json
 import hashlib
 import os
+import re
 import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -45,6 +46,42 @@ def _make_content_hash(stimulus: str, choice_a: str = "", choice_b: str = "",
              choice_d, choice_e, correct_answer]
     blob = "|".join(p.strip().lower() for p in parts)
     return hashlib.sha256(blob.encode()).hexdigest()[:32]
+
+
+def _course_abbreviation(course: dict | sqlite3.Row | None) -> str:
+    """Short stable prefix for course-scoped question IDs."""
+    if not course:
+        return "COURSE"
+
+    if isinstance(course, dict):
+        source = (course.get("category") or course.get("title") or "")
+    else:
+        source = (course["category"] if "category" in course.keys() else "") or course["title"]
+    source = str(source or "").strip().upper()
+    tokens = re.findall(r"[A-Z0-9]+", source)
+    if not tokens:
+        return "COURSE"
+
+    if len(tokens) == 1:
+        return tokens[0][:8]
+    return "".join(token[0] for token in tokens)[:8]
+
+
+def _next_question_number_for_course(conn: sqlite3.Connection, course_id: int,
+                                     prefix: str) -> int:
+    """Return the next numeric suffix for a course's generated question IDs."""
+    rows = conn.execute(
+        "SELECT question_id FROM questions WHERE course_id = ?",
+        (course_id,),
+    ).fetchall()
+    max_seen = 0
+    pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$", re.IGNORECASE)
+    for row in rows:
+        qid = row["question_id"] or ""
+        match = pattern.match(qid)
+        if match:
+            max_seen = max(max_seen, int(match.group(1)))
+    return max_seen + 1
 
 
 # ── Connection helper ─────────────────────────────────────────────────────────
@@ -103,7 +140,7 @@ def init_database() -> None:
     CREATE TABLE IF NOT EXISTS questions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         course_id       INTEGER,
-        question_id     TEXT UNIQUE,
+        question_id     TEXT,
         section_type    TEXT,
         question_type   TEXT,
         difficulty      INTEGER DEFAULT 3,
@@ -127,6 +164,9 @@ def init_database() -> None:
         created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (course_id) REFERENCES courses(id)
     );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_questions_course_question_id
+        ON questions(course_id, question_id);
 
     -- ── Exam attempts  (user-specific) ──────────────────────────────────── --
     CREATE TABLE IF NOT EXISTS exam_attempts (
@@ -162,6 +202,40 @@ def init_database() -> None:
         FOREIGN KEY (question_id) REFERENCES questions(id)
     );
 
+    -- Content-quality reports submitted while practicing/testing.
+    CREATE TABLE IF NOT EXISTS question_issue_reports (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id        INTEGER NOT NULL,
+        question_id    INTEGER NOT NULL,
+        attempt_id     INTEGER,
+        issue_type     TEXT    DEFAULT 'Other',
+        note           TEXT    DEFAULT '',
+        selected_answer TEXT   DEFAULT '',
+        mode           TEXT    DEFAULT '',
+        status         TEXT    DEFAULT 'New',
+        admin_notes    TEXT    DEFAULT '',
+        resolved_at    TIMESTAMP,
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id)     REFERENCES users(id),
+        FOREIGN KEY (question_id) REFERENCES questions(id),
+        FOREIGN KEY (attempt_id)  REFERENCES exam_attempts(id)
+    );
+
+    -- In-progress exam snapshots. These are drafts only; final answer history
+    -- is still written to user_answers when an attempt is formally submitted.
+    CREATE TABLE IF NOT EXISTS exam_drafts (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id       INTEGER NOT NULL,
+        attempt_id    INTEGER NOT NULL UNIQUE,
+        mode          TEXT,
+        course_id     INTEGER,
+        state_json    TEXT NOT NULL,
+        updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id)    REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (attempt_id) REFERENCES exam_attempts(id) ON DELETE CASCADE
+    );
+
     -- ── Per-user settings ────────────────────────────────────────────────── --
     CREATE TABLE IF NOT EXISTS settings (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,9 +260,31 @@ def init_database() -> None:
         question_id INTEGER NOT NULL,
         attempt_id  INTEGER,
         note        TEXT,
+        is_completed INTEGER DEFAULT 0,
+        completed_at TIMESTAMP,
         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id)     REFERENCES users(id),
         FOREIGN KEY (question_id) REFERENCES questions(id)
+    );
+
+    -- Smart review queue (user-specific spaced review state).
+    CREATE TABLE IF NOT EXISTS user_question_review (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id           INTEGER NOT NULL,
+        question_id       INTEGER NOT NULL,
+        course_id         INTEGER,
+        question_type     TEXT DEFAULT '',
+        times_seen        INTEGER DEFAULT 0,
+        correct_streak    INTEGER DEFAULT 0,
+        misses            INTEGER DEFAULT 0,
+        mastery_level     INTEGER DEFAULT 0,
+        next_review_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_answered_at  TIMESTAMP,
+        retired           INTEGER DEFAULT 0,
+        UNIQUE(user_id, question_id),
+        FOREIGN KEY (user_id)     REFERENCES users(id),
+        FOREIGN KEY (question_id) REFERENCES questions(id),
+        FOREIGN KEY (course_id)   REFERENCES courses(id)
     );
 
     -- ── Course materials  (shared — belong to course, not user) ─────────── --
@@ -293,9 +389,146 @@ def _migrate_database() -> None:
                FOREIGN KEY (course_id) REFERENCES courses(id)
            )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS user_question_review (
+               id                INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id           INTEGER NOT NULL,
+               question_id       INTEGER NOT NULL,
+               course_id         INTEGER,
+               question_type     TEXT DEFAULT '',
+               times_seen        INTEGER DEFAULT 0,
+               correct_streak    INTEGER DEFAULT 0,
+               misses            INTEGER DEFAULT 0,
+               mastery_level     INTEGER DEFAULT 0,
+               next_review_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               last_answered_at  TIMESTAMP,
+               retired           INTEGER DEFAULT 0,
+               UNIQUE(user_id, question_id),
+               FOREIGN KEY (user_id)     REFERENCES users(id),
+               FOREIGN KEY (question_id) REFERENCES questions(id),
+               FOREIGN KEY (course_id)   REFERENCES courses(id)
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS exam_drafts (
+               id            INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id       INTEGER NOT NULL,
+               attempt_id    INTEGER NOT NULL UNIQUE,
+               mode          TEXT,
+               course_id     INTEGER,
+               state_json    TEXT NOT NULL,
+               updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               FOREIGN KEY (user_id)    REFERENCES users(id) ON DELETE CASCADE,
+               FOREIGN KEY (attempt_id) REFERENCES exam_attempts(id) ON DELETE CASCADE
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS question_issue_reports (
+               id              INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id         INTEGER NOT NULL,
+               question_id     INTEGER NOT NULL,
+               attempt_id      INTEGER,
+               issue_type      TEXT    DEFAULT 'Other',
+               note            TEXT    DEFAULT '',
+               selected_answer TEXT    DEFAULT '',
+               mode            TEXT    DEFAULT '',
+               status          TEXT    DEFAULT 'New',
+               admin_notes     TEXT    DEFAULT '',
+               resolved_at     TIMESTAMP,
+               created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               FOREIGN KEY (user_id)     REFERENCES users(id),
+               FOREIGN KEY (question_id) REFERENCES questions(id),
+               FOREIGN KEY (attempt_id)  REFERENCES exam_attempts(id)
+           )"""
+    )
 
     def cols(table: str) -> set:
         return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    mj_cols = cols("mistake_journal")
+    if "is_completed" not in mj_cols:
+        conn.execute("ALTER TABLE mistake_journal ADD COLUMN is_completed INTEGER DEFAULT 0")
+    if "completed_at" not in mj_cols:
+        conn.execute("ALTER TABLE mistake_journal ADD COLUMN completed_at TIMESTAMP")
+    conn.commit()
+
+    q_cols_for_rebuild = cols("questions")
+    if "course_id" not in q_cols_for_rebuild:
+        conn.execute("ALTER TABLE questions ADD COLUMN course_id INTEGER")
+        q_cols_for_rebuild.add("course_id")
+    if "content_hash" not in q_cols_for_rebuild:
+        conn.execute("ALTER TABLE questions ADD COLUMN content_hash TEXT DEFAULT ''")
+        q_cols_for_rebuild.add("content_hash")
+    conn.commit()
+
+    def question_id_has_global_unique() -> bool:
+        for idx in conn.execute("PRAGMA index_list(questions)").fetchall():
+            if not idx["unique"]:
+                continue
+            info = conn.execute(f"PRAGMA index_info({idx['name']})").fetchall()
+            if [r["name"] for r in info] == ["question_id"]:
+                return True
+        return False
+
+    if question_id_has_global_unique():
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.executescript("""
+        CREATE TABLE questions_new (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            course_id       INTEGER,
+            question_id     TEXT,
+            section_type    TEXT,
+            question_type   TEXT,
+            difficulty      INTEGER DEFAULT 3,
+            passage         TEXT,
+            stimulus        TEXT NOT NULL,
+            choice_a        TEXT,
+            choice_b        TEXT,
+            choice_c        TEXT,
+            choice_d        TEXT,
+            choice_e        TEXT,
+            correct_answer  TEXT,
+            explanation     TEXT,
+            wrong_answer_a  TEXT,
+            wrong_answer_b  TEXT,
+            wrong_answer_c  TEXT,
+            wrong_answer_d  TEXT,
+            wrong_answer_e  TEXT,
+            source          TEXT DEFAULT 'custom',
+            tags            TEXT,
+            content_hash    TEXT DEFAULT '',
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (course_id) REFERENCES courses(id)
+        );
+
+        INSERT INTO questions_new
+            (id, course_id, question_id, section_type, question_type, difficulty,
+             passage, stimulus, choice_a, choice_b, choice_c, choice_d, choice_e,
+             correct_answer, explanation,
+             wrong_answer_a, wrong_answer_b, wrong_answer_c,
+             wrong_answer_d, wrong_answer_e, source, tags, content_hash, created_at)
+        SELECT
+             id, course_id, question_id, section_type, question_type, difficulty,
+             passage, stimulus, choice_a, choice_b, choice_c, choice_d, choice_e,
+             correct_answer, explanation,
+             wrong_answer_a, wrong_answer_b, wrong_answer_c,
+             wrong_answer_d, wrong_answer_e, source, tags,
+             COALESCE(content_hash, ''), created_at
+        FROM questions;
+
+        DROP TABLE questions;
+        ALTER TABLE questions_new RENAME TO questions;
+        """)
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys=ON")
+
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_questions_course_question_id
+           ON questions(course_id, question_id)"""
+    )
+    conn.commit()
 
     # ── 1. users columns ──────────────────────────────────────────────────────
     u_cols = cols("users")
@@ -1075,13 +1308,24 @@ def insert_questions(rows: list,
     Bulk-insert shared questions.
 
     Duplicate detection (in order):
-    1. question_id UNIQUE constraint → skipped_id
-    2. content_hash duplicate within same course → skipped_content
+    1. content_hash duplicate within same course → skipped_content
+    2. generated question_id duplicate within same course → skipped_id
 
     Returns (inserted, skipped_id, skipped_content).
     """
     conn     = get_connection()
     inserted = skipped_id = skipped_content = 0
+    course_prefix = "COURSE"
+    next_question_number = 1
+
+    if course_id is not None:
+        course = conn.execute(
+            "SELECT * FROM courses WHERE id = ?", (course_id,)
+        ).fetchone()
+        course_prefix = _course_abbreviation(course)
+        next_question_number = _next_question_number_for_course(
+            conn, course_id, course_prefix
+        )
 
     for row in rows:
         r = dict(row)
@@ -1108,6 +1352,10 @@ def insert_questions(rows: list,
             if existing:
                 skipped_content += 1
                 continue
+
+        if r["course_id"] is not None:
+            r["question_id"] = f"{course_prefix}-{next_question_number:04d}"
+            next_question_number += 1
 
         try:
             conn.execute(
@@ -1190,6 +1438,7 @@ def _safe_delete_questions(conn: sqlite3.Connection, ids: list) -> None:
     placeholders = ",".join("?" * len(ids))
     conn.execute(f"DELETE FROM user_answers    WHERE question_id IN ({placeholders})", ids)
     conn.execute(f"DELETE FROM mistake_journal WHERE question_id IN ({placeholders})", ids)
+    conn.execute(f"DELETE FROM question_issue_reports WHERE question_id IN ({placeholders})", ids)
     conn.execute(f"DELETE FROM questions       WHERE id          IN ({placeholders})", ids)
 
 
@@ -1287,20 +1536,233 @@ def save_answer(attempt_id: int, question_id: int, selected: str,
         (attempt_id, question_id, selected, int(is_correct),
          round(time_spent, 2), int(is_flagged), section_num),
     )
+    _update_question_review_state(conn, attempt_id, question_id, is_correct)
     conn.commit()
     conn.close()
 
 
-def get_attempts(user_id: int, limit: int = 50,
-                 course_id=None) -> list:
-    conn   = get_connection()
-    query  = ("SELECT * FROM exam_attempts "
-               "WHERE user_id = ? AND completed_at IS NOT NULL")
-    params = [user_id]
+def save_exam_draft(
+    user_id: int,
+    attempt_id: int,
+    mode: str,
+    course_id,
+    state: dict,
+) -> None:
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO exam_drafts
+           (user_id, attempt_id, mode, course_id, state_json, updated_at)
+           VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(attempt_id) DO UPDATE SET
+             mode = excluded.mode,
+             course_id = excluded.course_id,
+             state_json = excluded.state_json,
+             updated_at = CURRENT_TIMESTAMP""",
+        (user_id, attempt_id, mode, course_id, json.dumps(state)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_latest_exam_draft(
+    user_id: int,
+    modes: list[str] | tuple[str, ...] | set[str] | None = None,
+    course_id=None,
+) -> dict | None:
+    conn = get_connection()
+    query = (
+        """SELECT ed.*, ea.completed_at
+           FROM exam_drafts ed
+           JOIN exam_attempts ea ON ea.id = ed.attempt_id
+           WHERE ed.user_id = ? AND ea.completed_at IS NULL"""
+    )
+    params: list = [user_id]
+    if modes:
+        placeholders = ",".join("?" for _ in modes)
+        query += f" AND ed.mode IN ({placeholders})"
+        params.extend(list(modes))
+    if course_id is not None:
+        query += " AND (ed.course_id = ? OR ed.course_id IS NULL)"
+        params.append(course_id)
+    query += " ORDER BY ed.updated_at DESC, ed.id DESC LIMIT 1"
+    row = conn.execute(query, params).fetchone()
+    conn.close()
+    if not row:
+        return None
+    draft = dict(row)
+    try:
+        draft["state"] = json.loads(draft.get("state_json") or "{}")
+    except json.JSONDecodeError:
+        draft["state"] = {}
+    return draft
+
+
+def delete_exam_draft(attempt_id: int) -> None:
+    conn = get_connection()
+    conn.execute("DELETE FROM exam_drafts WHERE attempt_id = ?", (attempt_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_user_exam_drafts(
+    user_id: int,
+    modes: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> None:
+    conn = get_connection()
+    if modes:
+        placeholders = ",".join("?" for _ in modes)
+        conn.execute(
+            f"DELETE FROM exam_drafts WHERE user_id = ? AND mode IN ({placeholders})",
+            [user_id, *list(modes)],
+        )
+    else:
+        conn.execute("DELETE FROM exam_drafts WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def _update_question_review_state(
+    conn: sqlite3.Connection,
+    attempt_id: int,
+    question_id: int,
+    is_correct: bool,
+) -> None:
+    """Advance the spaced-review state for one answered question."""
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS user_question_review (
+               id                INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id           INTEGER NOT NULL,
+               question_id       INTEGER NOT NULL,
+               course_id         INTEGER,
+               question_type     TEXT DEFAULT '',
+               times_seen        INTEGER DEFAULT 0,
+               correct_streak    INTEGER DEFAULT 0,
+               misses            INTEGER DEFAULT 0,
+               mastery_level     INTEGER DEFAULT 0,
+               next_review_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               last_answered_at  TIMESTAMP,
+               retired           INTEGER DEFAULT 0,
+               UNIQUE(user_id, question_id),
+               FOREIGN KEY (user_id)     REFERENCES users(id),
+               FOREIGN KEY (question_id) REFERENCES questions(id),
+               FOREIGN KEY (course_id)   REFERENCES courses(id)
+           )"""
+    )
+    attempt = conn.execute(
+        "SELECT user_id, course_id FROM exam_attempts WHERE id = ?",
+        (attempt_id,),
+    ).fetchone()
+    question = conn.execute(
+        "SELECT course_id, question_type FROM questions WHERE id = ?",
+        (question_id,),
+    ).fetchone()
+    if not attempt or not question:
+        return
+
+    now = datetime.now()
+    existing = conn.execute(
+        """SELECT * FROM user_question_review
+           WHERE user_id = ? AND question_id = ?""",
+        (attempt["user_id"], question_id),
+    ).fetchone()
+
+    if existing:
+        times_seen = int(existing["times_seen"] or 0) + 1
+        misses = int(existing["misses"] or 0)
+        mastery = int(existing["mastery_level"] or 0)
+        correct_streak = int(existing["correct_streak"] or 0)
+    else:
+        times_seen = 1
+        misses = 0
+        mastery = 0
+        correct_streak = 0
+
+    if is_correct:
+        correct_streak += 1
+        mastery = min(5, mastery + 1)
+        interval_days = [0, 1, 3, 7, 14, 30][mastery]
+        next_review_at = now + timedelta(days=interval_days)
+        retired = 1 if mastery >= 5 and correct_streak >= 5 else 0
+    else:
+        correct_streak = 0
+        misses += 1
+        mastery = max(0, mastery - 2)
+        next_review_at = now
+        retired = 0
+
+    conn.execute(
+        """INSERT INTO user_question_review
+           (user_id, question_id, course_id, question_type, times_seen,
+            correct_streak, misses, mastery_level, next_review_at,
+            last_answered_at, retired)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, question_id) DO UPDATE SET
+             course_id = excluded.course_id,
+             question_type = excluded.question_type,
+             times_seen = excluded.times_seen,
+             correct_streak = excluded.correct_streak,
+             misses = excluded.misses,
+             mastery_level = excluded.mastery_level,
+             next_review_at = excluded.next_review_at,
+             last_answered_at = excluded.last_answered_at,
+             retired = excluded.retired""",
+        (
+            attempt["user_id"],
+            question_id,
+            question["course_id"] if question["course_id"] is not None else attempt["course_id"],
+            question["question_type"] or "",
+            times_seen,
+            correct_streak,
+            misses,
+            mastery,
+            next_review_at.isoformat(timespec="seconds"),
+            now.isoformat(timespec="seconds"),
+            retired,
+        ),
+    )
+
+
+def get_review_states(user_id: int, question_ids: list[int] | None = None,
+                      course_id=None) -> list[dict]:
+    conn = get_connection()
+    query = "SELECT * FROM user_question_review WHERE user_id = ?"
+    params: list = [user_id]
     if course_id is not None:
         query += " AND course_id = ?"
         params.append(course_id)
-    query += " ORDER BY completed_at DESC LIMIT ?"
+    if question_ids:
+        placeholders = ",".join("?" for _ in question_ids)
+        query += f" AND question_id IN ({placeholders})"
+        params.extend(question_ids)
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_attempts(user_id: int, limit: int = 50,
+                 course_id=None, course_ids=None) -> list:
+    conn   = get_connection()
+    query  = ("SELECT DISTINCT ea.* FROM exam_attempts ea ")
+    params = [user_id]
+    if course_ids is not None:
+        course_ids = [cid for cid in course_ids if cid is not None]
+        if not course_ids:
+            conn.close()
+            return []
+        placeholders = ",".join("?" for _ in course_ids)
+        query += (
+            "JOIN user_answers ua ON ua.attempt_id = ea.id "
+            "JOIN questions q ON ua.question_id = q.id "
+            "WHERE ea.user_id = ? AND ea.completed_at IS NOT NULL "
+            f"AND q.course_id IN ({placeholders})"
+        )
+        params.extend(course_ids)
+    else:
+        query += "WHERE ea.user_id = ? AND ea.completed_at IS NOT NULL"
+        if course_id is not None:
+            query += " AND ea.course_id = ?"
+            params.append(course_id)
+    query += " ORDER BY ea.completed_at DESC LIMIT ?"
     params.append(limit)
     rows = conn.execute(query, params).fetchall()
     conn.close()
@@ -1424,21 +1886,72 @@ def add_to_journal(user_id: int, question_id: int,
     conn.close()
 
 
-def get_mistake_journal(user_id: int, course_id=None) -> list:
+def get_mistake_journal(user_id: int, course_id=None, course_ids=None) -> list:
     conn   = get_connection()
     query  = """
         SELECT mj.*, q.stimulus, q.section_type, q.question_type,
-               q.difficulty, q.correct_answer, q.explanation,
+               q.difficulty, q.correct_answer, q.explanation, q.passage,
                q.choice_a, q.choice_b, q.choice_c, q.choice_d, q.choice_e,
-               q.course_id as q_course_id
+               q.course_id as q_course_id, c.title as course_title
         FROM mistake_journal mj
         JOIN questions q ON mj.question_id = q.id
+        LEFT JOIN courses c ON q.course_id = c.id
         WHERE mj.user_id = ?"""
     params = [user_id]
-    if course_id is not None:
+    if course_ids is not None:
+        course_ids = [cid for cid in course_ids if cid is not None]
+        if not course_ids:
+            conn.close()
+            return []
+        placeholders = ",".join("?" for _ in course_ids)
+        query += f" AND q.course_id IN ({placeholders})"
+        params.extend(course_ids)
+    elif course_id is not None:
         query += " AND q.course_id = ?"
         params.append(course_id)
     query += " ORDER BY mj.created_at DESC"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_review_activity(
+    user_id: int,
+    course_id=None,
+    course_ids=None,
+    reviewed_from=None,
+    reviewed_to=None,
+) -> list:
+    conn = get_connection()
+    query = """
+        SELECT mj.id, mj.question_id, mj.completed_at, mj.created_at,
+               q.section_type, q.question_type, q.difficulty,
+               q.course_id as q_course_id, c.title as course_title
+        FROM mistake_journal mj
+        JOIN questions q ON mj.question_id = q.id
+        LEFT JOIN courses c ON q.course_id = c.id
+        WHERE mj.user_id = ?
+          AND mj.is_completed = 1
+          AND mj.completed_at IS NOT NULL"""
+    params = [user_id]
+    if course_ids is not None:
+        course_ids = [cid for cid in course_ids if cid is not None]
+        if not course_ids:
+            conn.close()
+            return []
+        placeholders = ",".join("?" for _ in course_ids)
+        query += f" AND q.course_id IN ({placeholders})"
+        params.extend(course_ids)
+    elif course_id is not None:
+        query += " AND q.course_id = ?"
+        params.append(course_id)
+    if reviewed_from is not None:
+        query += " AND mj.completed_at >= ?"
+        params.append(str(reviewed_from))
+    if reviewed_to is not None:
+        query += " AND mj.completed_at < ?"
+        params.append(str(reviewed_to))
+    query += " ORDER BY mj.completed_at DESC"
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -1451,22 +1964,132 @@ def delete_journal_entry(entry_id: int) -> None:
     conn.close()
 
 
+def set_journal_entry_completed(entry_id: int, is_completed: bool) -> None:
+    conn = get_connection()
+    conn.execute(
+        """UPDATE mistake_journal
+           SET is_completed = ?,
+               completed_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END
+           WHERE id = ?""",
+        (1 if is_completed else 0, 1 if is_completed else 0, entry_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 # ── Analytics raw queries ─────────────────────────────────────────────────────
-def get_answer_stats(user_id: int, course_id=None) -> list:
+def get_answer_stats(
+    user_id: int,
+    course_id=None,
+    course_ids=None,
+    completed_from=None,
+    completed_to=None,
+) -> list:
     conn   = get_connection()
     query  = """
-        SELECT ua.is_correct, ua.time_spent_seconds, ua.is_flagged,
+        SELECT ua.attempt_id, ua.is_correct, ua.time_spent_seconds, ua.is_flagged,
                q.section_type, q.question_type, q.difficulty,
+               q.course_id as question_course_id, c.title as course_title,
                ea.mode, ea.completed_at, ea.course_id
         FROM user_answers ua
         JOIN exam_attempts ea ON ua.attempt_id = ea.id
         JOIN questions q      ON ua.question_id = q.id
+        LEFT JOIN courses c   ON q.course_id = c.id
         WHERE ea.user_id = ? AND ea.completed_at IS NOT NULL"""
     params = [user_id]
-    if course_id is not None:
-        query += " AND ea.course_id = ?"
+    if course_ids is not None:
+        course_ids = [cid for cid in course_ids if cid is not None]
+        if not course_ids:
+            conn.close()
+            return []
+        placeholders = ",".join("?" for _ in course_ids)
+        query += f" AND q.course_id IN ({placeholders})"
+        params.extend(course_ids)
+    elif course_id is not None:
+        query += " AND q.course_id = ?"
         params.append(course_id)
+    if completed_from is not None:
+        query += " AND ea.completed_at >= ?"
+        params.append(str(completed_from))
+    if completed_to is not None:
+        query += " AND ea.completed_at < ?"
+        params.append(str(completed_to))
     query += " ORDER BY ea.completed_at"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_answer_drilldown(
+    user_id: int,
+    attempt_id: int | None = None,
+    course_id=None,
+    course_ids=None,
+    section_type: str | None = None,
+    question_type: str | None = None,
+    difficulty: int | None = None,
+    is_correct: bool | None = None,
+    completed_from=None,
+    completed_to=None,
+    limit: int = 200,
+) -> list:
+    """Return answered-question detail rows for dashboard drilldowns."""
+    conn = get_connection()
+    query = """
+        SELECT ua.id as answer_id, ua.attempt_id, ua.question_id,
+               ua.selected_answer, ua.is_correct, ua.time_spent_seconds,
+               ua.is_flagged, ua.section_number,
+               q.passage, q.stimulus, q.choice_a, q.choice_b, q.choice_c,
+               q.choice_d, q.choice_e, q.correct_answer, q.explanation,
+               q.wrong_answer_a, q.wrong_answer_b, q.wrong_answer_c,
+               q.wrong_answer_d, q.wrong_answer_e,
+               q.section_type, q.question_type, q.difficulty, q.source, q.tags,
+               q.course_id as question_course_id, c.title as course_title,
+               ea.mode, ea.completed_at
+        FROM user_answers ua
+        JOIN exam_attempts ea ON ua.attempt_id = ea.id
+        JOIN questions q      ON ua.question_id = q.id
+        LEFT JOIN courses c   ON q.course_id = c.id
+        WHERE ea.user_id = ? AND ea.completed_at IS NOT NULL"""
+    params = [user_id]
+
+    if attempt_id is not None:
+        query += " AND ua.attempt_id = ?"
+        params.append(int(attempt_id))
+
+    if course_ids is not None:
+        course_ids = [cid for cid in course_ids if cid is not None]
+        if not course_ids:
+            conn.close()
+            return []
+        placeholders = ",".join("?" for _ in course_ids)
+        query += f" AND q.course_id IN ({placeholders})"
+        params.extend(course_ids)
+    elif course_id is not None:
+        query += " AND q.course_id = ?"
+        params.append(course_id)
+
+    if section_type:
+        query += " AND q.section_type = ?"
+        params.append(section_type)
+    if question_type:
+        query += " AND q.question_type = ?"
+        params.append(question_type)
+    if difficulty is not None:
+        query += " AND q.difficulty = ?"
+        params.append(int(difficulty))
+    if is_correct is not None:
+        query += " AND ua.is_correct = ?"
+        params.append(int(bool(is_correct)))
+    if completed_from is not None:
+        query += " AND ea.completed_at >= ?"
+        params.append(str(completed_from))
+    if completed_to is not None:
+        query += " AND ea.completed_at < ?"
+        params.append(str(completed_to))
+
+    query += " ORDER BY ea.completed_at DESC, ua.id DESC LIMIT ?"
+    params.append(limit)
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -1686,7 +2309,8 @@ def update_material(material_id: int, title: str, material_type: str,
                     display_order: int = 0,
                     estimated_minutes: int = 0,
                     material_section: str = "Module",
-                    module_name: str = "") -> None:
+                    module_name: str = "",
+                    is_active: int | None = None) -> None:
     conn = get_connection()
     conn.execute(
         """UPDATE course_materials
@@ -1694,12 +2318,13 @@ def update_material(material_id: int, title: str, material_type: str,
                content_text = ?, external_url = ?, notes = ?,
                material_section = ?, module_name = ?,
                display_order = ?, estimated_minutes = ?,
+               is_active = COALESCE(?, is_active),
                updated_at = CURRENT_TIMESTAMP
            WHERE id = ?""",
         (title.strip(), _normalize_title(title), material_type, content_text,
          external_url.strip(), notes,
          material_section if material_section in MATERIAL_SECTIONS else "Module",
-         module_name.strip(), display_order, estimated_minutes, material_id),
+         module_name.strip(), display_order, estimated_minutes, is_active, material_id),
     )
     conn.commit()
     conn.close()
@@ -2123,6 +2748,191 @@ def get_questions_for_courses(course_ids: list,
             course_id=cid,
         )
     return result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Question Issue Reports
+# ═════════════════════════════════════════════════════════════════════════════
+
+QUESTION_REPORT_STATUSES = ["New", "Reviewing", "Resolved", "Dismissed"]
+
+
+def init_question_issue_tables() -> None:
+    """Create the question issue report table if needed."""
+    conn = get_connection()
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS question_issue_reports (
+               id              INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id         INTEGER NOT NULL,
+               question_id     INTEGER NOT NULL,
+               attempt_id      INTEGER,
+               issue_type      TEXT    DEFAULT 'Other',
+               note            TEXT    DEFAULT '',
+               selected_answer TEXT    DEFAULT '',
+               mode            TEXT    DEFAULT '',
+               status          TEXT    DEFAULT 'New',
+               admin_notes     TEXT    DEFAULT '',
+               resolved_at     TIMESTAMP,
+               created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               FOREIGN KEY (user_id)     REFERENCES users(id),
+               FOREIGN KEY (question_id) REFERENCES questions(id),
+               FOREIGN KEY (attempt_id)  REFERENCES exam_attempts(id)
+           )"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def create_question_issue_report(
+    user_id: int,
+    question_id: int,
+    attempt_id: int | None = None,
+    issue_type: str = "Other",
+    note: str = "",
+    selected_answer: str = "",
+    mode: str = "",
+) -> tuple[int | None, str | None]:
+    """Save a content-quality report for a question."""
+    init_question_issue_tables()
+    if not question_id:
+        return None, "Question is missing."
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            """INSERT INTO question_issue_reports
+               (user_id, question_id, attempt_id, issue_type, note,
+                selected_answer, mode)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                user_id,
+                question_id,
+                attempt_id,
+                issue_type.strip() or "Other",
+                note.strip(),
+                selected_answer.strip(),
+                mode.strip(),
+            ),
+        )
+        rid = cur.lastrowid
+        conn.commit()
+        return rid, None
+    except Exception as exc:
+        return None, str(exc)
+    finally:
+        conn.close()
+
+
+def get_question_issue_reports(
+    status: str | None = None,
+    course_ids: list[int] | None = None,
+    question_id: int | None = None,
+    search: str | None = None,
+) -> list:
+    """Return question reports for admin review, newest first."""
+    init_question_issue_tables()
+    conn = get_connection()
+    query = """
+        SELECT r.*, u.username,
+               q.question_id AS master_question_id,
+               q.course_id, q.section_type, q.question_type, q.difficulty,
+               q.passage, q.stimulus, q.choice_a, q.choice_b, q.choice_c,
+               q.choice_d, q.choice_e, q.correct_answer, q.explanation,
+               c.title AS course_title
+        FROM question_issue_reports r
+        JOIN users u     ON u.id = r.user_id
+        JOIN questions q ON q.id = r.question_id
+        LEFT JOIN courses c ON c.id = q.course_id
+        WHERE 1=1
+    """
+    params: list = []
+    if status:
+        query += " AND r.status = ?"
+        params.append(status)
+    if question_id is not None:
+        query += " AND r.question_id = ?"
+        params.append(int(question_id))
+    if course_ids is not None:
+        course_ids = [int(cid) for cid in course_ids if cid is not None]
+        if not course_ids:
+            conn.close()
+            return []
+        placeholders = ",".join("?" for _ in course_ids)
+        query += f" AND q.course_id IN ({placeholders})"
+        params.extend(course_ids)
+    if search:
+        like = f"%{search.strip()}%"
+        query += """
+            AND (
+                r.note LIKE ? OR r.issue_type LIKE ? OR r.admin_notes LIKE ?
+                OR u.username LIKE ? OR q.stimulus LIKE ?
+                OR q.question_id LIKE ?
+            )
+        """
+        params.extend([like, like, like, like, like, like])
+    query += " ORDER BY r.created_at DESC"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_question_issue_report(
+    report_id: int,
+    status: str,
+    admin_notes: str = "",
+) -> None:
+    """Update admin review state for a question issue report."""
+    init_question_issue_tables()
+    resolved_at = None
+    if status in ("Resolved", "Dismissed"):
+        resolved_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_connection()
+    conn.execute(
+        """UPDATE question_issue_reports
+           SET status = ?,
+               admin_notes = ?,
+               resolved_at = ?,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?""",
+        (status, admin_notes.strip(), resolved_at, report_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_question_issue_metrics(course_ids: list[int] | None = None) -> dict:
+    """Return aggregate report counts for the question-bank review queue."""
+    init_question_issue_tables()
+    conn = get_connection()
+    query = """
+        SELECT
+            COUNT(*) AS total,
+            COALESCE(SUM(CASE WHEN r.status = 'New' THEN 1 ELSE 0 END), 0) AS new_count,
+            COALESCE(SUM(CASE WHEN r.status = 'Reviewing' THEN 1 ELSE 0 END), 0) AS reviewing_count,
+            COALESCE(SUM(CASE WHEN r.status = 'Resolved' THEN 1 ELSE 0 END), 0) AS resolved_count,
+            COALESCE(SUM(CASE WHEN r.status = 'Dismissed' THEN 1 ELSE 0 END), 0) AS dismissed_count
+        FROM question_issue_reports r
+        JOIN questions q ON q.id = r.question_id
+        WHERE 1=1
+    """
+    params: list = []
+    if course_ids is not None:
+        course_ids = [int(cid) for cid in course_ids if cid is not None]
+        if not course_ids:
+            conn.close()
+            return {
+                "total": 0, "new_count": 0, "reviewing_count": 0,
+                "resolved_count": 0, "dismissed_count": 0,
+            }
+        placeholders = ",".join("?" for _ in course_ids)
+        query += f" AND q.course_id IN ({placeholders})"
+        params.extend(course_ids)
+    row = conn.execute(query, params).fetchone()
+    conn.close()
+    return dict(row) if row else {
+        "total": 0, "new_count": 0, "reviewing_count": 0,
+        "resolved_count": 0, "dismissed_count": 0,
+    }
 
 
 def get_curriculum_question_counts(curriculum_id: int) -> dict:

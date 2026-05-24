@@ -68,19 +68,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ".main .block-container": {
             "label":   "Page Container",
             "group":   "Layout",
-            "desktop": {"max-width": "1200px", "padding": "2rem 3rem"},
-            "laptop":  {"max-width": "100%",   "padding": "1.5rem 2rem"},
-            "tablet":  {"padding": "1.25rem 1.5rem"},
-            "mobile":  {"padding": "0.75rem 1rem"},
+            "desktop": {"max-width": "1220px", "padding": "2.1rem 2.6rem 4.5rem"},
+            "laptop":  {"max-width": "100%",   "padding": "1.6rem 2rem 4rem"},
+            "tablet":  {"padding": "1.25rem 1.35rem 3.5rem"},
+            "mobile":  {"padding": "1rem 0.9rem 3rem"},
         },
         # ── Page headings (h1/h2) ────────────────────────────────────────────
         ".main h1, .main h2": {
             "label":   "Page Headers",
             "group":   "Typography",
-            "desktop": {"font-size": "1.75rem", "margin-bottom": "0.5rem"},
-            "laptop":  {"font-size": "1.6rem"},
-            "tablet":  {"font-size": "1.4rem"},
-            "mobile":  {"font-size": "1.2rem", "margin-bottom": "0.25rem"},
+            "desktop": {"font-size": "2rem", "margin-bottom": "0.55rem", "font-weight": "800"},
+            "laptop":  {"font-size": "1.75rem"},
+            "tablet":  {"font-size": "1.5rem"},
+            "mobile":  {"font-size": "1.28rem", "margin-bottom": "0.25rem"},
         },
         # ── Subheadings (h3) ─────────────────────────────────────────────────
         ".main h3": {
@@ -94,8 +94,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ".stButton > button": {
             "label":   "Buttons",
             "group":   "Controls",
-            "desktop": {"min-height": "38px", "font-size": "14px",
-                        "padding": "0.375rem 0.75rem"},
+            "desktop": {"min-height": "40px", "font-size": "14px",
+                        "padding": "0.5rem 0.85rem", "border-radius": "8px"},
             "tablet":  {"min-height": "40px"},
             "mobile":  {"min-height": "44px", "font-size": "15px",
                         "padding": "0.5rem 1rem", "width": "100%"},
@@ -104,9 +104,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "[data-testid='stMetric']": {
             "label":   "KPI Metric Cards",
             "group":   "Cards",
-            "desktop": {"padding": "1rem", "font-size": "14px"},
-            "tablet":  {"padding": "0.75rem"},
-            "mobile":  {"padding": "0.5rem", "font-size": "12px"},
+            "desktop": {"padding": "1rem", "font-size": "14px", "border-radius": "8px"},
+            "tablet":  {"padding": "0.8rem"},
+            "mobile":  {"padding": "0.75rem", "font-size": "12px"},
         },
         # ── Column grid ──────────────────────────────────────────────────────
         "[data-testid='column']": {
@@ -146,7 +146,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ".stAlert": {
             "label":   "Alert / Info Boxes",
             "group":   "Cards",
-            "desktop": {"padding": "0.75rem 1rem", "font-size": "14px"},
+            "desktop": {"padding": "0.75rem 1rem", "font-size": "14px", "border-radius": "8px"},
             "mobile":  {"padding": "0.6rem 0.75rem", "font-size": "13px"},
         },
     },

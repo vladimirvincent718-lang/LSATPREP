@@ -17,10 +17,12 @@ from src.database   import (get_all_settings, get_attempts, get_attempt_answers,
 from src.exam_engine import (
     start_full_exam, advance_full_exam, submit_section,
     is_active, current_question, next_question, prev_question,
-    record_answer, toggle_flag, seconds_remaining, is_timed_out,
-    clear_quiz, _st, _set, _K, format_time,
+    record_answer, record_self_grade, toggle_flag, seconds_remaining, is_timed_out,
+    clear_quiz, resume_timer, persist_current_exam, restore_exam_draft,
+    _st, _set, _K, format_time,
 )
 from src.scoring import compute_score
+from src.question_loader import is_open_ended_question
 
 st.set_page_config(page_title="Full Exam · StudyForge", page_icon="📋", layout="wide")
 
@@ -32,8 +34,12 @@ from src.utils import course_selector
 course_id    = require_course(user_id)
 course       = get_course(course_id)
 course_title = course["title"] if course else "Unknown"
+restore_exam_draft(user_id, modes={"full_exam"}, course_id=course_id)
 
 page_header("📋 Full Exam Mode", f"Multi-section simulation — {course_title}")
+
+if st.session_state.pop("_exam_restored_notice", False):
+    st.success("Your in-progress full exam was restored with your saved answers and remaining time.")
 
 settings  = get_all_settings(user_id)
 hard_mode = settings.get("hard_mode", "false") == "true"
@@ -41,6 +47,7 @@ hard_mode = settings.get("hard_mode", "false") == "true"
 KEY_EXAM_RUNNING  = "full_exam_running"
 KEY_EXAM_COMPLETE = "full_exam_complete"
 KEY_ALL_REPORTS   = "full_exam_all_reports"
+KEY_CONFIRM_SUBMIT = "full_exam_confirm_submit"
 
 def exam_running():  return st.session_state.get(KEY_EXAM_RUNNING, False)
 def exam_complete(): return st.session_state.get(KEY_EXAM_COMPLETE, False)
@@ -52,12 +59,12 @@ if not exam_running() and not exam_complete():
 
     st.subheader("Full Exam Simulation")
     st.markdown(f"""
-**Structure** (LSAT-style defaults — works for any course with Logical Reasoning / Reading Comprehension sections):
+**Structure** (course-aware defaults):
 - **4 sections**, each 35 minutes (30 min in Hard Mode)
 - **3 scored** sections, **1 unscored** experimental section
 - **10-minute break** after Section 2
 
-For other course types, this mode uses whatever section types exist in your question bank.
+This mode uses the section types available in the active course question bank.
 
 > **Note:** Full Exam works best with at least 20+ questions covering multiple section types.
     """)
@@ -71,6 +78,14 @@ For other course types, this mode uses whatever section types exist in your ques
     if hard_mode:
         st.warning("⚡ Hard Mode is ON — 30-minute sections, harder questions.")
 
+    open_ended_mode = st.checkbox(
+        "Open-ended challenge - hide answer choices",
+        help=(
+            "Multiple choice is the default. Turn this on when you want to "
+            "remove the options and self-grade your written response."
+        ),
+    )
+
     if st.button("▶ Begin Full Exam", type="primary", use_container_width=True):
         from src.database import get_all_questions
         pool = get_all_questions(course_id=course_id)
@@ -78,10 +93,16 @@ For other course types, this mode uses whatever section types exist in your ques
             st.error(f"Need at least 5 questions in **{course_title}** to run a full exam.")
             st.stop()
 
-        start_full_exam(user_id, hard_mode=hard_mode, course_id=course_id)
+        start_full_exam(
+            user_id,
+            hard_mode=hard_mode,
+            course_id=course_id,
+            open_ended_mode=open_ended_mode,
+        )
         st.session_state[KEY_EXAM_RUNNING]  = True
         st.session_state[KEY_EXAM_COMPLETE] = False
         st.session_state[KEY_ALL_REPORTS]   = []
+        persist_current_exam(user_id)
         st.rerun()
 
     st.stop()
@@ -161,8 +182,12 @@ if on_break:
         st.session_state[_K["on_break"]] = False
         sec_idx  = st.session_state.get(_K["full_sec_idx"], 2)
         sections = st.session_state.get(_K["full_sections"], [])
-        from src.exam_engine import _start_full_section
-        _start_full_section(user_id, sec_idx, sections, hard_mode, course_id)
+        if is_active() and (_st("section_num") or 0) == sec_idx + 1:
+            resume_timer()
+            persist_current_exam(user_id)
+        else:
+            from src.exam_engine import _start_full_section
+            _start_full_section(user_id, sec_idx, sections, hard_mode, course_id)
         st.rerun()
     st.stop()
 
@@ -188,6 +213,7 @@ current_sec = sections[sec_idx] if sec_idx < len(sections) else {}
 
 if is_timed_out():
     st.warning("⏰ Time's up!")
+    st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
     report      = submit_section(user_id)
     all_reports = st.session_state.get(KEY_ALL_REPORTS, [])
     all_reports.append(report)
@@ -200,7 +226,12 @@ if is_timed_out():
 
 sec_type = current_sec.get("section_type", "")
 st.markdown(f"### Section {section_num} of 4 — {sec_type}")
-render_timer(remaining, total_secs)
+render_timer(
+    remaining,
+    total_secs,
+    key_prefix=f"full_exam_timer_s{section_num}",
+    allow_pause=not hard_mode,
+)
 st.progress(answered / total if total else 0, text=f"{answered}/{total} answered")
 
 n1, n2, n3, n4 = st.columns([1, 1, 4, 2])
@@ -215,7 +246,9 @@ with n3:
                         index=current_idx, label_visibility="collapsed", key="fe_jump")
     tidx = int(jump[1:]) - 1
     if tidx != current_idx:
-        st.session_state[_K["current_idx"]] = tidx; st.rerun()
+        st.session_state[_K["current_idx"]] = tidx
+        persist_current_exam(user_id)
+        st.rerun()
 with n4:
     flabel = "🚩 Unflag" if current_idx in flagged_set else "🏳️ Flag"
     if st.button(flabel, key="fe_flag"):
@@ -229,11 +262,27 @@ if q:
     from src.voice_exam import render_voice_exam_panel
     render_voice_exam_panel(q, current_idx, total)
 
+    open_ended = is_open_ended_question(q)
+    if open_ended:
+        existing_grade = (_st("self_grades") or {}).get(current_idx, True)
+        self_grade_choice = st.radio(
+            "Self-grade this written response before scoring:",
+            options=["Correct", "Incorrect"],
+            index=0 if existing_grade else 1,
+            horizontal=True,
+            key=f"fe_self_grade_{section_num}_{current_idx}",
+        )
+        record_self_grade(current_idx, self_grade_choice == "Correct")
+
     picked = render_question(
         q=q, idx=current_idx, total=total,
         selected=answers_dict.get(current_idx, ""),
         show_answer=False, is_flagged=(current_idx in flagged_set),
     )
+    if picked and picked != answers_dict.get(current_idx, ""):
+        record_answer(current_idx, picked)
+        answers_dict = _st("answers") or {}
+        answered = len(answers_dict)
     if st.button("✔ Record Answer", type="primary", use_container_width=True, key="fe_submit_ans"):
         if not picked:
             st.warning("Select an answer first.")
@@ -250,11 +299,28 @@ col_s, col_q = st.columns(2)
 with col_s:
     btn_label = "🏁 Submit Section & Continue" if sec_idx < 3 else "🏁 Submit Final Section"
     if st.button(btn_label, type="primary", use_container_width=True):
-        if unanswered > 0 and not st.session_state.get("confirm_submit_fe"):
-            st.session_state["confirm_submit_fe"] = True
-            st.warning(f"{unanswered} questions unanswered. Click again to confirm.")
-        else:
-            st.session_state.pop("confirm_submit_fe", None)
+        st.session_state.pop("confirm_submit_fe", None)
+        st.session_state[KEY_CONFIRM_SUBMIT] = True
+        st.rerun()
+
+with col_q:
+    if not hard_mode:
+        if st.button("✖ Quit Exam", use_container_width=True):
+            for k in [KEY_EXAM_RUNNING, KEY_EXAM_COMPLETE]:
+                st.session_state.pop(k, None)
+            st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
+            clear_quiz(); st.rerun()
+
+if st.session_state.get(KEY_CONFIRM_SUBMIT):
+    detail = (
+        f" {unanswered} question(s) are unanswered."
+        if unanswered > 0 else ""
+    )
+    st.warning(f"Are you sure you want to submit this section?{detail}")
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Yes, submit section", type="primary", use_container_width=True):
+            st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
             report      = submit_section(user_id)
             all_reports = st.session_state.get(KEY_ALL_REPORTS, [])
             all_reports.append(report)
@@ -264,13 +330,10 @@ with col_s:
                 st.session_state[KEY_EXAM_COMPLETE] = True
                 st.session_state[KEY_EXAM_RUNNING]  = False
             st.rerun()
-
-with col_q:
-    if not hard_mode:
-        if st.button("✖ Quit Exam", use_container_width=True):
-            for k in [KEY_EXAM_RUNNING, KEY_EXAM_COMPLETE]:
-                st.session_state.pop(k, None)
-            clear_quiz(); st.rerun()
+    with cancel_col:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
+            st.rerun()
 
 with st.sidebar:
     st.markdown(f"**Section {section_num}/4 Question Map**")

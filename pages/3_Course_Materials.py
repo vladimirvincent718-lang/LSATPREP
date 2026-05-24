@@ -4,7 +4,7 @@ All enrolled users can view materials and track their own completion.
 Only admins can add, edit, or archive materials.
 """
 
-import sys, os, re
+import sys, os, re, html
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
@@ -40,7 +40,12 @@ page_header("📖 Course Materials", f"Course: {course_title}")
 # ── Constants ─────────────────────────────────────────────────────────────────
 PROGRESS_OPTIONS = ["Not Started", "In Progress", "Completed"]
 STATUS_ICONS     = {"Not Started": "⬜", "In Progress": "🔄", "Completed": "✅"}
-STATUS_COLORS    = {"Not Started": "#6B7280", "In Progress": "#F59E0B", "Completed": "#10B981"}
+RESOURCE_TYPE_TO_MATERIAL = {
+    "Video": "Video",
+    "Article": "Link",
+    "Document": "PDF/Document Link",
+    "Other": "Other",
+}
 
 TYPE_META = {
     "Reading":           ("📖", "#3B82F6"),
@@ -56,7 +61,7 @@ st.markdown("""
 <style>
 .mat-card {
     border: 1px solid #E5E7EB;
-    border-radius: 14px;
+    border-radius: 8px;
     padding: 0;
     margin-bottom: 16px;
     background: #fff;
@@ -89,7 +94,7 @@ st.markdown("""
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: 10px;
+    border-radius: 8px;
     flex-shrink: 0;
 }
 .mat-title-block { flex: 1; min-width: 0; }
@@ -102,6 +107,14 @@ st.markdown("""
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+.mat-title a {
+    color: inherit !important;
+    text-decoration: none !important;
+}
+.mat-title a:hover {
+    color: #1D4ED8 !important;
+    text-decoration: underline !important;
 }
 .mat-subtitle {
     font-size: 12px;
@@ -146,7 +159,7 @@ st.markdown("""
     align-items: center;
     gap: 6px;
     padding: 8px 16px;
-    border-radius: 9px;
+    border-radius: 8px;
     background: #EFF6FF;
     color: #1D4ED8 !important;
     text-decoration: none !important;
@@ -243,6 +256,22 @@ def _group_by_module(materials: list[dict]) -> dict[str, list[dict]]:
     return dict(sorted(grouped.items(), key=lambda item: item[0].lower()))
 
 
+def _parse_module_paste(raw: str) -> list[str]:
+    modules = []
+    seen = set()
+    for line in (raw or "").splitlines():
+        cells = [cell.strip() for cell in line.split("\t") if cell.strip()]
+        name = cells[0] if cells else line.strip()
+        if not name:
+            continue
+        key = " ".join(name.lower().split())
+        if key in seen:
+            continue
+        modules.append(name)
+        seen.add(key)
+    return modules
+
+
 def _modules_for_discovery(course_id: int, materials: list[dict]) -> list[dict]:
     saved_modules = get_course_modules(course_id)
     if saved_modules:
@@ -261,6 +290,258 @@ def _modules_for_discovery(course_id: int, materials: list[dict]) -> list[dict]:
     return infer_modules(materials)
 
 
+def _materials_for_module(module_name: str, materials: list[dict]) -> list[dict]:
+    target = module_name.strip().lower()
+    return [
+        mat for mat in materials
+        if _material_section(mat) == "Module"
+        and _module_name(mat).strip().lower() == target
+    ]
+
+
+def _render_resource_group(
+    label: str,
+    items: list[dict],
+    progress: dict,
+    user_id: int,
+    course_id: int,
+    admin: bool,
+) -> None:
+    if not items:
+        st.info(f"No {label.lower()} have been added to this module yet.")
+        return
+    for mat in items:
+        status = progress.get(mat["id"], "Not Started")
+        _render_mat_card(mat, status, user_id, course_id, admin)
+
+
+def _render_module_resource_view(
+    module_name: str,
+    module_materials: list[dict],
+    progress: dict,
+    user_id: int,
+    course_id: int,
+    admin: bool,
+) -> None:
+    st.markdown(f"### {module_name}")
+    videos = [m for m in module_materials if m.get("material_type") == "Video"]
+    articles = [m for m in module_materials if m.get("material_type") == "Link"]
+    documents = [m for m in module_materials if m.get("material_type") == "PDF/Document Link"]
+    other = [
+        m for m in module_materials
+        if m.get("material_type") not in {"Video", "Link", "PDF/Document Link"}
+    ]
+
+    video_tab, article_tab, document_tab, other_tab = st.tabs(
+        ["Videos", "Articles", "Documents", "Other"]
+    )
+    with video_tab:
+        _render_resource_group("Videos", videos, progress, user_id, course_id, admin)
+    with article_tab:
+        _render_resource_group("Articles", articles, progress, user_id, course_id, admin)
+    with document_tab:
+        _render_resource_group("Documents", documents, progress, user_id, course_id, admin)
+    with other_tab:
+        _render_resource_group("Other materials", other, progress, user_id, course_id, admin)
+
+
+def _render_modules_section(
+    course_modules: list[dict],
+    materials: list[dict],
+    progress: dict,
+    user_id: int,
+    course_id: int,
+    admin: bool,
+) -> None:
+    st.metric("Modules", len(course_modules))
+    selected_key = f"selected_module_detail_{course_id}"
+    module_names = [m["name"] for m in course_modules]
+    selected_module = st.session_state.get(selected_key)
+
+    if selected_module and selected_module in module_names:
+        if st.button("Back to modules", key=f"back_modules_{course_id}"):
+            st.session_state.pop(selected_key, None)
+            st.rerun()
+        _render_module_resource_view(
+            selected_module,
+            _materials_for_module(selected_module, materials),
+            progress,
+            user_id,
+            course_id,
+            admin,
+        )
+        return
+
+    if not course_modules:
+        st.info("No modules have been added to this course yet.")
+        return
+
+    for module in course_modules:
+        module_name = module["name"]
+        module_materials = _materials_for_module(module_name, materials)
+        videos = sum(1 for m in module_materials if m.get("material_type") == "Video")
+        articles = sum(1 for m in module_materials if m.get("material_type") == "Link")
+        documents = sum(1 for m in module_materials if m.get("material_type") == "PDF/Document Link")
+        total = len(module_materials)
+        with st.container(border=True):
+            name_col, stat_col, action_col = st.columns([4, 3, 1])
+            with name_col:
+                st.markdown(f"**{module_name}**")
+            with stat_col:
+                st.caption(
+                    f"{total} resources | {videos} videos | "
+                    f"{articles} articles | {documents} documents"
+                )
+            with action_col:
+                if st.button("Open", key=f"open_module_{course_id}_{module['id']}"):
+                    st.session_state[selected_key] = module_name
+                    st.rerun()
+
+
+def _resource_label_from_material_type(material_type: str) -> str:
+    reverse = {value: key for key, value in RESOURCE_TYPE_TO_MATERIAL.items()}
+    return reverse.get(material_type, "Other")
+
+
+def _batch_rows_for_materials(
+    materials: list[dict],
+    section: str,
+    course_modules: list[dict],
+) -> list[dict]:
+    rows = []
+    module_names = {m["name"].strip().lower() for m in course_modules}
+    for mat in materials:
+        if _material_section(mat) != section:
+            continue
+        module_name = _module_name(mat) if section == "Module" else ""
+        if section == "Module" and module_name.strip().lower() not in module_names:
+            continue
+        rows.append(
+            {
+                "ID": mat["id"],
+                "Module": module_name,
+                "Resource type": _resource_label_from_material_type(mat.get("material_type", "Other")),
+                "Title": mat.get("title", ""),
+                "URL": mat.get("external_url", ""),
+                "Content text": mat.get("content_text", ""),
+                "Notes": mat.get("notes", ""),
+                "Estimated minutes": int(mat.get("estimated_minutes") or 0),
+                "Display order": int(mat.get("display_order") or 0),
+                "Active": True,
+            }
+        )
+    if rows:
+        return rows
+    default_module = course_modules[0]["name"] if section == "Module" and course_modules else ""
+    return [
+        {
+            "ID": "",
+            "Module": default_module,
+            "Resource type": "Video" if section == "Module" else "Other",
+            "Title": "",
+            "URL": "",
+            "Content text": "",
+            "Notes": "",
+            "Estimated minutes": 0,
+            "Display order": 0,
+            "Active": True,
+        }
+    ]
+
+
+def _save_batch_materials(
+    edited_df: pd.DataFrame,
+    *,
+    section: str,
+    course_id: int,
+    user_id: int,
+) -> tuple[int, int, list[str]]:
+    saved = 0
+    skipped = 0
+    errors = []
+    seen_titles = set()
+
+    for idx, row in edited_df.fillna("").iterrows():
+        title = str(row.get("Title", "")).strip()
+        url = str(row.get("URL", "")).strip()
+        content = str(row.get("Content text", "")).strip()
+        notes = str(row.get("Notes", "")).strip()
+        module_name = str(row.get("Module", "")).strip() if section == "Module" else ""
+        resource_label = str(row.get("Resource type", "Other")).strip() or "Other"
+        material_type = RESOURCE_TYPE_TO_MATERIAL.get(resource_label, resource_label)
+        raw_id = str(row.get("ID", "")).strip()
+
+        if not any([title, url, content, notes, module_name]):
+            skipped += 1
+            continue
+        if not title:
+            errors.append(f"Row {idx + 1}: title is required.")
+            continue
+        title_key = " ".join(title.lower().split())
+        if title_key in seen_titles:
+            errors.append(f"Row {idx + 1}: duplicate title in batch: {title}")
+            continue
+        seen_titles.add(title_key)
+        if section == "Module" and not module_name:
+            errors.append(f"Row {idx + 1}: module is required.")
+            continue
+        if section == "Module" and material_type in {"Video", "Link", "PDF/Document Link"} and not url:
+            errors.append(f"Row {idx + 1}: URL is required for {resource_label}.")
+            continue
+        if not content and not url:
+            errors.append(f"Row {idx + 1}: add content text or a URL.")
+            continue
+
+        try:
+            estimated_minutes = int(float(row.get("Estimated minutes", 0) or 0))
+            display_order = int(float(row.get("Display order", 0) or 0))
+        except ValueError:
+            errors.append(f"Row {idx + 1}: estimated minutes and display order must be numbers.")
+            continue
+
+        is_active = 1 if bool(row.get("Active", True)) else 0
+        if raw_id:
+            try:
+                material_id = int(float(raw_id))
+            except ValueError:
+                errors.append(f"Row {idx + 1}: invalid ID.")
+                continue
+            update_material(
+                material_id,
+                title,
+                material_type,
+                content,
+                url,
+                notes,
+                display_order=display_order,
+                estimated_minutes=estimated_minutes,
+                material_section=section,
+                module_name=module_name,
+                is_active=is_active,
+            )
+            saved += 1
+        else:
+            _, err = create_material(
+                course_id=course_id,
+                title=title,
+                material_type=material_type,
+                content_text=content,
+                external_url=url,
+                notes=notes,
+                created_by_user_id=user_id,
+                display_order=display_order,
+                estimated_minutes=estimated_minutes,
+                is_active=is_active,
+                material_section=section,
+                module_name=module_name,
+            )
+            if err:
+                errors.append(f"Row {idx + 1}: {err}")
+            else:
+                saved += 1
+    return saved, skipped, errors
+
+
 def _render_mat_card(mat: dict, status: str, user_id: int,
                      course_id: int, admin: bool) -> None:
     mat_id     = mat["id"]
@@ -268,13 +549,10 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
     type_icon, accent = TYPE_META.get(m_type, ("📦", "#9CA3AF"))
     icon_bg    = accent + "18"
 
-    stat_icon  = STATUS_ICONS.get(status, "⬜")
-    stat_color = STATUS_COLORS.get(status, "#6B7280")
-    stat_bg    = stat_color + "18"
-
     raw_title    = (mat.get("title") or "Untitled").strip()
     display_title = _extract_display_title(raw_title)
     is_doc        = _is_document_content(raw_title)
+    url           = (mat.get("external_url") or "").strip()
 
     est      = mat.get("estimated_minutes") or 0
     added    = (mat.get("created_at") or "")[:10]
@@ -285,23 +563,49 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
     section = _material_section(mat)
     module = _module_name(mat) if section == "Module" else ""
     module_part = f"<span>{module}</span>" if module else ""
+    safe_title = html.escape(display_title)
+    safe_url = html.escape(url, quote=True)
+    title_html = (
+        f'<a href="{safe_url}" target="_blank" rel="noopener" title="{safe_title}">'
+        f'{safe_title}</a>'
+        if url
+        else f'<span title="{safe_title}">{safe_title}</span>'
+    )
 
-    st.markdown(f"""
-<div class="mat-card">
-  <div class="mat-card-header">
-    <div class="mat-accent-bar" style="background:{accent}"></div>
-    <div class="mat-icon" style="background:{icon_bg}">{type_icon}</div>
-    <div class="mat-title-block">
-      <div class="mat-title" title="{display_title}">{display_title}</div>
-      <div class="mat-subtitle">{est_part}{add_part}{module_part}<span style="color:{accent};font-weight:600">{m_type}</span></div>
-    </div>
-    <span class="mat-status-pill" style="color:{stat_color};background:{stat_bg}">{stat_icon}&thinsp;{status}</span>
-  </div>
+    with st.container(border=True):
+        row = st.columns([0.035, 0.055, 0.46, 0.15, 0.15, 0.15])
+        row[0].markdown(
+            f'<div class="mat-accent-bar" style="background:{accent};height:48px"></div>',
+            unsafe_allow_html=True,
+        )
+        row[1].markdown(
+            f'<div class="mat-icon" style="background:{icon_bg}">{type_icon}</div>',
+            unsafe_allow_html=True,
+        )
+        row[2].markdown(
+            f"""
+<div class="mat-title-block">
+  <div class="mat-title">{title_html}</div>
+  <div class="mat-subtitle">{est_part}{add_part}{module_part}<span style="color:{accent};font-weight:600">{m_type}</span></div>
 </div>
-""", unsafe_allow_html=True)
+""",
+            unsafe_allow_html=True,
+        )
+
+        for i, opt in enumerate(PROGRESS_OPTIONS):
+            s_icon = STATUS_ICONS[opt]
+            is_active = status == opt
+            if row[i + 3].button(
+                f"{s_icon} {opt}",
+                key=f"prog_{mat_id}_{opt}",
+                type="primary" if is_active else "secondary",
+                use_container_width=True,
+            ):
+                set_material_progress(user_id, mat_id, course_id, opt)
+                st.rerun()
 
     # ── Expandable body ───────────────────────────────────────────────────────
-    with st.expander("View content & mark progress", expanded=False):
+    with st.expander("Details", expanded=False):
 
         # Choose what to show as body text
         content_text = (mat.get("content_text") or "").strip()
@@ -311,32 +615,16 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
             st.markdown(body)      # renders full markdown: headers, tables, lists
 
         # URL / link
-        url = (mat.get("external_url") or "").strip()
         if url:
             if m_type == "Video":
                 link_label = "🎬 Open video"
-                if "youtube.com/watch?v=" in url or "youtu.be/" in url:
-                    try:
-                        vid_id = (
-                            url.split("youtu.be/")[-1].split("?")[0]
-                            if "youtu.be/" in url
-                            else url.split("v=")[-1].split("&")[0]
-                        )
-                        st.markdown(
-                            f'<iframe width="100%" height="315" '
-                            f'src="https://www.youtube.com/embed/{vid_id}" '
-                            f'frameborder="0" allowfullscreen></iframe>',
-                            unsafe_allow_html=True,
-                        )
-                    except Exception:
-                        pass
             elif m_type == "PDF/Document Link":
                 link_label = "📄 Open document"
             else:
                 link_label = "🔗 Open link"
 
             st.markdown(
-                f'<a class="mat-link-btn" href="{url}" target="_blank">{link_label} ↗</a>',
+                f'<a class="mat-link-btn" href="{safe_url}" target="_blank" rel="noopener">{link_label} ↗</a>',
                 unsafe_allow_html=True,
             )
 
@@ -348,21 +636,6 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
 
         if admin:
             st.caption(f"Display order: {mat.get('display_order', 0)}")
-
-        st.markdown("---")
-        st.markdown("**Your progress:**")
-        prog_cols = st.columns(len(PROGRESS_OPTIONS))
-        for i, opt in enumerate(PROGRESS_OPTIONS):
-            s_icon   = STATUS_ICONS[opt]
-            is_active = status == opt
-            if prog_cols[i].button(
-                f"{s_icon} {opt}",
-                key=f"prog_{mat_id}_{opt}",
-                type="primary" if is_active else "secondary",
-                use_container_width=True,
-            ):
-                set_material_progress(user_id, mat_id, course_id, opt)
-                st.rerun()
 
         if admin:
             st.markdown("---")
@@ -442,40 +715,20 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
 
 # ── Build tabs ────────────────────────────────────────────────────────────────
 if admin:
-    tab_view, tab_modules, tab_add, tab_discover = st.tabs(["Materials", "Modules", "Add Material", "Discover Resources"])
+    tab_view, tab_add, tab_discover = st.tabs(["Materials", "Add Material", "Discover Resources"])
 else:
-    tab_view, tab_modules = st.tabs(["Materials", "Modules"])
+    (tab_view,) = st.tabs(["Materials"])
     tab_add = None
     tab_discover = None
-
-
-# -- Tab 0: Module structure ---------------------------------------------------
-with tab_modules:
-    course_modules = get_course_modules(course_id)
-    st.metric("Modules", len(course_modules))
-
-    module_rows = [{"Module name": m["name"]} for m in course_modules]
-    if module_rows:
-        st.dataframe(
-            pd.DataFrame(module_rows),
-            hide_index=True,
-            use_container_width=True,
-        )
-    else:
-        st.info("No modules have been added to this course yet.")
 
 
 # ── Tab 1: View materials ─────────────────────────────────────────────────────
 with tab_view:
     materials = get_materials(course_id)
+    course_modules = get_course_modules(course_id)
     progress  = get_material_progress(user_id, course_id)
 
-    if not materials:
-        msg = "No materials have been added to this course yet."
-        if admin:
-            msg += " Use the **Add Material** tab above to get started."
-        st.info(msg)
-    else:
+    if materials:
         m_total     = len(materials)
         m_completed = sum(1 for m in materials if progress.get(m["id"]) == "Completed")
         m_pct = round(m_completed / m_total * 100) if m_total else 0
@@ -515,25 +768,31 @@ with tab_view:
                     _render_mat_card(mat, status, user_id, course_id, admin)
 
             with modules_tab:
-                st.caption("Module materials grouped by module name.")
-                if not module_materials:
-                    st.info("No module materials have been added to this course yet.")
-                else:
-                    modules = _group_by_module(module_materials)
-                    module_names = list(modules.keys())
-                    selected_module = st.radio(
-                        "Module",
-                        module_names,
-                        horizontal=True,
-                        key="selected_module_name",
-                    )
-                    st.markdown(f"### {selected_module}")
-                    for mat in modules[selected_module]:
-                        status = progress.get(mat["id"], "Not Started")
-                        _render_mat_card(mat, status, user_id, course_id, admin)
+                _render_modules_section(
+                    course_modules,
+                    materials,
+                    progress,
+                    user_id,
+                    course_id,
+                    admin,
+                )
 
 
 # ── Tab 2: Add material (admin only) ─────────────────────────────────────────
+    if not materials:
+        syllabus_tab, modules_tab = st.tabs(["Syllabus", "Modules"])
+        with syllabus_tab:
+            st.info("No syllabus materials have been added to this course yet.")
+        with modules_tab:
+            _render_modules_section(
+                course_modules,
+                materials,
+                progress,
+                user_id,
+                course_id,
+                admin,
+            )
+
 if tab_add is not None:
     with tab_add:
         st.markdown("### Add a Shared Material")
@@ -551,137 +810,256 @@ if tab_add is not None:
             help="Syllabus items appear in the course syllabus. Module items are grouped under a module name.",
             key="add_material_section",
         )
+        add_mode = st.radio(
+            "Mode",
+            ["Add one", "Batch add/edit"],
+            horizontal=True,
+            key="add_material_mode",
+        )
 
         if a_section == "Module":
             course_modules = get_course_modules(course_id)
-            st.metric("Modules", len(course_modules))
-            module_rows = [{"Module name": m["name"]} for m in course_modules]
-            if not module_rows:
-                module_rows = [{"Module name": ""}]
+            with st.expander("Manage module list", expanded=False):
+                st.metric("Modules", len(course_modules))
+                module_rows = [{"Module name": m["name"]} for m in course_modules]
+                if not module_rows:
+                    module_rows = [{"Module name": ""}]
 
-            with st.form("add_material_module_grid_form"):
-                edited_modules = st.data_editor(
-                    pd.DataFrame(module_rows),
+                with st.form("bulk_module_paste_form"):
+                    pasted_modules = st.text_area(
+                        "Paste module names",
+                        height=120,
+                        placeholder=(
+                            "stress test financial modules\n"
+                            "forecasting financials\n"
+                            "real estate finance\n"
+                            "trading"
+                        ),
+                    )
+                    paste_add, paste_replace = st.columns(2)
+                    add_pasted = paste_add.form_submit_button(
+                        "Add Pasted Rows",
+                        use_container_width=True,
+                    )
+                    replace_pasted = paste_replace.form_submit_button(
+                        "Replace With Paste",
+                        use_container_width=True,
+                    )
+
+                if add_pasted or replace_pasted:
+                    parsed_modules = _parse_module_paste(pasted_modules)
+                    if not parsed_modules:
+                        st.warning("Paste at least one module name.")
+                    else:
+                        if add_pasted:
+                            existing_names = [m["name"] for m in course_modules]
+                            replace_course_modules(course_id, existing_names + parsed_modules)
+                        else:
+                            replace_course_modules(course_id, parsed_modules)
+                        st.success("Modules saved.")
+                        st.rerun()
+
+                with st.form("add_material_module_grid_form"):
+                    edited_modules = st.data_editor(
+                        pd.DataFrame(module_rows),
+                        column_config={
+                            "Module name": st.column_config.TextColumn(
+                                "Module name",
+                                required=False,
+                                width="large",
+                            )
+                        },
+                        hide_index=True,
+                        num_rows="dynamic",
+                        use_container_width=True,
+                        key="add_material_module_grid_editor",
+                    )
+                    save_modules = st.form_submit_button(
+                        "Save Modules",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if save_modules:
+                    names = edited_modules["Module name"].fillna("").astype(str).tolist()
+                    replace_course_modules(course_id, names)
+                    st.success("Modules saved.")
+                    st.rerun()
+
+        if add_mode == "Batch add/edit":
+            course_modules = get_course_modules(course_id)
+            include_existing = st.checkbox(
+                "Include existing materials",
+                value=False,
+                help="Load current materials into the grid so you can update them in bulk.",
+            )
+            source_materials = get_materials(course_id) if include_existing else []
+            batch_rows = _batch_rows_for_materials(source_materials, a_section, course_modules)
+            module_options = [m["name"] for m in course_modules]
+            resource_options = list(RESOURCE_TYPE_TO_MATERIAL.keys())
+            type_options = resource_options if a_section == "Module" else MATERIAL_TYPES
+
+            with st.form("batch_material_form"):
+                batch_df = st.data_editor(
+                    pd.DataFrame(batch_rows),
                     column_config={
-                        "Module name": st.column_config.TextColumn(
-                            "Module name",
-                            required=False,
-                            width="large",
-                        )
+                        "ID": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                        "Module": st.column_config.SelectboxColumn(
+                            "Destination module",
+                            options=module_options,
+                            required=(a_section == "Module"),
+                            disabled=(a_section != "Module"),
+                            width="medium",
+                        ),
+                        "Resource type": st.column_config.SelectboxColumn(
+                            "Resource type",
+                            options=type_options,
+                            required=True,
+                            width="small",
+                        ),
+                        "Title": st.column_config.TextColumn("Title", required=True, width="large"),
+                        "URL": st.column_config.TextColumn("URL", width="large"),
+                        "Content text": st.column_config.TextColumn("Content text", width="large"),
+                        "Notes": st.column_config.TextColumn("Notes", width="medium"),
+                        "Estimated minutes": st.column_config.NumberColumn("Estimated minutes", min_value=0, max_value=600),
+                        "Display order": st.column_config.NumberColumn("Display order", min_value=0, max_value=9999),
+                        "Active": st.column_config.CheckboxColumn("Active"),
                     },
                     hide_index=True,
                     num_rows="dynamic",
                     use_container_width=True,
-                    key="add_material_module_grid_editor",
+                    key="batch_material_editor",
                 )
-                save_modules = st.form_submit_button(
-                    "Save Modules",
+                save_batch = st.form_submit_button(
+                    "Save Batch Changes",
                     type="primary",
                     use_container_width=True,
                 )
 
-            if save_modules:
-                names = edited_modules["Module name"].fillna("").astype(str).tolist()
-                replace_course_modules(course_id, names)
-                st.success("Modules saved.")
-                st.rerun()
-
-        with st.form("add_material_form", clear_on_submit=True):
-            a_title = st.text_input(
-                "Title *",
-                placeholder="e.g., Chapter 1 Reading, Intro Video, Practice Problem Set",
-            )
-            a_type = st.selectbox("Material Type *", MATERIAL_TYPES)
-            existing_module_names = [m["name"] for m in get_course_modules(course_id)]
-            if a_section == "Module" and existing_module_names:
-                a_module = st.selectbox("Module name", existing_module_names)
-            else:
-                a_module = st.text_input(
-                    "Module name",
-                    disabled=(a_section != "Module"),
-                )
-
-            st.markdown("---")
-            st.markdown("**Content**")
-            st.caption(
-                "For Reading / Notes: paste text below (Markdown supported).  "
-                "For Video / Link / PDF: provide the URL.  You can use both."
-            )
-
-            a_content = st.text_area(
-                "Content text",
-                height=180,
-                placeholder=(
-                    "Paste reading text, lecture notes, summaries…\n"
-                    "Markdown is supported: ## Headings, **bold**, tables, lists."
-                ),
-            )
-            a_url = st.text_input(
-                "External URL",
-                placeholder="https://www.youtube.com/watch?v=...  or  https://example.com/file.pdf",
-            )
-
-            st.markdown("---")
-            a_notes = st.text_input(
-                "Notes / tags (optional)",
-                placeholder="e.g., 'Required reading', 'Chapter 3', 'Week 2'",
-            )
-
-            col1, col2 = st.columns(2)
-            with col1:
-                a_order = st.number_input(
-                    "Display order", min_value=0, max_value=9999, value=0, step=1,
-                    help="Materials are sorted by this number (low → high).",
-                )
-            with col2:
-                a_mins = st.number_input(
-                    "Estimated time (minutes)", min_value=0, max_value=600, value=0, step=5,
-                )
-
-            a_active = st.radio(
-                "Status",
-                ["Active (visible to learners)", "Inactive (hidden for now)"],
-                horizontal=True,
-            )
-
-            add_btn = st.form_submit_button(
-                "➕ Add Material", use_container_width=True, type="primary"
-            )
-
-        if add_btn:
-            if not a_title.strip():
-                st.error("⚠️ Title is required.")
-            elif a_section == "Module" and not a_module.strip():
-                st.error("Please add a module name for module materials.")
-            elif not a_content.strip() and not a_url.strip():
-                st.error("⚠️ Please provide either content text or an external URL.")
-            else:
-                is_active_val = 1 if "Active" in a_active else 0
-                mid, err = create_material(
-                    course_id=course_id,
-                    title=a_title.strip(),
-                    material_type=a_type,
-                    content_text=a_content.strip(),
-                    external_url=a_url.strip(),
-                    notes=a_notes.strip(),
-                    created_by_user_id=user_id,
-                    display_order=int(a_order),
-                    estimated_minutes=int(a_mins),
-                    is_active=is_active_val,
-                    material_section=a_section,
-                    module_name=a_module.strip() if a_section == "Module" else "",
-                )
-                if err:
-                    st.error(f"⚠️ {err}")
+            if save_batch:
+                if a_section == "Module" and not module_options:
+                    st.error("Add at least one module before saving module resources.")
                 else:
-                    status_word = "added" if is_active_val else "saved as draft"
-                    st.success(
-                        f"✅ **{a_title.strip()}** {status_word} successfully! "
-                        + ("Visible to all enrolled users now."
-                           if is_active_val
-                           else "Switch it to Active when ready.")
+                    saved, skipped, errors = _save_batch_materials(
+                        batch_df,
+                        section=a_section,
+                        course_id=course_id,
+                        user_id=user_id,
                     )
-                    st.rerun()
+                    if errors:
+                        st.error("Some rows need attention before they can be saved.")
+                        for msg in errors[:10]:
+                            st.caption(msg)
+                    if saved:
+                        st.success(f"Saved {saved} row(s).")
+                        st.rerun()
+                    elif skipped and not errors:
+                        st.info("No filled rows to save yet.")
+
+        else:
+            with st.form("add_material_form", clear_on_submit=True):
+                existing_module_names = [m["name"] for m in get_course_modules(course_id)]
+                with st.expander("Destination", expanded=True):
+                    if a_section == "Module":
+                        if existing_module_names:
+                            a_module = st.selectbox("Destination module *", existing_module_names)
+                        else:
+                            a_module = st.text_input("Destination module *")
+                        a_resource_type = st.radio(
+                            "Resource type *",
+                            list(RESOURCE_TYPE_TO_MATERIAL.keys()),
+                            horizontal=True,
+                        )
+                        a_type = RESOURCE_TYPE_TO_MATERIAL[a_resource_type]
+                    else:
+                        a_module = ""
+                        a_type = st.selectbox("Material Type *", MATERIAL_TYPES)
+
+                with st.expander("Material details", expanded=True):
+                    a_title = st.text_input(
+                        "Title *",
+                        placeholder="e.g., Chapter 1 Reading, Intro Video, Practice Problem Set",
+                    )
+                    a_notes = st.text_input(
+                        "Notes / tags (optional)",
+                        placeholder="e.g., 'Required reading', 'Chapter 3', 'Week 2'",
+                    )
+
+                with st.expander("Source and content", expanded=True):
+                    st.caption(
+                        "Paste text or notes below. For videos, articles, and documents, add the URL too."
+                    )
+                    a_content = st.text_area(
+                        "Content text",
+                        height=180,
+                        placeholder=(
+                            "Paste reading text, lecture notes, summaries...\n"
+                            "Markdown is supported: ## Headings, **bold**, tables, lists."
+                        ),
+                    )
+                    a_url = st.text_input(
+                        "External URL",
+                        placeholder="https://www.youtube.com/watch?v=...  or  https://example.com/file.pdf",
+                    )
+
+                with st.expander("Display settings", expanded=False):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        a_order = st.number_input(
+                            "Display order", min_value=0, max_value=9999, value=0, step=1,
+                            help="Materials are sorted by this number (low to high).",
+                        )
+                    with col2:
+                        a_mins = st.number_input(
+                            "Estimated time (minutes)", min_value=0, max_value=600, value=0, step=5,
+                        )
+
+                    a_active = st.radio(
+                        "Status",
+                        ["Active (visible to learners)", "Inactive (hidden for now)"],
+                        horizontal=True,
+                    )
+
+                add_btn = st.form_submit_button(
+                    "➕ Add Material", use_container_width=True, type="primary"
+                )
+
+            if add_btn:
+                if not a_title.strip():
+                    st.error("⚠️ Title is required.")
+                elif a_section == "Module" and not a_module.strip():
+                    st.error("Please choose the destination module for this resource.")
+                elif a_section == "Module" and a_type in {"Video", "Link", "PDF/Document Link"} and not a_url.strip():
+                    st.error("Please add the source URL for this resource.")
+                elif not a_content.strip() and not a_url.strip():
+                    st.error("⚠️ Please provide either content text or an external URL.")
+                else:
+                    is_active_val = 1 if "Active" in a_active else 0
+                    mid, err = create_material(
+                        course_id=course_id,
+                        title=a_title.strip(),
+                        material_type=a_type,
+                        content_text=a_content.strip(),
+                        external_url=a_url.strip(),
+                        notes=a_notes.strip(),
+                        created_by_user_id=user_id,
+                        display_order=int(a_order),
+                        estimated_minutes=int(a_mins),
+                        is_active=is_active_val,
+                        material_section=a_section,
+                        module_name=a_module.strip() if a_section == "Module" else "",
+                    )
+                    if err:
+                        st.error(f"⚠️ {err}")
+                    else:
+                        status_word = "added" if is_active_val else "saved as draft"
+                        st.success(
+                            f"✅ **{a_title.strip()}** {status_word} successfully! "
+                            + ("Visible to all enrolled users now."
+                               if is_active_val
+                               else "Switch it to Active when ready.")
+                        )
+                        st.rerun()
 
         st.divider()
         with st.expander("💡 Tips for each material type", expanded=False):

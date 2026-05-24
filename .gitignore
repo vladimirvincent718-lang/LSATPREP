@@ -2,6 +2,55 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
 .venv/
 venv/
 .DS_Store
+
+# Python caches and local tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Streamlit and local secrets
+.streamlit/secrets.toml
+secrets.toml
+credentials.json
+token.json
+client_secret*.json
+
+# Local databases, backups, and generated data
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.backup
+*_backup*
+*_before_*
+
+# Generated outputs and exports
+outputs/
+output/
+exports/
+export/
+dist/
+build/
+
+# Large media and archives
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.aac
+*.ogg
+*.zip
+*.7z
+*.rar

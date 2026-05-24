@@ -14,10 +14,13 @@ from src.utils       import (page_header, sidebar_nav, require_course,
 from src.database    import get_all_questions, get_all_settings, get_distinct_values, get_course
 from src.exam_engine import (
     start_quiz, clear_quiz, is_active, current_question,
-    next_question, prev_question, record_answer, submit_section,
+    next_question, prev_question, record_answer, record_self_grade, submit_section,
     toggle_flag, seconds_remaining, format_time, is_timed_out,
-    _st, _set, _K,
+    persist_current_exam, restore_exam_draft, _st, _set, _K,
 )
+from src.question_loader import is_open_ended_question
+
+TIMED_CONFIRM_SUBMIT_KEY = "timed_confirm_submit"
 
 st.set_page_config(page_title="Timed Exam · StudyForge", page_icon="⏱", layout="wide")
 
@@ -29,8 +32,12 @@ from src.utils import course_selector
 course_id    = require_course(user_id)
 course       = get_course(course_id)
 course_title = course["title"] if course else "Unknown"
+restore_exam_draft(user_id, modes={"timed_section"}, course_id=course_id)
 
 page_header("⏱ Timed Exam", f"One timed section — {course_title}")
+
+if st.session_state.pop("_exam_restored_notice", False):
+    st.success("Your in-progress timed section was restored with your saved answers and remaining time.")
 
 settings  = get_all_settings(user_id)
 hard_mode = settings.get("hard_mode", "false") == "true"
@@ -63,6 +70,14 @@ if not is_active():
             diff_max = 5 if hard_mode else int(settings.get("max_difficulty", "5"))
             diff_min = 4 if hard_mode else int(settings.get("min_difficulty", "1"))
 
+        open_ended_mode = st.checkbox(
+            "Open-ended challenge - hide answer choices",
+            help=(
+                "Multiple choice is the default. Turn this on when you want to "
+                "remove the options and self-grade your written response."
+            ),
+        )
+
         if hard_mode:
             st.warning("⚡ Hard Mode is ON — shorter timer, harder questions, no pausing.")
 
@@ -91,6 +106,7 @@ if not is_active():
             hard_mode=hard_mode,
             time_limit_seconds=int(time_min) * 60,
             course_id=course_id,
+            open_ended_mode=open_ended_mode,
         )
         st.rerun()
     from src.voice_exam import cleanup_voice_exam_panel
@@ -114,6 +130,7 @@ remaining = seconds_remaining()
 
 if is_timed_out():
     st.warning("⏰ Time's up! Submitting your answers now…")
+    st.session_state.pop(TIMED_CONFIRM_SUBMIT_KEY, None)
     report = submit_section(user_id)
     st.session_state["timed_report"] = report
     clear_quiz(); st.rerun()
@@ -126,7 +143,7 @@ if q is None:
 from src.voice_exam import render_voice_exam_panel
 render_voice_exam_panel(q, current_idx, total)
 
-render_timer(remaining, total_secs)
+render_timer(remaining, total_secs, key_prefix="timed_section_timer", allow_pause=not hard)
 st.progress(answered / total if total else 0, text=f"{answered}/{total} answered")
 
 n1, n2, n3, n4 = st.columns([1, 1, 4, 2])
@@ -143,7 +160,9 @@ with n3:
     )
     target_idx = int(jump[1:]) - 1
     if target_idx != current_idx:
-        st.session_state[_K["current_idx"]] = target_idx; st.rerun()
+        st.session_state[_K["current_idx"]] = target_idx
+        persist_current_exam(user_id)
+        st.rerun()
 with n4:
     flag_label = "🚩 Unflag" if current_idx in flagged_set else "🏳️ Flag"
     if st.button(flag_label):
@@ -154,10 +173,26 @@ st.divider()
 selected   = answers_dict.get(current_idx, "")
 is_flagged = current_idx in flagged_set
 
+open_ended = is_open_ended_question(q)
+if open_ended:
+    existing_grade = (_st("self_grades") or {}).get(current_idx, True)
+    self_grade_choice = st.radio(
+        "Self-grade this written response before scoring:",
+        options=["Correct", "Incorrect"],
+        index=0 if existing_grade else 1,
+        horizontal=True,
+        key=f"timed_self_grade_{current_idx}",
+    )
+    record_self_grade(current_idx, self_grade_choice == "Correct")
+
 picked = render_question(
     q=q, idx=current_idx, total=total,
     selected=selected, show_answer=False, is_flagged=is_flagged,
 )
+if picked and picked != selected:
+    record_answer(current_idx, picked)
+    answers_dict = _st("answers") or {}
+    answered = len(answers_dict)
 
 if st.button("✔ Record Answer", type="primary", use_container_width=True):
     if not picked:
@@ -177,15 +212,29 @@ if unanswered > 0:
 col_sub, col_quit = st.columns(2)
 with col_sub:
     if st.button("🏁 Submit Section", type="primary", use_container_width=True):
-        report = submit_section(user_id)
-        st.session_state["timed_report"] = report
-        clear_quiz(); st.rerun()
+        st.session_state[TIMED_CONFIRM_SUBMIT_KEY] = True
+        st.rerun()
 with col_quit:
     if not hard:
         if st.button("✖ Quit Without Saving", use_container_width=True):
+            st.session_state.pop(TIMED_CONFIRM_SUBMIT_KEY, None)
             clear_quiz(); st.rerun()
     else:
         st.caption("⚡ Hard Mode: Quit disabled during timed section.")
+
+if st.session_state.get(TIMED_CONFIRM_SUBMIT_KEY):
+    st.warning("Are you sure you want to submit this timed section?")
+    confirm_col, cancel_col = st.columns(2)
+    with confirm_col:
+        if st.button("Yes, submit section", type="primary", use_container_width=True):
+            st.session_state.pop(TIMED_CONFIRM_SUBMIT_KEY, None)
+            report = submit_section(user_id)
+            st.session_state["timed_report"] = report
+            clear_quiz(); st.rerun()
+    with cancel_col:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state.pop(TIMED_CONFIRM_SUBMIT_KEY, None)
+            st.rerun()
 
 # ── Sidebar question map ──────────────────────────────────────────────────────
 with st.sidebar:
