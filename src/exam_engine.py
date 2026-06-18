@@ -62,6 +62,24 @@ _DRAFT_PREFIXES = (
 
 _DRAFT_SKIP_SUFFIXES = ("_pdf", "_pdf_name")
 
+_DRAFT_TRANSIENT_KEYS = {
+    "ceb_flag",
+    "ceb_next",
+    "ceb_prev",
+    "ceb_rec",
+    "fe_flag",
+    "fe_next",
+    "fe_prev",
+    "fe_submit_ans",
+}
+
+_DRAFT_TRANSIENT_PREFIXES = (
+    "practice_timer_",
+    "timed_section_timer_",
+    "curriculum_exam_timer_",
+    "full_exam_timer_",
+)
+
 
 def _st(key) -> Any:
     return st.session_state.get(_K[key])
@@ -113,7 +131,17 @@ def _restore_index_keyed_dict(value: Any) -> dict:
 def _should_snapshot_key(key: str) -> bool:
     if key.endswith(_DRAFT_SKIP_SUFFIXES):
         return False
+    if _is_transient_widget_key(key):
+        return False
     return key in _K.values() or key.startswith(_DRAFT_PREFIXES)
+
+
+def _is_transient_widget_key(key: str) -> bool:
+    if key in _DRAFT_TRANSIENT_KEYS:
+        return True
+    if any(key.startswith(prefix) for prefix in _DRAFT_TRANSIENT_PREFIXES):
+        return True
+    return key.endswith(("_autorefresh", "_refresh"))
 
 
 def persist_current_exam(user_id: int | None = None) -> None:
@@ -135,13 +163,17 @@ def persist_current_exam(user_id: int | None = None) -> None:
     snapshot["exam_remaining_seconds"] = seconds_remaining()
     snapshot["exam_current_question_elapsed"] = time_on_current_question()
     snapshot["exam_saved_at"] = time.time()
-    save_exam_draft(
+    saved = save_exam_draft(
         user_id=user_id,
         attempt_id=attempt_id,
         mode=_st("mode") or "",
         course_id=_st("course_id"),
         state=snapshot,
     )
+    if not saved:
+        # A concurrent submit may have completed the attempt while this rerun
+        # still held stale active state. Do not let that rerun reopen the exam.
+        _set("active", False)
 
 
 def restore_exam_draft(
@@ -159,6 +191,9 @@ def restore_exam_draft(
     state = draft["state"]
     for key, value in state.items():
         if key in {"exam_remaining_seconds", "exam_current_question_elapsed", "exam_saved_at"}:
+            continue
+        if _is_transient_widget_key(str(key)):
+            st.session_state.pop(str(key), None)
             continue
         if key in {_K["answers"], _K["self_grades"]}:
             st.session_state[key] = _restore_index_keyed_dict(value)
@@ -388,10 +423,11 @@ def toggle_timer_pause() -> None:
 
 
 # ── Submit section ────────────────────────────────────────────────────────────
-def submit_section(user_id: int) -> dict:
+def submit_section(user_id: int, question_indices: list[int] | set[int] | tuple[int, ...] | None = None) -> dict:
     """
     Save all answers to DB, mark attempt complete, return score report.
     For full-exam mode, accumulates answers but does NOT mark complete yet.
+    When question_indices is provided, only those question slots are scored.
     """
     questions       = _st("questions") or []
     answers         = _st("answers") or {}
@@ -405,14 +441,25 @@ def submit_section(user_id: int) -> dict:
 
     from src.question_loader import is_open_ended_question
 
+    if question_indices is None:
+        scored_indices = list(range(len(questions)))
+    else:
+        scored_indices = sorted({
+            int(idx)
+            for idx in question_indices
+            if isinstance(idx, int) or str(idx).isdigit()
+        })
+        scored_indices = [idx for idx in scored_indices if 0 <= idx < len(questions)]
+
     answer_rows = []
-    for idx, q in enumerate(questions):
+    for idx in scored_indices:
+        q = questions[idx]
         selected   = answers.get(idx, "")
         if is_open_ended_question(q):
             is_correct = bool(selected.strip()) and bool(self_grades.get(idx, False))
         else:
             is_correct = selected.upper() == (q.get("correct_answer") or "").upper()
-        time_spent = max(0.0, (submitted_at - section_started) / max(len(questions), 1))
+        time_spent = max(0.0, (submitted_at - section_started) / max(len(scored_indices), 1))
 
         save_answer(
             attempt_id=attempt_id,
@@ -437,6 +484,10 @@ def submit_section(user_id: int) -> dict:
         })
 
     report = compute_score(answer_rows)
+    if question_indices is not None:
+        report["planned_total"] = len(questions)
+        report["scored_total"] = len(scored_indices)
+        report["excluded_unreached"] = max(0, len(questions) - len(scored_indices))
 
     if mode in ("practice", "timed_section"):
         complete_attempt(

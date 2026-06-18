@@ -14,7 +14,7 @@ import plotly.express as px
 import streamlit as st
 
 from src.auth import require_login
-from src.analytics import get_dashboard_stats
+from src.analytics import get_dashboard_stats, get_module_attempt_history
 from src.database import (
     get_all_curriculums,
     get_all_questions,
@@ -33,7 +33,10 @@ from src.database import (
     set_setting,
 )
 from src.ui_theme import apply_plotly_theme
-from src.utils import DIFFICULTY_LABELS, course_selector, page_header, sidebar_nav
+from src.utils import (
+    DIFFICULTY_LABELS, course_selector, page_header, sidebar_nav,
+    question_reference_label,
+)
 
 st.set_page_config(page_title="Dashboard - StudyForge", page_icon="📊", layout="wide")
 
@@ -449,6 +452,7 @@ def _report_builder(user_id: int, view_mode: str) -> set[str]:
         "Performance overview",
         "Daily activity",
         "Review activity",
+        "Module attempt report",
         "Score trend analysis",
         "Weakest courses",
         "Question reports",
@@ -460,6 +464,7 @@ def _report_builder(user_id: int, view_mode: str) -> set[str]:
         "Performance overview",
         "Daily activity",
         "Review activity",
+        "Module attempt report",
         "Score trend analysis",
         "Weakest courses",
         "Question reports",
@@ -922,6 +927,126 @@ def _time_grain_parts(time_grain: str) -> tuple[str, str]:
     return freq_map.get(time_grain, "D"), period_label
 
 
+def _render_review_day_drilldown(df: pd.DataFrame, key_prefix: str) -> None:
+    st.markdown("#### Reviews by Day")
+
+    pivot_df = df.copy()
+    pivot_df["Day"] = pivot_df["Reviewed At"].dt.strftime("%Y-%m-%d")
+    pivot_df["Difficulty Value"] = pd.to_numeric(pivot_df["difficulty"], errors="coerce")
+
+    day_df = (
+        pivot_df.groupby("Day")
+        .agg(
+            Reviews=("Day", "size"),
+            Courses=("Course", "nunique"),
+            Modules=("Module", "nunique"),
+            Latest_Review=("Reviewed At", "max"),
+        )
+        .reset_index()
+        .sort_values("Day", ascending=False)
+        .rename(columns={"Latest_Review": "Latest Review"})
+    )
+    day_df["Latest Review"] = day_df["Latest Review"].dt.strftime("%Y-%m-%d %H:%M")
+
+    st.dataframe(
+        day_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Reviews": st.column_config.NumberColumn("Reviews", format="%d"),
+            "Courses": st.column_config.NumberColumn("Courses", format="%d"),
+            "Modules": st.column_config.NumberColumn("Modules", format="%d"),
+        },
+    )
+    st.caption("Open a day below to see the course and module breakdown for that review activity.")
+
+    for idx, (_, day_row) in enumerate(day_df.iterrows()):
+        day = day_row["Day"]
+        day_reviews = int(day_row["Reviews"])
+        day_slice = pivot_df[pivot_df["Day"] == day].copy()
+        with st.expander(f"{day} - {day_reviews} reviews", expanded=idx == 0):
+            course_df = (
+                day_slice.groupby("Course")
+                .agg(
+                    Reviews=("Course", "size"),
+                    Modules=("Module", "nunique"),
+                    Question_Types=("Question Type", "nunique"),
+                    Latest_Review=("Reviewed At", "max"),
+                )
+                .reset_index()
+                .sort_values(["Reviews", "Course"], ascending=[False, True])
+                .rename(
+                    columns={
+                        "Question_Types": "Question Types",
+                        "Latest_Review": "Latest Review",
+                    }
+                )
+            )
+            course_df["Latest Review"] = course_df["Latest Review"].dt.strftime("%H:%M")
+
+            st.markdown("##### Courses")
+            st.dataframe(
+                course_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Reviews": st.column_config.NumberColumn("Reviews", format="%d"),
+                    "Modules": st.column_config.NumberColumn("Modules", format="%d"),
+                    "Question Types": st.column_config.NumberColumn("Question Types", format="%d"),
+                },
+            )
+
+            course_options = course_df["Course"].tolist()
+            if len(course_options) > 1:
+                selected_course = st.selectbox(
+                    "Open course",
+                    course_options,
+                    key=f"{key_prefix}_review_day_{day}_course",
+                )
+                module_slice = day_slice[day_slice["Course"] == selected_course]
+            else:
+                selected_course = course_options[0]
+                module_slice = day_slice
+
+            module_df = (
+                module_slice.groupby(["Module", "Question Type"])
+                .agg(
+                    Reviews=("Module", "size"),
+                    Avg_Difficulty=("Difficulty Value", "mean"),
+                    Latest_Review=("Reviewed At", "max"),
+                )
+                .reset_index()
+                .sort_values(["Reviews", "Module", "Question Type"], ascending=[False, True, True])
+                .rename(
+                    columns={
+                        "Avg_Difficulty": "Avg Difficulty",
+                        "Latest_Review": "Latest Review",
+                    }
+                )
+            )
+            module_df["Avg Difficulty"] = module_df["Avg Difficulty"].round(1)
+            module_df["Latest Review"] = module_df["Latest Review"].dt.strftime("%H:%M")
+
+            st.markdown(f"##### Modules in {selected_course}")
+            st.dataframe(
+                module_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Reviews": st.column_config.NumberColumn("Reviews", format="%d"),
+                    "Avg Difficulty": st.column_config.NumberColumn("Avg Difficulty", format="%.1f"),
+                },
+            )
+
+            detail = module_slice.sort_values("Reviewed At", ascending=False)[
+                ["Reviewed At", "Module", "Question Type", "difficulty"]
+            ].rename(columns={"difficulty": "Difficulty"})
+            detail["Reviewed At"] = detail["Reviewed At"].dt.strftime("%H:%M")
+
+            st.markdown(f"##### Review Rows in {selected_course}")
+            st.dataframe(detail, use_container_width=True, hide_index=True)
+
+
 def _render_review_activity(
     user_id: int,
     title: str,
@@ -1010,12 +1135,7 @@ def _render_review_activity(
         )
         st.dataframe(course_df, use_container_width=True, hide_index=True)
 
-    st.markdown("#### Reviewed Mistakes")
-    display = df.sort_values("Reviewed At", ascending=False)[
-        ["Reviewed At", "Course", "Module", "Question Type", "difficulty"]
-    ].rename(columns={"difficulty": "Difficulty"})
-    display["Reviewed At"] = display["Reviewed At"].dt.strftime("%Y-%m-%d %H:%M")
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    _render_review_day_drilldown(df, key_prefix)
 
 
 def _render_question_reports(
@@ -1372,6 +1492,122 @@ def _render_kpi_drilldown(
             )
 
 
+def _render_module_attempt_report(
+    user_id: int,
+    *,
+    key_prefix: str,
+    course_id: int | None = None,
+    course_ids: list[int] | None = None,
+    completed_from=None,
+    completed_to=None,
+) -> dict | None:
+    st.markdown("### Module Attempt Report")
+    module_df = get_module_attempt_history(
+        user_id,
+        course_id=course_id,
+        course_ids=course_ids,
+        completed_from=completed_from,
+        completed_to=completed_to,
+    )
+    if module_df.empty:
+        st.caption("Complete a module practice session to see attempt dates and scores here.")
+        return None
+
+    latest_df = (
+        module_df[module_df["Latest"]]
+        .sort_values(["Course", "Module"])
+        .rename(
+            columns={
+                "Date": "Last Attempt Date",
+                "Attempt #": "Last Attempt #",
+                "% Correct": "Score",
+            }
+        )
+    )
+    latest_display = latest_df[
+        ["Course", "Module", "Last Attempt #", "Last Attempt Date", "Score", "Correct", "Questions", "Mode"]
+    ].copy()
+    latest_display["Last Attempt Date"] = latest_display["Last Attempt Date"].dt.strftime("%Y-%m-%d %H:%M")
+    st.dataframe(
+        latest_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Score": st.column_config.ProgressColumn(
+                "Score",
+                format="%.1f%%",
+                min_value=0,
+                max_value=100,
+            ),
+            "Last Attempt #": st.column_config.NumberColumn("Last Attempt #", format="%d"),
+            "Questions": st.column_config.NumberColumn("Questions", format="%d"),
+            "Correct": st.column_config.NumberColumn("Correct", format="%d"),
+        },
+    )
+
+    module_options = list(
+        module_df[["Course", "Module"]]
+        .drop_duplicates()
+        .sort_values(["Course", "Module"])
+        .itertuples(index=False, name=None)
+    )
+    selected_course, selected_module = st.selectbox(
+        "Practice module",
+        module_options,
+        key=f"{key_prefix}_module",
+        format_func=lambda item: item[1] if course_id is not None else f"{item[0]} - {item[1]}",
+    )
+
+    attempt_df = module_df[
+        (module_df["Course"] == selected_course)
+        & (module_df["Module"] == selected_module)
+    ].sort_values("Attempt #", ascending=False)
+    attempt_options = attempt_df["Attempt ID"].tolist()
+    selected_attempt_id = st.selectbox(
+        "Attempt",
+        attempt_options,
+        key=f"{key_prefix}_attempt",
+        format_func=lambda attempt_id: _module_attempt_option_label(attempt_df, attempt_id),
+    )
+    selected = attempt_df[attempt_df["Attempt ID"] == selected_attempt_id].iloc[0].to_dict()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Date", selected["Date"].strftime("%Y-%m-%d"))
+    c2.metric("Attempt #", int(selected["Attempt #"]))
+    c3.metric("Score", f"{selected['% Correct']:.1f}%")
+    c4.metric("Correct", f"{int(selected['Correct'])}/{int(selected['Questions'])}")
+
+    history_display = attempt_df[
+        ["Attempt #", "Date", "% Correct", "Correct", "Questions", "Mode", "Attempt ID"]
+    ].copy()
+    history_display["Date"] = history_display["Date"].dt.strftime("%Y-%m-%d %H:%M")
+    st.dataframe(
+        history_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "% Correct": st.column_config.ProgressColumn(
+                "Score",
+                format="%.1f%%",
+                min_value=0,
+                max_value=100,
+            ),
+            "Attempt #": st.column_config.NumberColumn("Attempt #", format="%d"),
+            "Attempt ID": None,
+        },
+    )
+    return selected
+
+
+def _module_attempt_option_label(attempt_df: pd.DataFrame, attempt_id: int) -> str:
+    row = attempt_df[attempt_df["Attempt ID"] == attempt_id].iloc[0]
+    return (
+        f"Attempt {int(row['Attempt #'])} - "
+        f"{row['Date'].strftime('%Y-%m-%d %H:%M')} - "
+        f"{row['% Correct']:.1f}%"
+    )
+
+
 def _render_answer_drilldown(
     user_id: int,
     *,
@@ -1460,6 +1696,9 @@ def _render_answer_drilldown(
             f"{str(row.get('stimulus') or '')[:90]}"
         )
         with st.expander(label, expanded=selected_answer_id is not None or idx == 1):
+            ref_label = question_reference_label(row)
+            if ref_label:
+                st.caption(ref_label)
             if row.get("passage"):
                 st.markdown("**Passage**")
                 st.markdown(row["passage"])
@@ -2061,6 +2300,29 @@ if view_mode == "Course":
             completed_to=time_context["completed_to"],
         )
 
+    if "Module attempt report" in report_sections:
+        st.divider()
+        selected_module_attempt = _render_module_attempt_report(
+            user_id,
+            key_prefix="course_module_attempt_report",
+            course_id=course_id,
+            completed_from=time_context["completed_from"],
+            completed_to=time_context["completed_to"],
+        )
+        if selected_module_attempt:
+            _render_answer_drilldown(
+                user_id,
+                title=(
+                    f"{selected_module_attempt['Module']} / "
+                    f"Attempt {int(selected_module_attempt['Attempt #'])}"
+                ),
+                attempt_id=int(selected_module_attempt["Attempt ID"]),
+                course_id=course_id,
+                section_type=selected_module_attempt["Module"],
+                completed_from=time_context["completed_from"],
+                completed_to=time_context["completed_to"],
+            )
+
     if "Question reports" in report_sections:
         st.divider()
         _render_question_reports(
@@ -2305,6 +2567,30 @@ else:
             completed_from=time_context["completed_from"],
             completed_to=time_context["completed_to"],
         )
+
+    if "Module attempt report" in report_sections:
+        st.divider()
+        selected_module_attempt = _render_module_attempt_report(
+            user_id,
+            key_prefix="curriculum_module_attempt_report",
+            course_ids=course_ids,
+            completed_from=time_context["completed_from"],
+            completed_to=time_context["completed_to"],
+        )
+        if selected_module_attempt:
+            _render_answer_drilldown(
+                user_id,
+                title=(
+                    f"{selected_module_attempt['Course']} / "
+                    f"{selected_module_attempt['Module']} / "
+                    f"Attempt {int(selected_module_attempt['Attempt #'])}"
+                ),
+                attempt_id=int(selected_module_attempt["Attempt ID"]),
+                course_ids=course_ids,
+                section_type=selected_module_attempt["Module"],
+                completed_from=time_context["completed_from"],
+                completed_to=time_context["completed_to"],
+            )
 
     if "Question reports" in report_sections:
         st.divider()

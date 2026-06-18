@@ -15,6 +15,14 @@ from src.database import (
     get_all_settings, set_setting, get_connection, DB_PATH,
     get_app_settings, set_app_setting,
 )
+from src.email_notifications import (
+    EMAIL_NOTIFICATIONS_KEY,
+    REQUIRED_SMTP_FIELDS,
+    SMTP_SETTING_KEYS,
+    TEST_START_COUNT_KEY,
+    USER_EMAIL_KEY,
+)
+from src.exam_engine import persist_current_exam
 
 st.set_page_config(page_title="Settings · StudyForge", page_icon="⚙️", layout="wide")
 
@@ -39,6 +47,17 @@ with tab_general:
             min_value=5, max_value=120,
             value=int(settings.get("section_time_minutes", "35")),
             help="Used for Timed Exam when hard mode is off.",
+        )
+        question_time = st.number_input(
+            "Default Time Per Question (seconds)",
+            min_value=15,
+            max_value=600,
+            value=int(settings.get("question_time_seconds", "120")),
+            step=5,
+            help=(
+                "Used as the default per-question timer in Practice Mode. "
+                "You can still adjust it during an active practice session."
+            ),
         )
         diff_range = st.select_slider(
             "Difficulty Range (for question selection)",
@@ -79,10 +98,21 @@ with tab_general:
 
     if save_general:
         set_setting(user_id, "section_time_minutes", str(sec_time))
+        set_setting(user_id, "question_time_seconds", str(question_time))
         set_setting(user_id, "min_difficulty",       str(diff_range[0]))
         set_setting(user_id, "max_difficulty",       str(diff_range[1]))
         set_setting(user_id, "show_explanations",    show_exp)
         set_setting(user_id, "question_mix",         q_mix)
+        if (
+            st.session_state.get("exam_active")
+            and st.session_state.get("exam_mode") == "practice"
+            and st.session_state.get("practice_timer_enabled")
+        ):
+            st.session_state["practice_timer_seconds"] = int(question_time)
+            st.session_state["practice_setup_timer_seconds"] = int(question_time)
+            st.session_state["exam_time_limit"] = int(question_time)
+            st.session_state["exam_timer_visible"] = True
+            persist_current_exam(user_id)
         st.success("General settings saved.")
 
 # ── Hard mode settings ────────────────────────────────────────────────────────
@@ -174,6 +204,105 @@ with tab_account:
             st.success("Integration settings saved.")
 
         st.divider()
+
+    if admin:
+        st.markdown("#### Email Delivery")
+        st.caption(
+            "These app-wide SMTP settings power exam-start emails. "
+            "Users only control their own recipient address and notification toggle."
+        )
+        email_settings = get_app_settings(SMTP_SETTING_KEYS)
+        missing_smtp = [
+            label
+            for setting_key, label in {
+                "smtp_host": REQUIRED_SMTP_FIELDS["host"],
+                "smtp_port": REQUIRED_SMTP_FIELDS["port"],
+                "smtp_from_email": REQUIRED_SMTP_FIELDS["from_email"],
+            }.items()
+            if not str(email_settings.get(setting_key) or "").strip()
+        ]
+        if missing_smtp:
+            st.warning(
+                "Email delivery is not ready. Missing: "
+                + ", ".join(missing_smtp)
+                + "."
+            )
+        with st.form("smtp_email_settings"):
+            smtp_host = st.text_input(
+                "SMTP host",
+                value=email_settings.get("smtp_host", ""),
+                placeholder="smtp.gmail.com",
+            )
+            smtp_port = st.text_input(
+                "SMTP port",
+                value=email_settings.get("smtp_port", "587") or "587",
+            )
+            smtp_username = st.text_input(
+                "SMTP username",
+                value=email_settings.get("smtp_username", ""),
+            )
+            smtp_password = st.text_input(
+                "SMTP password",
+                value=email_settings.get("smtp_password", ""),
+                type="password",
+            )
+            smtp_from = st.text_input(
+                "From email",
+                value=email_settings.get("smtp_from_email", ""),
+                placeholder="notifications@studyforge.local",
+            )
+            smtp_tls = st.toggle(
+                "Use TLS",
+                value=(email_settings.get("smtp_use_tls", "true") or "true") == "true",
+            )
+            save_smtp = st.form_submit_button(
+                "Save Email Delivery Settings",
+                use_container_width=True,
+            )
+
+        if save_smtp:
+            set_app_setting("smtp_host", smtp_host.strip())
+            set_app_setting("smtp_port", smtp_port.strip() or "587")
+            set_app_setting("smtp_username", smtp_username.strip())
+            set_app_setting("smtp_password", smtp_password)
+            set_app_setting("smtp_from_email", smtp_from.strip())
+            set_app_setting("smtp_use_tls", "true" if smtp_tls else "false")
+            st.success("Email delivery settings saved.")
+
+        st.divider()
+
+    st.markdown("#### Exam Email Notifications")
+    current_email = settings.get(USER_EMAIL_KEY, "")
+    current_enabled = settings.get(EMAIL_NOTIFICATIONS_KEY, "false") == "true"
+    current_count = settings.get(TEST_START_COUNT_KEY, "0")
+    with st.form("exam_email_notifications"):
+        profile_email = st.text_input(
+            "Email on file",
+            value=current_email,
+            placeholder="you@example.com",
+            help="StudyForge sends exam-start notifications to this address.",
+        )
+        notifications_on = st.toggle(
+            "Email me when an exam starts",
+            value=current_enabled,
+        )
+        st.caption(f"Current test count: {current_count}")
+        save_email_notifications = st.form_submit_button(
+            "Save Exam Email Settings",
+            use_container_width=True,
+        )
+
+    if save_email_notifications:
+        cleaned_email = profile_email.strip()
+        if cleaned_email and ("@" not in cleaned_email or "." not in cleaned_email.split("@")[-1]):
+            st.error("Enter a valid email address, or leave it blank.")
+        else:
+            set_setting(user_id, USER_EMAIL_KEY, cleaned_email)
+            set_setting(user_id, EMAIL_NOTIFICATIONS_KEY, "true" if notifications_on else "false")
+            st.success("Exam email settings saved.")
+            st.rerun()
+
+    st.divider()
 
     # Change password
     st.markdown("#### 🔑 Change Password")

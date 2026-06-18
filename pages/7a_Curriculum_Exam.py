@@ -17,7 +17,10 @@ import random
 import streamlit as st
 
 from src.auth       import require_login
-from src.utils      import page_header, sidebar_nav, render_question, render_timer
+from src.utils      import (
+    page_header, sidebar_nav, render_question, render_timer,
+    question_reference_label,
+)
 from src.database   import (
     get_all_courses, get_all_curriculums,
     get_curriculum_courses, get_weight_presets,
@@ -32,11 +35,13 @@ from src.exam_engine import (
     persist_current_exam, restore_exam_draft, _K, _st, _set, format_time,
 )
 from src.question_loader import is_open_ended_question
+from src.question_map import render_question_map, render_question_map_legend
 from src.curriculum_allocation import (
     equal_allocation, preset_allocation, manual_allocation, random_allocation,
     AllocationResult,
 )
 from src.pdf_export import generate_exam_pdf, make_pdf_filename
+from src.email_notifications import notify_exam_started
 from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Curriculum Exam · StudyForge",
@@ -58,6 +63,10 @@ KEY_EXAM_PDF     = "ceb_exam_pdf"
 KEY_EXAM_PDF_NAME = "ceb_exam_pdf_name"
 KEY_CONFIRM_SUBMIT = "ceb_confirm_submit"
 KEY_OPEN_ENDED_MODE = "ceb_open_ended_mode"
+
+email_notice = st.session_state.pop("exam_email_notice", None)
+if email_notice:
+    st.info(email_notice)
 
 if st.session_state.pop("_exam_restored_notice", False):
     st.success("Your in-progress exam was restored with your saved answers and remaining time.")
@@ -84,6 +93,18 @@ def _launch_exam(uid, questions, label, timed, mins, course_id, dist):
         section_num=1, course_id=course_id,
         open_ended_mode=st.session_state.get(KEY_OPEN_ENDED_MODE, False),
     )
+    course_name = dist[0].get("course", "Course") if len(dist or []) == 1 else "Multiple Courses"
+    result = notify_exam_started(
+        uid,
+        course_name=course_name,
+        module_name=label,
+        exam_label=label,
+        pdf_bytes=st.session_state.get(KEY_EXAM_PDF),
+        pdf_filename=st.session_state.get(KEY_EXAM_PDF_NAME),
+        question_count=len(questions),
+    )
+    if result.sent or result.message != "Email notifications are off.":
+        st.session_state["exam_email_notice"] = result.message
     st.session_state[KEY_EXAM_SOURCE]  = label
     st.session_state[KEY_DISTRIBUTION] = dist
     set_stage("running")
@@ -153,8 +174,12 @@ if get_stage() == "complete":
         if attempt_id:
             for i, row in enumerate(get_attempt_answers(attempt_id)):
                 icon = "OK" if row["is_correct"] else "X"
+                ref_label = question_reference_label(row, include_prefix=False)
+                title = f"**Q{i+1}**"
+                if ref_label:
+                    title += f" ({ref_label})"
                 st.markdown(
-                    f"**Q{i+1}** {icon}  "
+                    f"{title} {icon}  "
                     f"Your: **{row['selected_answer'] or 'skipped'}** | "
                     f"Correct: **{row['correct_answer']}**"
                 )
@@ -278,13 +303,26 @@ if get_stage() == "running":
                 st.rerun()
     with st.sidebar:
         st.markdown("**Question Map**")
-        st.caption("Green=Answered  White=Skipped  Flag=Flagged")
-        mcols = st.columns(5)
-        for i in range(total):
+        render_question_map_legend(scored=False)
+
+        def _curriculum_map_state(i: int) -> dict[str, object]:
             flag = i in flagged_set
             icon = "F" if flag else ("+" if answers_dict.get(i,"") else "o")
+            return {
+                "status": "answered" if answers_dict.get(i, "") else "unanswered",
+                "flagged": flag,
+                "help": f"Go to question {i + 1}",
+            }
             if mcols[i%5].button(icon, key=f"cebmap_{i}"):
                 st.session_state[_K["current_idx"]] = i; st.rerun()
+        selected_map_idx = render_question_map(
+            total=total,
+            current_idx=current_idx,
+            state_for_index=_curriculum_map_state,
+            key_prefix="cebmap",
+        )
+        if selected_map_idx is not None:
+            st.session_state[_K["current_idx"]] = selected_map_idx; st.rerun()
     st.stop()
 
 

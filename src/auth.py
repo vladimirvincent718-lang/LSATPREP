@@ -13,9 +13,9 @@ Session architecture
    reads the cookie, validates the token against the DB, and restores
    st.session_state if the token is valid and not expired.
 4. On logout the token is deleted from the DB and the cookie is removed.
-5. Tokens expire after SESSION_DAYS (default 30).  The expiry is checked
-   server-side in the DB — the browser cookie expiry is kept in sync but is
-   not trusted as the sole source of truth.
+5. Tokens use a far-future expiry so refreshes and browser restarts keep the
+   user logged in.  Explicit logout still revokes the token server-side and
+   removes the browser cookie.
 """
 
 import hashlib
@@ -34,9 +34,12 @@ from src.database import (
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 COOKIE_NAME   = "sf_auth"          # browser cookie that stores the session token
+LAST_USERNAME_COOKIE_NAME = "sf_last_username"
 SESSION_DAYS  = SESSION_TOKEN_DAYS  # kept in sync with the DB-level expiry
 COOKIE_STATE_KEY = "_sf_cookies"
 COOKIE_LOAD_WAIT_KEY = "_sf_waited_for_cookie_load"
+COOKIE_LOAD_ATTEMPTS_KEY = "_sf_cookie_load_attempts"
+COOKIE_LOAD_MAX_ATTEMPTS = 5
 
 SECURITY_QUESTIONS = [
     "What was the name of your first pet?",
@@ -58,19 +61,61 @@ def _hash(value: str) -> str:
 
 def _get_cookie_controller():
     """
-    Return a CookieController instance, reusing the cached instance stored in
-    st.session_state so we never fire the underlying component more than once
-    per Streamlit script run.
+    Return a CookieController instance.
 
-    The CookieController itself caches all cookie values in
-    st.session_state["_sf_cookies"]; subsequent .get() calls are pure
-    dict lookups (no JS round-trip required).
+    CookieController caches values in st.session_state["_sf_cookies"].  After a
+    hard refresh that cache may start as an empty dict before the browser has
+    answered, so restore_session_from_cookie() can explicitly refresh it while
+    the cookie-load grace window is open.
     """
     from streamlit_cookies_controller import CookieController
     # CookieController stores cookie values at st.session_state[key].
     # Creating it with the same key on every call is safe: on the first call it
     # fires the JS component; on subsequent calls it reads from session_state.
     return CookieController(key=COOKIE_STATE_KEY)
+
+
+def _cookie_expires() -> datetime:
+    return datetime.now() + timedelta(days=SESSION_DAYS)
+
+
+def _remove_cookie(cc, name: str) -> None:
+    try:
+        cc.remove(name)
+    except KeyError:
+        # CookieController removes in the browser before popping its local cache.
+        pass
+
+
+def _remember_last_username(username: str) -> None:
+    clean_username = (username or "").strip()
+    if not clean_username:
+        return
+    st.session_state["last_login_username"] = clean_username
+    try:
+        cc = _get_cookie_controller()
+        cc.set(
+            LAST_USERNAME_COOKIE_NAME,
+            clean_username,
+            expires=_cookie_expires(),
+            same_site="strict",
+        )
+    except Exception:
+        pass
+
+
+def get_last_login_username() -> str:
+    username = st.session_state.get("last_login_username")
+    if username:
+        return str(username)
+    try:
+        username = _get_cookie_controller().get(LAST_USERNAME_COOKIE_NAME)
+    except Exception:
+        username = None
+    if username:
+        st.session_state["last_login_username"] = str(username)
+        return str(username)
+    return ""
 
 
 # ── Public session helpers ────────────────────────────────────────────────────
@@ -100,19 +145,27 @@ def restore_session_from_cookie() -> bool:
     sub-second delay.
     """
     if is_logged_in():
+        st.session_state.pop(COOKIE_LOAD_ATTEMPTS_KEY, None)
         return True
 
     try:
         cc    = _get_cookie_controller()
         token = cc.get(COOKIE_NAME)
         if not token:
+            attempts = int(st.session_state.get(COOKIE_LOAD_ATTEMPTS_KEY, 0))
+            cookie_cache = st.session_state.get(COOKIE_STATE_KEY)
+            if attempts < COOKIE_LOAD_MAX_ATTEMPTS and not cookie_cache:
+                try:
+                    cc.refresh()
+                except Exception:
+                    pass
             return False
 
         user = validate_session_token(token)
         if not user:
             # Token expired or revoked — remove the stale cookie
             try:
-                cc.remove(COOKIE_NAME)
+                _remove_cookie(cc, COOKIE_NAME)
             except Exception:
                 pass
             return False
@@ -120,6 +173,18 @@ def restore_session_from_cookie() -> bool:
         # ── Restore session state ─────────────────────────────────────────────
         st.session_state["user_id"]  = user["id"]
         st.session_state["username"] = user["username"]
+        _remember_last_username(user["username"])
+        st.session_state.pop(COOKIE_LOAD_WAIT_KEY, None)
+        st.session_state.pop(COOKIE_LOAD_ATTEMPTS_KEY, None)
+        try:
+            cc.set(
+                COOKIE_NAME,
+                token,
+                expires=_cookie_expires(),
+                same_site="strict",
+            )
+        except Exception:
+            pass
         return True
 
     except Exception:
@@ -129,10 +194,37 @@ def restore_session_from_cookie() -> bool:
 
 def cookie_load_is_pending() -> bool:
     """
-    True only for the first run where the browser cookie component has been
-    mounted but has not yet had a chance to return the real browser cookies.
+    True while the browser cookie component is still likely resolving.
+
+    CookieController may put an empty dict in session state before the browser
+    has returned the actual cookie values, so "key exists" is not enough to
+    prove there is no auth cookie after a hard refresh.
     """
-    return not is_logged_in() and COOKIE_STATE_KEY not in st.session_state
+    if is_logged_in():
+        return False
+
+    attempts = int(st.session_state.get(COOKIE_LOAD_ATTEMPTS_KEY, 0))
+    if attempts >= COOKIE_LOAD_MAX_ATTEMPTS:
+        return False
+
+    cookie_cache = st.session_state.get(COOKIE_STATE_KEY)
+    return COOKIE_STATE_KEY not in st.session_state or not cookie_cache
+
+
+def wait_for_cookie_load() -> None:
+    """
+    Give the browser cookie component a few reruns to hydrate cookies.
+    Callers should use this before rendering the login UI after a refresh.
+    """
+    if not cookie_load_is_pending():
+        return
+
+    st.session_state[COOKIE_LOAD_WAIT_KEY] = True
+    st.session_state[COOKIE_LOAD_ATTEMPTS_KEY] = (
+        int(st.session_state.get(COOKIE_LOAD_ATTEMPTS_KEY, 0)) + 1
+    )
+    st.caption("Restoring your saved sign-in...")
+    st.stop()
 
 
 def require_login() -> int:
@@ -142,23 +234,26 @@ def require_login() -> int:
     """
     restore_session_from_cookie()
     if not is_logged_in():
-        if cookie_load_is_pending() and not st.session_state.get(COOKIE_LOAD_WAIT_KEY):
-            st.session_state[COOKIE_LOAD_WAIT_KEY] = True
-            st.rerun()
-            st.stop()
+        wait_for_cookie_load()
         st.warning("Please log in from the Home page.")
         st.stop()
     st.session_state.pop(COOKIE_LOAD_WAIT_KEY, None)
+    st.session_state.pop(COOKIE_LOAD_ATTEMPTS_KEY, None)
     return st.session_state["user_id"]
 
 
 # ── Login / logout ────────────────────────────────────────────────────────────
 
-def login_user(username: str, password: str) -> tuple[bool, str]:
+def login_user(
+    username: str,
+    password: str,
+    remember_me: bool = True,
+) -> tuple[bool, str]:
     """
     Validate credentials.  On success:
       - Populates st.session_state with user_id and username.
-      - Creates a DB session token and writes it to a browser cookie.
+      - Creates a DB session token and writes it to a browser cookie when
+        remember_me is enabled.
     """
     user = get_user_by_username(username)
     if not user:
@@ -169,11 +264,19 @@ def login_user(username: str, password: str) -> tuple[bool, str]:
     # ── Populate session state ────────────────────────────────────────────────
     st.session_state["user_id"]  = user["id"]
     st.session_state["username"] = user["username"]
+    _remember_last_username(user["username"])
+
+    if not remember_me:
+        try:
+            _remove_cookie(_get_cookie_controller(), COOKIE_NAME)
+        except Exception:
+            pass
+        return True, "Logged in."
 
     # ── Create persistent token and set cookie ────────────────────────────────
     try:
         token   = create_session_token(user["id"], days=SESSION_DAYS)
-        expires = datetime.now() + timedelta(days=SESSION_DAYS)
+        expires = _cookie_expires()
         cc      = _get_cookie_controller()
         cc.set(
             COOKIE_NAME,
@@ -200,12 +303,18 @@ def logout() -> None:
         token = cc.get(COOKIE_NAME)
         if token:
             delete_session_token(token)
-            cc.remove(COOKIE_NAME)
+        _remove_cookie(cc, COOKIE_NAME)
     except Exception:
         pass
 
     # Clear all auth-related session state keys
-    for key in ("user_id", "username", "admin_view_mode"):
+    for key in (
+        "user_id",
+        "username",
+        "admin_view_mode",
+        COOKIE_LOAD_WAIT_KEY,
+        COOKIE_LOAD_ATTEMPTS_KEY,
+    ):
         st.session_state.pop(key, None)
 
 
@@ -270,11 +379,16 @@ def login_register_form() -> None:
 
     with tab_login:
         with st.form("login_form"):
-            uname = st.text_input("Username")
+            uname = st.text_input(
+                "Username",
+                value=get_last_login_username(),
+                key="login_username",
+            )
             pwd   = st.text_input("Password", type="password")
+            remember_me = st.checkbox("Keep me signed in", value=True)
             sub   = st.form_submit_button("Log In", use_container_width=True)
         if sub:
-            ok, msg = login_user(uname, pwd)
+            ok, msg = login_user(uname, pwd, remember_me=remember_me)
             if ok:
                 st.success(msg)
                 st.rerun()

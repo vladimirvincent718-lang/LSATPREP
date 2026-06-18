@@ -13,13 +13,13 @@ import streamlit as st
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from src.database import init_database
 from src.auth     import (
-    cookie_load_is_pending,
     is_logged_in,
     login_register_form,
     logout,
     restore_session_from_cookie,
+    wait_for_cookie_load,
 )
-from src.utils import inject_sidebar_page_labels
+from src.utils import inject_sidebar_page_labels, _review_mistakes_outstanding_count
 from src.ui_theme import feature_grid, hero, inject_modern_theme
 
 if __name__ == "__main__" and get_script_run_ctx() is None:
@@ -45,7 +45,6 @@ st.set_page_config(
 
 init_database()
 inject_modern_theme()
-inject_sidebar_page_labels()
 
 
 def main():
@@ -53,10 +52,9 @@ def main():
     # This must run BEFORE is_logged_in() so a returning user with a valid
     # cookie gets their session_state repopulated automatically.
     restore_session_from_cookie()
-    if cookie_load_is_pending() and not st.session_state.get("_sf_waited_for_cookie_load"):
-        st.session_state["_sf_waited_for_cookie_load"] = True
-        st.rerun()
-        st.stop()
+    wait_for_cookie_load()
+    user_id = st.session_state.get("user_id") if is_logged_in() else None
+    inject_sidebar_page_labels(_review_mistakes_outstanding_count(user_id))
 
     if not is_logged_in():
         hero(

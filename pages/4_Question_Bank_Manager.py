@@ -34,6 +34,75 @@ def _module_sort_key(label: str) -> tuple[int, int, str]:
     return (1, 0, label.lower())
 
 
+QUESTION_SEARCH_FIELDS = {
+    "Bank #": ("id",),
+    "Master ID": ("question_id",),
+    "Course": ("_course_title",),
+    "Section": ("section_type",),
+    "Type": ("question_type",),
+    "Difficulty": ("difficulty", "_difficulty_label"),
+    "Passage": ("passage",),
+    "Stimulus": ("stimulus",),
+    "Choices": ("choice_a", "choice_b", "choice_c", "choice_d", "choice_e"),
+    "Correct Answer": ("correct_answer",),
+    "Explanation": (
+        "explanation",
+        "wrong_answer_a", "wrong_answer_b", "wrong_answer_c",
+        "wrong_answer_d", "wrong_answer_e",
+    ),
+    "Source": ("source",),
+    "Tags": ("tags",),
+}
+
+
+def _question_search_blob(
+    q: dict,
+    field_labels: list[str],
+    course_titles: dict[int, str],
+) -> str:
+    values = []
+    enriched = {
+        **q,
+        "_course_title": course_titles.get(q.get("course_id"), ""),
+        "_difficulty_label": DIFFICULTY_LABELS.get(q.get("difficulty"), ""),
+    }
+    for label in field_labels:
+        for key in QUESTION_SEARCH_FIELDS.get(label, ()):
+            value = enriched.get(key, "")
+            if value not in (None, ""):
+                values.append(str(value))
+    return " ".join(values).lower()
+
+
+def _filter_questions_by_column_search(
+    questions: list[dict],
+    *,
+    query: str,
+    field_labels: list[str],
+    match_mode: str,
+    course_titles: dict[int, str],
+) -> list[dict]:
+    terms = [term.lower() for term in query.split() if term.strip()]
+    phrase = query.strip().lower()
+    if not phrase:
+        return questions
+    if not field_labels:
+        return []
+
+    matched = []
+    for q in questions:
+        blob = _question_search_blob(q, field_labels, course_titles)
+        if match_mode == "Exact phrase":
+            is_match = phrase in blob
+        elif match_mode == "Any term":
+            is_match = any(term in blob for term in terms)
+        else:
+            is_match = all(term in blob for term in terms)
+        if is_match:
+            matched.append(q)
+    return matched
+
+
 def _question_bank_analytics_rows(selected_course_ids: list[int],
                                   course_titles: dict[int, str]) -> list[dict]:
     rows = []
@@ -55,7 +124,10 @@ def _question_bank_analytics_rows(selected_course_ids: list[int],
     return rows
 
 from src.auth            import require_login
-from src.utils           import page_header, sidebar_nav, require_course, DIFFICULTY_LABELS, get_effective_admin
+from src.utils           import (
+    page_header, sidebar_nav, require_course, DIFFICULTY_LABELS,
+    get_effective_admin, question_reference_label,
+)
 from src.database        import (
     get_all_questions, get_course_question_count, delete_question,
     bulk_delete_questions,
@@ -63,6 +135,7 @@ from src.database        import (
     get_enrolled_courses, get_course_modules,
     QUESTION_REPORT_STATUSES, get_question_issue_metrics,
     get_question_issue_reports, update_question_issue_report,
+    get_archived_questions, restore_question, archive_question,
 )
 from src.question_loader import (
     process_upload,
@@ -88,8 +161,8 @@ page_header("🗂 Question Bank Manager",
 
 # ── Build tabs based on role ──────────────────────────────────────────────────
 if admin:
-    tab_browse, tab_reports, tab_upload, tab_template = st.tabs(
-        ["🔎 Browse Questions", "Report Issues", "⬆️ Upload Files", "📄 Download Template"]
+    tab_browse, tab_reports, tab_archive, tab_upload, tab_template = st.tabs(
+        ["🔎 Browse Questions", "Report Issues", "Archived Questions", "⬆️ Upload Files", "📄 Download Template"]
     )
 else:
     tab_browse, tab_template = st.tabs(
@@ -97,6 +170,7 @@ else:
     )
     tab_upload = None
     tab_reports = None
+    tab_archive = None
 
 
 # ── Tab: Browse ───────────────────────────────────────────────────────────────
@@ -168,6 +242,32 @@ with tab_browse:
                 key="b_diff",
             )
 
+        st.markdown("#### Search Questions")
+        search_col1, search_col2 = st.columns([2.4, 1])
+        with search_col1:
+            q_search = st.text_input(
+                "Search text",
+                placeholder="Bank #, master ID, module, stimulus, choices, explanation, source, tags...",
+                key="qbm_question_search_text",
+            )
+        with search_col2:
+            q_match_mode = st.selectbox(
+                "Match",
+                ["All terms", "Exact phrase", "Any term"],
+                key="qbm_question_search_match",
+            )
+        q_search_fields = st.multiselect(
+            "Search in columns",
+            options=list(QUESTION_SEARCH_FIELDS.keys()),
+            default=[
+                "Bank #", "Master ID", "Section", "Type", "Stimulus",
+                "Choices", "Explanation", "Source", "Tags",
+            ],
+            key="qbm_question_search_fields",
+        )
+        if q_search.strip() and not q_search_fields:
+            st.warning("Choose at least one column to search.")
+
         questions = []
         for cid in selected_course_ids:
             questions.extend(get_all_questions(
@@ -184,6 +284,13 @@ with tab_browse:
                 q.get("id") or 0,
             )
         )
+        questions = _filter_questions_by_column_search(
+            questions,
+            query=q_search,
+            field_labels=q_search_fields,
+            match_mode=q_match_mode,
+            course_titles=course_titles,
+        )
 
         st.caption(f"{len(questions)} question(s) match the filters")
 
@@ -193,6 +300,7 @@ with tab_browse:
             export_rows = []
             for q in questions:
                 export_rows.append({
+                    "bank_question_number": q.get("id", ""),
                     "course": course_titles.get(q.get("course_id"), ""),
                     "course_id": q.get("course_id", ""),
                     "question_id": q.get("question_id", ""),
@@ -229,11 +337,12 @@ with tab_browse:
                 key="qbm_full_csv_download",
                 help="Exports the full filtered questions, including answers and explanations.",
             )
-            # ── Selection state — managed entirely in our own key, never
-            #    touching the data_editor widget key (Streamlit forbids that).
-            #    _qbm_selected_ids is a set of integer question IDs.
+            # Selection state is stored as question IDs, while the grid reports
+            # selected row positions in the current filtered view.
             if "_qbm_selected_ids" not in st.session_state:
                 st.session_state["_qbm_selected_ids"] = set()
+            if "_qbm_grid_revision" not in st.session_state:
+                st.session_state["_qbm_grid_revision"] = 0
 
             current_ids = {q["id"] for q in questions}   # IDs in current filter view
 
@@ -244,20 +353,21 @@ with tab_browse:
 
                 if tb1.button("☑ Select All", use_container_width=True):
                     st.session_state["_qbm_selected_ids"] = set(current_ids)
+                    st.session_state["_qbm_grid_revision"] += 1
                     st.session_state.pop("qbm_confirm_delete", None)
 
                 if tb2.button("☐ Deselect All", use_container_width=True):
                     st.session_state["_qbm_selected_ids"] = set()
+                    st.session_state["_qbm_grid_revision"] += 1
                     st.session_state.pop("qbm_confirm_delete", None)
 
-            # ── Build display rows — Select column reflects our own state ─────
-            selected_set = st.session_state["_qbm_selected_ids"]
+            # Build display rows for a native selectable grid.
             rows = []
             for q in questions:
                 s = str(q.get("stimulus", ""))
                 rows.append({
-                    "Select":      q["id"] in selected_set,   # driven by our state
                     "ID":          q["id"],
+                    "Bank #":      q["id"],
                     "Master ID":   q.get("question_id", ""),
                     "Course":      course_titles.get(q.get("course_id"), ""),
                     "Section":     q.get("section_type", ""),
@@ -276,37 +386,39 @@ with tab_browse:
                 })
             df_all = pd.DataFrame(rows)
 
-            # ── Editable table with checkboxes ────────────────────────────────
-            # We pass a fresh df on every render with Select values matching
-            # _qbm_selected_ids.  The editor returns edited_df; we read it back
-            # and sync to _qbm_selected_ids so the state persists across reruns.
-            # We never write to st.session_state["qbm_question_editor"] directly
-            # — Streamlit forbids that for widget keys.
-            edited_df = st.data_editor(
+            # Clicking a row selects and highlights the whole row. The grid also
+            # keeps native keyboard cell navigation for spreadsheet-style review.
+            selection_default = {
+                "selection": {
+                    "rows": [
+                        i
+                        for i, row in df_all.iterrows()
+                        if int(row["ID"]) in st.session_state["_qbm_selected_ids"]
+                    ]
+                }
+            }
+            visible_signature = abs(hash(tuple(int(q["id"]) for q in questions)))
+            grid_event = st.dataframe(
                 df_all.drop(columns=["ID"]),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "Select": st.column_config.CheckboxColumn(
-                        "Select",
-                        help="Tick to include in bulk delete",
-                        default=False,
-                        width="small",
-                    ),
+                    "Bank #": st.column_config.NumberColumn("Bank #", format="%d"),
                 },
-                disabled=[
-                    "Master ID", "Course", "Section", "Type", "Difficulty",
-                    "Passage", "Stimulus", "Choice A", "Choice B", "Choice C",
-                    "Choice D", "Choice E", "Answer", "Explanation", "Source",
-                ],
-                key="qbm_question_editor",
+                on_select="rerun",
+                selection_mode="multi-row",
+                selection_default=selection_default,
+                key=(
+                    f"qbm_question_grid_"
+                    f"{st.session_state['_qbm_grid_revision']}_{visible_signature}"
+                ),
             )
 
-            # Sync editor output → our state (handles individual checkbox clicks)
+            # Sync native row selection to our selected question IDs.
             st.session_state["_qbm_selected_ids"] = {
                 int(df_all.iloc[i]["ID"])
-                for i, row in edited_df.iterrows()
-                if row["Select"]
+                for i in grid_event.selection.rows
+                if 0 <= i < len(df_all)
             }
 
             selected_ids = list(st.session_state["_qbm_selected_ids"])
@@ -381,6 +493,9 @@ with tab_browse:
                 q = next((x for x in questions if x["id"] == sel_qid), None)
                 if q:
                     with st.expander("📋 Full Question Details", expanded=True):
+                        ref_label = question_reference_label(q)
+                        if ref_label:
+                            st.caption(ref_label)
                         st.markdown(
                             f"**Course:** {course_titles.get(q.get('course_id'), '')}  |  "
                             f"**Section:** {q.get('section_type')}  |  "
@@ -501,6 +616,9 @@ if tab_reports is not None:
                 with st.expander(label, expanded=report.get("status") == "New"):
                     detail_cols = st.columns([2, 1])
                     with detail_cols[0]:
+                        ref_label = question_reference_label(report)
+                        if ref_label:
+                            st.caption(ref_label)
                         st.markdown("**Reported note**")
                         st.info(report.get("note") or "No note provided.")
                         st.markdown("**Question stimulus**")
@@ -524,6 +642,10 @@ if tab_reports is not None:
                         st.markdown(f"**Master ID:** {report.get('master_question_id') or '-'}")
                         st.markdown(f"**Section:** {report.get('section_type') or '-'}")
                         st.markdown(f"**Type:** {report.get('question_type') or '-'}")
+                        archive_label = "Archived" if report.get("is_archived") else "Active"
+                        st.markdown(f"**Bank status:** {archive_label}")
+                        if report.get("archive_reason"):
+                            st.caption(f"Archive reason: {report.get('archive_reason')}")
 
                     st.divider()
                     with st.form(f"qir_admin_update_{report['id']}"):
@@ -554,6 +676,123 @@ if tab_reports is not None:
                             admin_notes=admin_notes,
                         )
                         st.success("Report updated.")
+                        st.rerun()
+
+
+if tab_archive is not None:
+    with tab_archive:
+        st.markdown("### Archived Questions")
+        st.caption(
+            "Reported questions are archived automatically and removed from new "
+            "practice, timed section, full exam, and curriculum exam pools."
+        )
+
+        archive_courses = get_all_courses()
+        archive_course_ids = [c["id"] for c in archive_courses]
+        archive_course_titles = {c["id"]: c["title"] for c in archive_courses}
+
+        af1, af2 = st.columns([2, 2])
+        with af1:
+            selected_archive_course_ids = st.multiselect(
+                "Courses",
+                options=archive_course_ids,
+                default=archive_course_ids,
+                format_func=lambda cid: archive_course_titles.get(cid, str(cid)),
+                key="qbm_archive_course_filter",
+            )
+        with af2:
+            archive_search = st.text_input(
+                "Search archived questions",
+                placeholder="stimulus, master ID, section, type...",
+                key="qbm_archive_search",
+            )
+
+        archived_questions = get_archived_questions(
+            course_ids=selected_archive_course_ids,
+            search=archive_search.strip() or None,
+        )
+        st.metric("Archived questions", len(archived_questions))
+
+        if not archived_questions:
+            st.info("No archived questions match the current filters.")
+        else:
+            rows = [
+                {
+                    "ID": q.get("id"),
+                    "Master ID": q.get("question_id", ""),
+                    "Course": q.get("course_title", ""),
+                    "Section": q.get("section_type", ""),
+                    "Type": q.get("question_type", ""),
+                    "Reports": q.get("report_count", 0),
+                    "Archived At": str(q.get("archived_at") or "")[:16],
+                    "Reason": q.get("archive_reason", ""),
+                    "Stimulus": str(q.get("stimulus", ""))[:180],
+                }
+                for q in archived_questions
+            ]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            labels = {
+                q["id"]: (
+                    f"#{q['id']} | {q.get('course_title') or 'Unknown course'} | "
+                    f"{q.get('question_id') or ''} | {str(q.get('stimulus') or '')[:70]}"
+                )
+                for q in archived_questions
+            }
+            selected_archived_id = st.selectbox(
+                "Review archived question",
+                options=[q["id"] for q in archived_questions],
+                format_func=lambda qid: labels.get(qid, str(qid)),
+                key="qbm_archived_question_select",
+            )
+
+            q = next((item for item in archived_questions if item["id"] == selected_archived_id), None)
+            if q:
+                with st.expander("Archived Question Detail", expanded=True):
+                    ref_label = question_reference_label(q)
+                    if ref_label:
+                        st.caption(ref_label)
+                    st.markdown(
+                        f"**Course:** {q.get('course_title') or ''}  |  "
+                        f"**Section:** {q.get('section_type') or ''}  |  "
+                        f"**Type:** {q.get('question_type') or ''}  |  "
+                        f"**Difficulty:** {DIFFICULTY_LABELS.get(q.get('difficulty', 3), q.get('difficulty', ''))}"
+                    )
+                    st.markdown(f"**Archive reason:** {q.get('archive_reason') or 'Issue reported'}")
+                    st.markdown(f"**Report statuses:** {q.get('report_statuses') or '-'}")
+                    if q.get("passage"):
+                        with st.expander("Passage", expanded=False):
+                            st.markdown(q["passage"])
+                    st.markdown(f"**Stimulus:** {q.get('stimulus') or ''}")
+                    for letter in ["A", "B", "C", "D", "E"]:
+                        choice = q.get(f"choice_{letter.lower()}")
+                        if choice:
+                            marker = " (correct)" if letter == q.get("correct_answer") else ""
+                            st.write(f"**{letter}.** {choice}{marker}")
+                    if q.get("explanation"):
+                        st.info(q["explanation"])
+
+                    restore_col, rearchive_col, _ = st.columns([1.4, 1.4, 5])
+                    if restore_col.button(
+                        "Restore to Active Bank",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"qbm_restore_archived_{q['id']}",
+                    ):
+                        if not real_admin:
+                            st.error("Permission denied. Real admin access required.")
+                            st.stop()
+                        restore_question(q["id"])
+                        st.success("Question restored to the active bank.")
+                        st.rerun()
+
+                    if rearchive_col.button(
+                        "Keep Archived",
+                        use_container_width=True,
+                        key=f"qbm_keep_archived_{q['id']}",
+                    ):
+                        archive_question(q["id"], q.get("archive_reason") or "Issue reported")
+                        st.success("Question remains archived.")
                         st.rerun()
 
 

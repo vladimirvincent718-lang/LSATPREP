@@ -4,6 +4,7 @@ utils.py — Shared UI helpers, course selector, and small utilities.
 
 from __future__ import annotations
 from html import escape
+import json
 import streamlit as st
 import streamlit.components.v1 as _components
 
@@ -25,12 +26,37 @@ QUESTION_TYPES = [
 ]
 
 
+def question_reference_label(q: dict, *, include_prefix: bool = True) -> str:
+    """Return a searchable question-bank reference for display."""
+    master_id = q.get("master_question_id")
+    if master_id not in (None, "") and q.get("question_id") not in (None, ""):
+        bank_id = q.get("question_id")
+    else:
+        bank_id = q.get("id") or q.get("bank_question_id") or q.get("question_id")
+
+    if master_id is None and q.get("id") is not None:
+        master_id = q.get("question_id")
+
+    parts = []
+    if bank_id not in (None, ""):
+        parts.append(f"Bank #{bank_id}")
+    if master_id not in (None, ""):
+        parts.append(f"Master {master_id}")
+
+    label = " / ".join(parts)
+    if not label:
+        return ""
+    return f"Question {label}" if include_prefix else label
+
+
 # --- Sidebar page labels ----------------------------------------------------
-_SIDEBAR_PAGE_LABEL_JS = """
+def _sidebar_page_label_js(review_badge_count: int = 0) -> str:
+    template = """
 <script>
 (function () {
     'use strict';
 
+    var reviewBadgeCount = __REVIEW_BADGE_COUNT__;
     var P = window.parent;
     if (!P || !P.document) { return; }
     var doc = P.document;
@@ -62,16 +88,58 @@ _SIDEBAR_PAGE_LABEL_JS = """
         });
     }
 
+    function decorateReviewMistakesLink() {
+        var nav = doc.querySelector('[data-testid="stSidebarNav"], [data-testid="stSidebarNavItems"]');
+        if (!nav) { return; }
+
+        var links = Array.prototype.slice.call(nav.querySelectorAll('a'));
+        links.forEach(function (link) {
+            var href = link.getAttribute('href') || '';
+            var rawText = (link.textContent || '').replace(/\\s+/g, ' ').trim();
+            var isReviewLink = rawText.indexOf('Review Mistakes') !== -1
+                || href.indexOf('Review_Mistakes') !== -1;
+            if (!isReviewLink) { return; }
+
+            link.classList.add('sf-review-nav-link');
+            if (link.getAttribute('data-sf-review-count') === String(reviewBadgeCount)) { return; }
+
+            var labelNode = link.querySelector('span, p, div') || link;
+            var existingBadge = link.querySelector('.sf-review-nav-badge');
+            if (reviewBadgeCount > 0) {
+                if (!existingBadge) {
+                    existingBadge = doc.createElement('span');
+                    existingBadge.className = 'sf-review-nav-badge';
+                    labelNode.appendChild(existingBadge);
+                }
+                existingBadge.textContent = reviewBadgeCount > 99 ? '99+' : String(reviewBadgeCount);
+                link.setAttribute('aria-label', 'Review Mistakes, ' + reviewBadgeCount + ' outstanding');
+                link.setAttribute('title', reviewBadgeCount + ' outstanding mistakes to review');
+            } else if (existingBadge) {
+                existingBadge.remove();
+                link.setAttribute('aria-label', 'Review Mistakes');
+                link.setAttribute('title', 'Review Mistakes');
+            }
+            link.setAttribute('data-sf-review-count', String(reviewBadgeCount));
+        });
+    }
+
     relabelMainPage();
+    decorateReviewMistakesLink();
     setTimeout(relabelMainPage, 100);
+    setTimeout(decorateReviewMistakesLink, 100);
     setTimeout(relabelMainPage, 500);
+    setTimeout(decorateReviewMistakesLink, 500);
 
     if (P._sfPageLabelObs) { P._sfPageLabelObs.disconnect(); }
-    P._sfPageLabelObs = new MutationObserver(relabelMainPage);
+    P._sfPageLabelObs = new MutationObserver(function () {
+        relabelMainPage();
+        decorateReviewMistakesLink();
+    });
     P._sfPageLabelObs.observe(doc.body, { childList: true, subtree: true });
 })()
 </script>
 """
+    return template.replace("__REVIEW_BADGE_COUNT__", str(int(review_badge_count)))
 
 _SIDEBAR_PAGE_LABEL_CSS = """
 <style>
@@ -85,14 +153,74 @@ _SIDEBAR_PAGE_LABEL_CSS = """
     content: "Sign In";
     font-size: 14px;
 }
+
+[data-testid="stSidebarNav"] a.sf-review-nav-link,
+[data-testid="stSidebarNavItems"] a.sf-review-nav-link {
+    align-items: center !important;
+    gap: 0.5rem !important;
+}
+
+.sf-review-nav-badge {
+    align-items: center !important;
+    background: #dc2626 !important;
+    border-radius: 999px !important;
+    color: #ffffff !important;
+    display: inline-flex !important;
+    font-size: 0.7rem !important;
+    font-weight: 800 !important;
+    justify-content: center !important;
+    line-height: 1 !important;
+    margin-left: auto !important;
+    min-width: 1.35rem !important;
+    padding: 0.22rem 0.42rem !important;
+}
 </style>
 """
 
 
-def inject_sidebar_page_labels() -> None:
+def _review_mistakes_outstanding_count(user_id: int | None) -> int:
+    if not user_id:
+        return 0
+
+    try:
+        from src.database import (
+            get_all_curriculums,
+            get_curriculum_courses,
+            get_outstanding_mistake_count,
+        )
+
+        curriculums = get_all_curriculums()
+        if not curriculums:
+            return 0
+
+        curriculum_courses = {c["id"]: get_curriculum_courses(c["id"]) for c in curriculums}
+        active_course_id = st.session_state.get("active_course_id")
+        selected_curriculum_id = None
+
+        for curr in curriculums:
+            if any(c["id"] == active_course_id for c in curriculum_courses.get(curr["id"], [])):
+                selected_curriculum_id = curr["id"]
+                break
+
+        if selected_curriculum_id is None:
+            selected_curriculum_id = curriculums[0]["id"]
+
+        course_ids = [
+            c["id"] for c in curriculum_courses.get(selected_curriculum_id, [])
+        ]
+        if course_ids:
+            return get_outstanding_mistake_count(user_id, course_ids=course_ids)
+        if active_course_id:
+            return get_outstanding_mistake_count(user_id, course_id=active_course_id)
+        return 0
+    except Exception:
+        return 0
+
+
+def inject_sidebar_page_labels(review_badge_count: int = 0) -> None:
     """Rename Streamlit's default app.py sidebar label to the user-facing page name."""
     st.markdown(_SIDEBAR_PAGE_LABEL_CSS, unsafe_allow_html=True)
-    _components.html(_SIDEBAR_PAGE_LABEL_JS, height=0, scrolling=False)
+    _components.html(_sidebar_page_label_js(review_badge_count), height=0, scrolling=False)
 
 
 # ── Collapsible sidebar ───────────────────────────────────────────────────────
@@ -651,8 +779,11 @@ def page_header(title: str, subtitle: str = "") -> None:
 def sidebar_nav(username: str) -> None:
     from src.ui_theme import inject_modern_theme
 
+    uid = st.session_state.get("user_id")
+    review_badge_count = _review_mistakes_outstanding_count(uid)
+
     inject_modern_theme()
-    inject_sidebar_page_labels()
+    inject_sidebar_page_labels(review_badge_count)
     # Inject collapsible-sidebar (CSS via markdown, JS via iframe component)
     _inject_sidebar_toggle()
     # Inject responsive layout CSS from admin-managed config
@@ -664,7 +795,6 @@ def sidebar_nav(username: str) -> None:
 
     with st.sidebar:
         st.markdown(f"**Logged in as:** {username}")
-        uid = st.session_state.get("user_id")
 
         real_admin = False
         if uid:
@@ -762,6 +892,259 @@ def require_course(user_id: int) -> int:
 
 
 # ── Question rendering ────────────────────────────────────────────────────────
+def _question_text_card_html(question_text: str, dom_id: str) -> str:
+    return f"""
+<div class="sf-question-text-card" id="{escape(dom_id, quote=True)}">
+  <div class="sf-question-actionbar">
+    <span class="sf-question-action-label">Question text</span>
+    <span class="sf-question-actions">
+      <button type="button" class="sf-question-tool" data-sf-copy-question="{escape(dom_id, quote=True)}">Copy</button>
+      <button type="button" class="sf-question-tool" data-sf-play-question="{escape(dom_id, quote=True)}">&#9654; Play</button>
+    </span>
+  </div>
+  <textarea class="sf-question-copy-block sf-question-copy-area" aria-label="Question text for copying" readonly>{escape(question_text)}</textarea>
+</div>
+"""
+
+
+def _inject_question_text_tools(question_text: str, dom_id: str) -> None:
+    text_json = json.dumps(question_text)
+    dom_id_json = json.dumps(dom_id)
+    script = f"""
+<script>
+(function() {{
+  var P = window.parent;
+  var doc = P && P.document;
+  if (!P || !doc) return;
+
+  var id = {dom_id_json};
+  var text = {text_json};
+
+  function ensureStyles() {{
+    if (doc.getElementById('sf-question-text-tools-style')) return;
+    var style = doc.createElement('style');
+    style.id = 'sf-question-text-tools-style';
+    style.textContent = `
+      .sf-question-text-card {{
+        background:#fff;
+        border:1px solid #e5e7eb;
+        border-radius:8px;
+        box-shadow:0 10px 24px rgba(15,23,42,.06);
+        margin:0 0 1rem 0;
+        overflow:hidden;
+      }}
+      .sf-question-actionbar {{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:.75rem;
+        padding:.55rem .75rem;
+        border-bottom:1px solid #edf2f7;
+        background:#f8fafc;
+      }}
+      .sf-question-action-label {{
+        color:#475569;
+        font-size:.78rem;
+        font-weight:700;
+        letter-spacing:.04em;
+        text-transform:uppercase;
+      }}
+      .sf-question-actions {{
+        display:flex;
+        align-items:center;
+        gap:.4rem;
+        flex-shrink:0;
+      }}
+      .sf-question-tool {{
+        border:1px solid #cbd5e1;
+        border-radius:7px;
+        background:#fff;
+        color:#0f172a;
+        cursor:pointer;
+        font-size:.84rem;
+        font-weight:650;
+        line-height:1;
+        min-height:32px;
+        padding:.42rem .62rem;
+      }}
+      .sf-question-tool:hover {{ background:#f1f5f9; }}
+      .sf-question-tool:active {{ transform:scale(.97); }}
+      .sf-question-tool.sf-question-tool-ok {{
+        background:#dcfce7;
+        border-color:#86efac;
+        color:#166534;
+      }}
+      .sf-question-copy-block {{
+        border:0;
+        display:block;
+        margin:0;
+        min-height:3.2rem;
+        outline:none;
+        padding:.9rem 1rem;
+        resize:none;
+        white-space:pre-wrap;
+        width:100%;
+        word-break:normal;
+        overflow-wrap:anywhere;
+        color:#0f172a;
+        font:600 1rem/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+        background:#fff;
+      }}
+      .sf-question-copy-block:focus {{ box-shadow:inset 0 0 0 2px rgba(37,99,235,.18); }}
+      @media (max-width: 640px) {{
+        .sf-question-actionbar {{ align-items:flex-start; flex-direction:column; }}
+        .sf-question-actions {{ width:100%; }}
+        .sf-question-tool {{ flex:1; }}
+      }}
+    `;
+    (doc.head || doc.documentElement).appendChild(style);
+  }}
+
+  function flash(button, label) {{
+    var original = button.getAttribute('data-sf-original-label') || button.textContent;
+    button.setAttribute('data-sf-original-label', original);
+    button.textContent = label;
+    button.classList.add('sf-question-tool-ok');
+    setTimeout(function() {{
+      button.textContent = original;
+      button.classList.remove('sf-question-tool-ok');
+    }}, 1100);
+  }}
+
+  function fallbackCopy(value) {{
+    var area = doc.createElement('textarea');
+    area.value = value;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.left = '-9999px';
+    doc.body.appendChild(area);
+    area.select();
+    try {{ doc.execCommand('copy'); }} catch (e) {{}}
+    area.remove();
+  }}
+
+  function selectQuestionText() {{
+    var card = doc.getElementById(id);
+    var area = card && card.querySelector('.sf-question-copy-area');
+    if (area) {{
+      area.focus({{ preventScroll: true }});
+      area.select();
+      return;
+    }}
+    var code = card && card.querySelector('.sf-question-copy-block code');
+    var selection = P.getSelection ? P.getSelection() : doc.getSelection();
+    if (!code || !selection || !doc.createRange) return;
+    var range = doc.createRange();
+    range.selectNodeContents(code);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }}
+
+  function copyText(button) {{
+    selectQuestionText();
+    var clipboard = (window.navigator && window.navigator.clipboard)
+      || (P.navigator && P.navigator.clipboard);
+    if (clipboard && clipboard.writeText) {{
+      clipboard.writeText(text).then(function() {{
+        flash(button, 'Copied');
+      }}).catch(function() {{
+        fallbackCopy(text);
+        flash(button, 'Copied');
+      }});
+    }} else {{
+      fallbackCopy(text);
+      flash(button, 'Copied');
+    }}
+  }}
+
+  function fallbackSpeak(value, button) {{
+    var ss = P.speechSynthesis;
+    if (!ss || !P.SpeechSynthesisUtterance) return;
+    if (P._sfQuestionFallbackSpeaking) {{
+      try {{ ss.cancel(); }} catch (e) {{}}
+      P._sfQuestionFallbackSpeaking = false;
+      button.innerHTML = '&#9654; Play';
+      return;
+    }}
+    try {{ ss.cancel(); }} catch (e) {{}}
+    var utterance = new P.SpeechSynthesisUtterance(value);
+    var speed = P._sfVoiceState && P._sfVoiceState.speed ? P._sfVoiceState.speed : 1;
+    utterance.rate = parseFloat(speed) || 1;
+    utterance.volume = 1;
+    utterance.lang = 'en-US';
+    utterance.onend = utterance.onerror = function() {{
+      P._sfQuestionFallbackSpeaking = false;
+      button.innerHTML = '&#9654; Play';
+    }};
+    P._sfQuestionFallbackSpeaking = true;
+    button.textContent = 'Stop';
+    setTimeout(function() {{ try {{ ss.speak(utterance); }} catch (e) {{}} }}, 60);
+  }}
+
+  function playText(button) {{
+    if (P._sfQuestionAudio && P._sfQuestionAudio.isSpeaking && P._sfQuestionAudio.isSpeaking()) {{
+      P._sfQuestionAudio.stop();
+      button.innerHTML = '&#9654; Play';
+      return;
+    }}
+    if (P._sfQuestionAudio && P._sfQuestionAudio.playText) {{
+      P._sfQuestionAudio.playText(text, {{ openPanel: false }});
+      button.textContent = 'Stop';
+      setTimeout(function poll() {{
+        if (!P._sfQuestionAudio || !P._sfQuestionAudio.isSpeaking || !P._sfQuestionAudio.isSpeaking()) {{
+          button.innerHTML = '&#9654; Play';
+          return;
+        }}
+        setTimeout(poll, 400);
+      }}, 400);
+      return;
+    }}
+    fallbackSpeak(text, button);
+  }}
+
+  function installQuestionTools() {{
+    var card = doc.getElementById(id);
+    if (!card) return false;
+    card.setAttribute('data-sf-question-text', text);
+    var area = card.querySelector('.sf-question-copy-area');
+    if (area) {{
+      area.value = text;
+      area.style.height = 'auto';
+      area.style.height = Math.max(52, area.scrollHeight) + 'px';
+    }}
+
+    var copyButton = card.querySelector('[data-sf-copy-question="' + id + '"]');
+    if (copyButton && !copyButton.dataset.sfQuestionBound) {{
+      copyButton.dataset.sfQuestionBound = '1';
+      copyButton.addEventListener('click', function() {{ copyText(copyButton); }});
+    }}
+
+    var playButton = card.querySelector('[data-sf-play-question="' + id + '"]');
+    if (playButton && !playButton.dataset.sfQuestionBound) {{
+      playButton.dataset.sfQuestionBound = '1';
+      playButton.addEventListener('click', function() {{ playText(playButton); }});
+    }}
+    return true;
+  }}
+
+  ensureStyles();
+  if (!installQuestionTools()) {{
+    var observer = new MutationObserver(function() {{
+      if (installQuestionTools()) observer.disconnect();
+    }});
+    observer.observe(doc.body, {{ childList: true, subtree: true }});
+    setTimeout(installQuestionTools, 100);
+    setTimeout(installQuestionTools, 350);
+    setTimeout(installQuestionTools, 900);
+    setTimeout(installQuestionTools, 1800);
+    setTimeout(function() {{ observer.disconnect(); }}, 5000);
+  }}
+}})();
+</script>
+"""
+    _components.html(script, height=0, scrolling=False)
+
+
 def render_question(
     q: dict,
     idx: int,
@@ -784,12 +1167,14 @@ def render_question(
     col_l, col_r = st.columns([5, 1])
     with col_l:
         diff = q.get("difficulty", 3)
-        meta = (
-            f"Question {idx + 1} of {total} | "
-            f"{q.get('section_type', '')} | "
-            f"{q.get('question_type', '')} | "
-            f"Difficulty: {DIFFICULTY_LABELS.get(diff, diff)}"
-        )
+        meta_parts = [
+            f"Question {idx + 1} of {total}",
+            question_reference_label(q),
+            q.get("section_type", ""),
+            q.get("question_type", ""),
+            f"Difficulty: {DIFFICULTY_LABELS.get(diff, diff)}",
+        ]
+        meta = " | ".join(str(part) for part in meta_parts if part)
         st.markdown(
             f'<div class="sf-question-meta">{escape(meta)}</div>',
             unsafe_allow_html=True,
@@ -864,10 +1249,13 @@ def render_question(
         with st.expander("📖 Read Passage", expanded=True):
             st.markdown(q["passage"])
 
+    stimulus = str(q.get("stimulus", "")).strip()
+    question_dom_id = f"sf-question-text-{q.get('id', idx)}-{idx}"
     st.markdown(
-        f'<div class="sf-stimulus-card">{escape(str(q.get("stimulus", "")))}</div>',
+        _question_text_card_html(stimulus, question_dom_id),
         unsafe_allow_html=True,
     )
+    _inject_question_text_tools(stimulus, question_dom_id)
 
     if is_open_ended_question(q):
         sample_answer = str(q.get("_sample_answer") or "").strip()
@@ -942,6 +1330,14 @@ def render_score_card(report: dict, title: str = "Score Report") -> None:
     c2.metric("% Correct",   f"{report['percent_correct']}%")
     c3.metric("Est. Scaled", report.get("scaled_score") or "—")
     c4.metric("Avg Time/Q",  f"{report.get('avg_time_seconds', 0):.0f}s")
+    excluded = int(report.get("excluded_unreached") or 0)
+    planned_total = int(report.get("planned_total") or report.get("total") or 0)
+    scored_total = int(report.get("scored_total") or report.get("total") or 0)
+    if excluded:
+        st.caption(
+            f"Scored from {scored_total} reached question(s). "
+            f"{excluded} of {planned_total} planned question(s) were excluded."
+        )
     if report.get("by_question_type"):
         st.markdown("**Accuracy by Question Type**")
         import pandas as pd
@@ -973,24 +1369,24 @@ def render_timer(
     paused = is_timer_paused()
     visible = is_timer_visible()
 
-    c_time, c_show, c_pause = st.columns([4, 1, 1])
-    with c_time:
-        if visible:
-            suffix = "paused" if paused else "remaining"
-            st.markdown(
-                f'<div class="sf-timer-card"><div class="sf-timer-label">{m:02d}:{s:02d} {suffix}</div></div>',
-                unsafe_allow_html=True,
-            )
-            st.progress(pct)
-        else:
-            st.caption("Timer hidden. You can turn it back on from any question.")
-    with c_show:
-        show_label = "Hide Timer" if visible else "Show Timer"
+    if visible:
+        suffix = "paused" if paused else "remaining"
+        st.markdown(
+            f'<div class="sf-timer-card"><div class="sf-timer-label">{m:02d}:{s:02d} {suffix}</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.progress(pct)
+    else:
+        st.caption("Timer hidden. You can turn it back on from any question.")
+
+    show_col, pause_col = st.columns(2)
+    with show_col:
+        show_label = "Hide" if visible else "Show"
         if st.button(show_label, key=f"{key_prefix}_show", use_container_width=True):
             toggle_timer_visibility()
             st.rerun()
-    with c_pause:
-        pause_label = "Resume Timer" if paused else "Pause Timer"
+    with pause_col:
+        pause_label = "Resume" if paused else "Pause"
         if st.button(
             pause_label,
             key=f"{key_prefix}_pause",

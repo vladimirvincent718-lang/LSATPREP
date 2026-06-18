@@ -12,6 +12,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import (
+    Flowable,
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
@@ -37,8 +38,9 @@ def generate_exam_pdf(
     title: str,
     subtitle: str = "",
     distribution: list[dict] | None = None,
+    include_answer_key: bool = True,
 ) -> bytes:
-    """Build a workbook-style PDF with a clean one-answer-per-line answer key."""
+    """Build a workbook-style PDF with fillable answer and issue fields."""
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -108,21 +110,119 @@ def generate_exam_pdf(
         for choice_letter, text in choices:
             story.append(Paragraph(f"<b>{choice_letter}.</b> {escape(text)}", styles["Choice"]))
 
+        story.append(_QuestionResponseFields(index, choices))
         story.append(Spacer(1, 0.08 * inch))
 
-    story.append(PageBreak())
-    story.append(Paragraph("Answer Key", styles["Section"]))
-    story.append(
-        Paragraph(
-            "Each answer appears on its own line for clean review and printing.",
-            styles["Meta"],
+    if include_answer_key:
+        story.append(PageBreak())
+        story.append(Paragraph("Answer Key", styles["Section"]))
+        story.append(
+            Paragraph(
+                "Each answer appears on its own line for clean review and printing.",
+                styles["Meta"],
+            )
         )
-    )
-    story.append(Spacer(1, 0.08 * inch))
-    story.append(_answer_key_table(questions, styles))
+        story.append(Spacer(1, 0.08 * inch))
+        story.append(_answer_key_table(questions, styles))
 
     doc.build(story)
     return buffer.getvalue()
+
+
+class _QuestionResponseFields(Flowable):
+    """Small AcroForm block for answer selection and issue reporting."""
+
+    def __init__(self, question_number: int, choices: list[tuple[str, str]]):
+        super().__init__()
+        self.question_number = question_number
+        self.choice_letters = [letter for letter, _ in choices]
+        self.width = 6.45 * inch
+        self.height = 0.88 * inch if self.choice_letters else 1.08 * inch
+
+    def wrap(self, availWidth, availHeight):
+        return min(self.width, availWidth), self.height
+
+    def draw(self):
+        canvas = self.canv
+        form = canvas.acroForm
+        q_num = self.question_number
+        field_prefix = f"q_{q_num:03d}"
+        ink = colors.HexColor("#111827")
+        muted = colors.HexColor("#4b5563")
+        border = colors.HexColor("#9ca3af")
+        fill = colors.HexColor("#ffffff")
+
+        canvas.setStrokeColor(colors.HexColor("#e5e7eb"))
+        canvas.roundRect(0, 0, self.width, self.height, 4, stroke=1, fill=0)
+
+        canvas.setFillColor(ink)
+        canvas.setFont("Helvetica-Bold", 8.5)
+        canvas.drawString(8, self.height - 15, "Your answer:")
+
+        if self.choice_letters:
+            radio_name = f"{field_prefix}_answer"
+            x = 78
+            y = self.height - 19
+            for letter in self.choice_letters:
+                form.radioRelative(
+                    name=radio_name,
+                    value=letter,
+                    selected=False,
+                    x=x,
+                    y=y,
+                    size=10,
+                    buttonStyle="circle",
+                    borderColor=border,
+                    fillColor=fill,
+                    textColor=ink,
+                    fieldFlags="radio",
+                    tooltip=f"Question {q_num} answer {letter}",
+                )
+                canvas.setFillColor(ink)
+                canvas.setFont("Helvetica", 8.5)
+                canvas.drawString(x + 14, y + 1, letter)
+                x += 38
+        else:
+            form.textfieldRelative(
+                name=f"{field_prefix}_written_answer",
+                x=78,
+                y=self.height - 42,
+                width=self.width - 92,
+                height=22,
+                borderColor=border,
+                fillColor=fill,
+                textColor=ink,
+                fieldFlags="multiline",
+                tooltip=f"Question {q_num} written answer",
+            )
+
+        issue_y = 30
+        form.checkboxRelative(
+            name=f"{field_prefix}_report_issue",
+            x=8,
+            y=issue_y,
+            size=10,
+            buttonStyle="check",
+            borderColor=border,
+            fillColor=fill,
+            textColor=ink,
+            tooltip=f"Question {q_num} report issue",
+        )
+        canvas.setFillColor(muted)
+        canvas.setFont("Helvetica", 8)
+        canvas.drawString(24, issue_y + 1, "Report issue")
+        canvas.drawString(102, issue_y + 1, "Issue note:")
+        form.textfieldRelative(
+            name=f"{field_prefix}_issue_note",
+            x=154,
+            y=issue_y - 4,
+            width=self.width - 164,
+            height=18,
+            borderColor=border,
+            fillColor=fill,
+            textColor=ink,
+            tooltip=f"Question {q_num} issue note",
+        )
 
 
 def _styles():

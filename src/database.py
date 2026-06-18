@@ -161,6 +161,9 @@ def init_database() -> None:
         source          TEXT DEFAULT 'custom',
         tags            TEXT,
         content_hash    TEXT DEFAULT '',
+        is_archived     INTEGER DEFAULT 0,
+        archived_at     TIMESTAMP,
+        archive_reason  TEXT DEFAULT '',
         created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (course_id) REFERENCES courses(id)
     );
@@ -262,6 +265,7 @@ def init_database() -> None:
         note        TEXT,
         is_completed INTEGER DEFAULT 0,
         completed_at TIMESTAMP,
+        review_order INTEGER,
         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id)     REFERENCES users(id),
         FOREIGN KEY (question_id) REFERENCES questions(id)
@@ -451,6 +455,8 @@ def _migrate_database() -> None:
         conn.execute("ALTER TABLE mistake_journal ADD COLUMN is_completed INTEGER DEFAULT 0")
     if "completed_at" not in mj_cols:
         conn.execute("ALTER TABLE mistake_journal ADD COLUMN completed_at TIMESTAMP")
+    if "review_order" not in mj_cols:
+        conn.execute("ALTER TABLE mistake_journal ADD COLUMN review_order INTEGER")
     conn.commit()
 
     q_cols_for_rebuild = cols("questions")
@@ -460,6 +466,15 @@ def _migrate_database() -> None:
     if "content_hash" not in q_cols_for_rebuild:
         conn.execute("ALTER TABLE questions ADD COLUMN content_hash TEXT DEFAULT ''")
         q_cols_for_rebuild.add("content_hash")
+    if "is_archived" not in q_cols_for_rebuild:
+        conn.execute("ALTER TABLE questions ADD COLUMN is_archived INTEGER DEFAULT 0")
+        q_cols_for_rebuild.add("is_archived")
+    if "archived_at" not in q_cols_for_rebuild:
+        conn.execute("ALTER TABLE questions ADD COLUMN archived_at TIMESTAMP")
+        q_cols_for_rebuild.add("archived_at")
+    if "archive_reason" not in q_cols_for_rebuild:
+        conn.execute("ALTER TABLE questions ADD COLUMN archive_reason TEXT DEFAULT ''")
+        q_cols_for_rebuild.add("archive_reason")
     conn.commit()
 
     def question_id_has_global_unique() -> bool:
@@ -499,6 +514,9 @@ def _migrate_database() -> None:
             source          TEXT DEFAULT 'custom',
             tags            TEXT,
             content_hash    TEXT DEFAULT '',
+            is_archived     INTEGER DEFAULT 0,
+            archived_at     TIMESTAMP,
+            archive_reason  TEXT DEFAULT '',
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (course_id) REFERENCES courses(id)
         );
@@ -508,14 +526,17 @@ def _migrate_database() -> None:
              passage, stimulus, choice_a, choice_b, choice_c, choice_d, choice_e,
              correct_answer, explanation,
              wrong_answer_a, wrong_answer_b, wrong_answer_c,
-             wrong_answer_d, wrong_answer_e, source, tags, content_hash, created_at)
+             wrong_answer_d, wrong_answer_e, source, tags, content_hash,
+             is_archived, archived_at, archive_reason, created_at)
         SELECT
              id, course_id, question_id, section_type, question_type, difficulty,
              passage, stimulus, choice_a, choice_b, choice_c, choice_d, choice_e,
              correct_answer, explanation,
              wrong_answer_a, wrong_answer_b, wrong_answer_c,
              wrong_answer_d, wrong_answer_e, source, tags,
-             COALESCE(content_hash, ''), created_at
+             COALESCE(content_hash, ''),
+             COALESCE(is_archived, 0), archived_at, COALESCE(archive_reason, ''),
+             created_at
         FROM questions;
 
         DROP TABLE questions;
@@ -527,6 +548,20 @@ def _migrate_database() -> None:
     conn.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_questions_course_question_id
            ON questions(course_id, question_id)"""
+    )
+    # A rerun or double-click must not write the same question twice for one
+    # attempt section. Keep the newest legacy row before enforcing uniqueness.
+    conn.execute(
+        """DELETE FROM user_answers
+           WHERE id NOT IN (
+               SELECT MAX(id)
+               FROM user_answers
+               GROUP BY attempt_id, question_id, section_number
+           )"""
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_user_answers_attempt_question_section
+           ON user_answers(attempt_id, question_id, section_number)"""
     )
     conn.commit()
 
@@ -545,6 +580,13 @@ def _migrate_database() -> None:
     ea_cols = cols("exam_attempts")
     if "course_id" not in q_cols:
         conn.execute("ALTER TABLE questions ADD COLUMN course_id INTEGER")
+    for col_name, ddl in [
+        ("is_archived", "ALTER TABLE questions ADD COLUMN is_archived INTEGER DEFAULT 0"),
+        ("archived_at", "ALTER TABLE questions ADD COLUMN archived_at TIMESTAMP"),
+        ("archive_reason", "ALTER TABLE questions ADD COLUMN archive_reason TEXT DEFAULT ''"),
+    ]:
+        if col_name not in q_cols:
+            conn.execute(ddl)
     if "course_id" not in ea_cols:
         conn.execute("ALTER TABLE exam_attempts ADD COLUMN course_id INTEGER")
 
@@ -830,8 +872,10 @@ def set_admin(user_id: int, admin: bool) -> None:
 
 # ── Persistent session token helpers (cookie-based login) ────────────────────
 
-#: How long a session token lives before expiring.  Adjust freely.
-SESSION_TOKEN_DAYS = 30
+#: How long a session token lives before expiring.
+# Keep this effectively permanent so users stay signed in across refreshes and
+# browser restarts until they explicitly log out.
+SESSION_TOKEN_DAYS = 36500
 
 
 def create_session_token(user_id: int,
@@ -873,6 +917,15 @@ def validate_session_token(token: str) -> dict | None:
         """,
         (token,),
     ).fetchone()
+    if row:
+        renewed_expires_at = (
+            datetime.utcnow() + timedelta(days=SESSION_TOKEN_DAYS)
+        ).isoformat()
+        conn.execute(
+            "UPDATE user_sessions SET expires_at = ? WHERE token = ?",
+            (renewed_expires_at, token),
+        )
+        conn.commit()
     conn.close()
     return dict(row) if row else None
 
@@ -1059,7 +1112,9 @@ def delete_course_if_safe(course_id: int) -> tuple:
 def get_course_question_count(course_id: int) -> int:
     conn = get_connection()
     n = conn.execute(
-        "SELECT COUNT(*) FROM questions WHERE course_id = ?", (course_id,)
+        """SELECT COUNT(*) FROM questions
+           WHERE course_id = ? AND COALESCE(is_archived, 0) = 0""",
+        (course_id,),
     ).fetchone()[0]
     conn.close()
     return n
@@ -1388,10 +1443,13 @@ def get_all_questions(
     min_difficulty: int = 1,
     max_difficulty: int = 5,
     course_id=None,
+    include_archived: bool = False,
 ) -> list:
     conn   = get_connection()
     query  = "SELECT * FROM questions WHERE difficulty BETWEEN ? AND ?"
     params = [min_difficulty, max_difficulty]
+    if not include_archived:
+        query += " AND COALESCE(is_archived, 0) = 0"
     if course_id is not None:
         query += " AND course_id = ?"
         params.append(course_id)
@@ -1416,9 +1474,75 @@ def get_question_by_id(qid: int):
 
 def get_question_count() -> int:
     conn = get_connection()
-    n = conn.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
+    n = conn.execute(
+        "SELECT COUNT(*) FROM questions WHERE COALESCE(is_archived, 0) = 0"
+    ).fetchone()[0]
     conn.close()
     return n
+
+
+def archive_question(question_id: int, reason: str = "") -> None:
+    conn = get_connection()
+    conn.execute(
+        """UPDATE questions
+           SET is_archived = 1,
+               archived_at = COALESCE(archived_at, CURRENT_TIMESTAMP),
+               archive_reason = ?
+           WHERE id = ?""",
+        (reason.strip(), question_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def restore_question(question_id: int) -> None:
+    conn = get_connection()
+    conn.execute(
+        """UPDATE questions
+           SET is_archived = 0,
+               archived_at = NULL,
+               archive_reason = 'Restored by admin'
+           WHERE id = ?""",
+        (question_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_archived_questions(course_ids: list[int] | None = None, search: str | None = None) -> list:
+    conn = get_connection()
+    query = """
+        SELECT q.*, c.title AS course_title,
+               COUNT(r.id) AS report_count,
+               MAX(r.created_at) AS latest_report_at,
+               GROUP_CONCAT(DISTINCT r.status) AS report_statuses
+        FROM questions q
+        LEFT JOIN courses c ON c.id = q.course_id
+        LEFT JOIN question_issue_reports r ON r.question_id = q.id
+        WHERE COALESCE(q.is_archived, 0) = 1
+    """
+    params: list = []
+    if course_ids is not None:
+        course_ids = [int(cid) for cid in course_ids if cid is not None]
+        if not course_ids:
+            conn.close()
+            return []
+        placeholders = ",".join("?" for _ in course_ids)
+        query += f" AND q.course_id IN ({placeholders})"
+        params.extend(course_ids)
+    if search:
+        like = f"%{search.strip()}%"
+        query += """
+            AND (
+                q.question_id LIKE ? OR q.stimulus LIKE ? OR q.explanation LIKE ?
+                OR q.section_type LIKE ? OR q.question_type LIKE ?
+            )
+        """
+        params.extend([like, like, like, like, like])
+    query += " GROUP BY q.id ORDER BY q.archived_at DESC, q.id DESC"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def _safe_delete_questions(conn: sqlite3.Connection, ids: list) -> None:
@@ -1478,7 +1602,7 @@ def get_distinct_values(column: str, course_id=None) -> list:
         return []
     conn   = get_connection()
     query  = (f"SELECT DISTINCT {column} FROM questions "
-               f"WHERE {column} IS NOT NULL")
+               f"WHERE {column} IS NOT NULL AND COALESCE(is_archived, 0) = 0")
     params = []
     if course_id is not None:
         query += " AND course_id = ?"
@@ -1517,7 +1641,7 @@ def complete_attempt(attempt_id: int, total: int, correct: int,
                total_questions = ?, correct_answers = ?,
                raw_score = ?, percent_correct = ?,
                section_scores_json = ?
-           WHERE id = ?""",
+           WHERE id = ? AND completed_at IS NULL""",
         (total, correct, correct, pct, json.dumps(section_scores), attempt_id),
     )
     conn.commit()
@@ -1528,15 +1652,27 @@ def save_answer(attempt_id: int, question_id: int, selected: str,
                 is_correct: bool, time_spent: float,
                 is_flagged: bool, section_num: int) -> None:
     conn = get_connection()
-    conn.execute(
+    inserted = conn.execute(
         """INSERT INTO user_answers
            (attempt_id, question_id, selected_answer, is_correct,
             time_spent_seconds, is_flagged, section_number)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(attempt_id, question_id, section_number) DO NOTHING""",
         (attempt_id, question_id, selected, int(is_correct),
          round(time_spent, 2), int(is_flagged), section_num),
     )
-    _update_question_review_state(conn, attempt_id, question_id, is_correct)
+    conn.execute(
+        """UPDATE user_answers
+           SET selected_answer = ?,
+               is_correct = ?,
+               time_spent_seconds = ?,
+               is_flagged = ?
+           WHERE attempt_id = ? AND question_id = ? AND section_number = ?""",
+        (selected, int(is_correct), round(time_spent, 2), int(is_flagged),
+         attempt_id, question_id, section_num),
+    )
+    if inserted.rowcount:
+        _update_question_review_state(conn, attempt_id, question_id, is_correct)
     conn.commit()
     conn.close()
 
@@ -1547,21 +1683,30 @@ def save_exam_draft(
     mode: str,
     course_id,
     state: dict,
-) -> None:
+) -> bool:
     conn = get_connection()
-    conn.execute(
+    cur = conn.execute(
         """INSERT INTO exam_drafts
            (user_id, attempt_id, mode, course_id, state_json, updated_at)
-           VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+           SELECT ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+           WHERE EXISTS (
+               SELECT 1 FROM exam_attempts
+               WHERE id = ? AND completed_at IS NULL
+           )
            ON CONFLICT(attempt_id) DO UPDATE SET
              mode = excluded.mode,
              course_id = excluded.course_id,
              state_json = excluded.state_json,
-             updated_at = CURRENT_TIMESTAMP""",
-        (user_id, attempt_id, mode, course_id, json.dumps(state)),
+             updated_at = CURRENT_TIMESTAMP
+           WHERE EXISTS (
+               SELECT 1 FROM exam_attempts
+               WHERE id = excluded.attempt_id AND completed_at IS NULL
+           )""",
+        (user_id, attempt_id, mode, course_id, json.dumps(state), attempt_id),
     )
     conn.commit()
     conn.close()
+    return bool(cur.rowcount)
 
 
 def get_latest_exam_draft(
@@ -1772,7 +1917,8 @@ def get_attempts(user_id: int, limit: int = 50,
 def get_attempt_answers(attempt_id: int) -> list:
     conn = get_connection()
     rows = conn.execute(
-        """SELECT ua.*, q.stimulus, q.choice_a, q.choice_b, q.choice_c,
+        """SELECT ua.*, q.question_id AS master_question_id,
+                  q.stimulus, q.choice_a, q.choice_b, q.choice_c,
                   q.choice_d, q.choice_e, q.correct_answer, q.explanation,
                   q.section_type, q.question_type, q.difficulty, q.passage,
                   q.wrong_answer_a, q.wrong_answer_b, q.wrong_answer_c,
@@ -1791,6 +1937,7 @@ def get_attempt_answers(attempt_id: int) -> list:
 _DEFAULTS = {
     "hard_mode":              "false",
     "section_time_minutes":   "35",
+    "question_time_seconds":  "120",
     "hard_mode_time_minutes": "30",
     "min_difficulty":         "1",
     "max_difficulty":         "5",
@@ -1877,27 +2024,90 @@ def get_app_settings(keys: list[str] | None = None) -> dict:
 def add_to_journal(user_id: int, question_id: int,
                    attempt_id, note: str = "") -> None:
     conn = get_connection()
-    conn.execute(
-        """INSERT INTO mistake_journal (user_id, question_id, attempt_id, note)
-           VALUES (?, ?, ?, ?)""",
-        (user_id, question_id, attempt_id, note),
-    )
+    existing = conn.execute(
+        """SELECT id, note
+           FROM mistake_journal
+           WHERE user_id = ?
+             AND question_id = ?
+             AND COALESCE(is_completed, 0) = 0
+           ORDER BY datetime(created_at) DESC, id DESC
+           LIMIT 1""",
+        (user_id, question_id),
+    ).fetchone()
+    if existing:
+        next_note = existing["note"] or ""
+        if note and not next_note:
+            next_note = note
+        conn.execute(
+            """UPDATE mistake_journal
+               SET attempt_id = ?,
+                   note = ?,
+                   created_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (attempt_id, next_note, existing["id"]),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO mistake_journal (user_id, question_id, attempt_id, note)
+               VALUES (?, ?, ?, ?)""",
+            (user_id, question_id, attempt_id, note),
+        )
     conn.commit()
     conn.close()
 
 
-def get_mistake_journal(user_id: int, course_id=None, course_ids=None) -> list:
+def _ensure_mistake_journal_review_order(conn: sqlite3.Connection) -> None:
+    """Allow the review page to work before the full startup migration runs."""
+    columns = {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in conn.execute("PRAGMA table_info(mistake_journal)").fetchall()
+    }
+    if "review_order" not in columns:
+        conn.execute("ALTER TABLE mistake_journal ADD COLUMN review_order INTEGER")
+        conn.commit()
+
+
+def get_mistake_journal(
+    user_id: int,
+    course_id=None,
+    course_ids=None,
+    include_archived: bool = False,
+) -> list:
     conn   = get_connection()
+    _ensure_mistake_journal_review_order(conn)
     query  = """
-        SELECT mj.*, q.stimulus, q.section_type, q.question_type,
+        SELECT mj.*, q.question_id AS master_question_id,
+               q.stimulus, q.section_type, q.question_type,
                q.difficulty, q.correct_answer, q.explanation, q.passage,
                q.choice_a, q.choice_b, q.choice_c, q.choice_d, q.choice_e,
-               q.course_id as q_course_id, c.title as course_title
+               q.course_id as q_course_id, c.title as course_title,
+               (
+                   SELECT ua.selected_answer
+                   FROM user_answers ua
+                   WHERE ua.attempt_id = mj.attempt_id
+                     AND ua.question_id = mj.question_id
+                   ORDER BY ua.id DESC
+                   LIMIT 1
+               ) AS selected_answer
         FROM mistake_journal mj
         JOIN questions q ON mj.question_id = q.id
         LEFT JOIN courses c ON q.course_id = c.id
-        WHERE mj.user_id = ?"""
+        WHERE mj.user_id = ?
+          AND (
+              COALESCE(mj.is_completed, 0) = 1
+              OR mj.id = (
+                  SELECT mj2.id
+                  FROM mistake_journal mj2
+                  WHERE mj2.user_id = mj.user_id
+                    AND mj2.question_id = mj.question_id
+                    AND COALESCE(mj2.is_completed, 0) = 0
+                  ORDER BY datetime(mj2.created_at) DESC, mj2.id DESC
+                  LIMIT 1
+              )
+          )"""
     params = [user_id]
+    if not include_archived:
+        query += " AND COALESCE(q.is_archived, 0) = 0"
     if course_ids is not None:
         course_ids = [cid for cid in course_ids if cid is not None]
         if not course_ids:
@@ -1909,10 +2119,44 @@ def get_mistake_journal(user_id: int, course_id=None, course_ids=None) -> list:
     elif course_id is not None:
         query += " AND q.course_id = ?"
         params.append(course_id)
-    query += " ORDER BY mj.created_at DESC"
+    query += """
+        ORDER BY
+            CASE WHEN mj.review_order IS NULL THEN 1 ELSE 0 END,
+            mj.review_order,
+            datetime(mj.created_at) DESC,
+            mj.id DESC
+    """
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_outstanding_mistake_count(user_id: int, course_id=None, course_ids=None) -> int:
+    conn = get_connection()
+    query = """
+        SELECT COUNT(DISTINCT mj.question_id)
+        FROM mistake_journal mj
+        JOIN questions q ON mj.question_id = q.id
+        WHERE mj.user_id = ?
+          AND COALESCE(mj.is_completed, 0) = 0
+          AND COALESCE(q.is_archived, 0) = 0"""
+    params = [user_id]
+
+    if course_ids is not None:
+        course_ids = [cid for cid in course_ids if cid is not None]
+        if not course_ids:
+            conn.close()
+            return 0
+        placeholders = ",".join("?" for _ in course_ids)
+        query += f" AND q.course_id IN ({placeholders})"
+        params.extend(course_ids)
+    elif course_id is not None:
+        query += " AND q.course_id = ?"
+        params.append(course_id)
+
+    count = conn.execute(query, params).fetchone()[0]
+    conn.close()
+    return int(count or 0)
 
 
 def get_review_activity(
@@ -1964,15 +2208,61 @@ def delete_journal_entry(entry_id: int) -> None:
     conn.close()
 
 
+def set_mistake_journal_order(user_id: int, ordered_entry_ids: list[int]) -> None:
+    """Persist a user's preferred review-queue order."""
+    entry_ids = [int(entry_id) for entry_id in ordered_entry_ids]
+    if len(entry_ids) != len(set(entry_ids)):
+        raise ValueError("Review queue order cannot contain duplicate entries.")
+    if not entry_ids:
+        return
+
+    conn = get_connection()
+    _ensure_mistake_journal_review_order(conn)
+    placeholders = ",".join("?" for _ in entry_ids)
+    owned_ids = {
+        int(row["id"])
+        for row in conn.execute(
+            f"""SELECT id FROM mistake_journal
+                WHERE user_id = ? AND id IN ({placeholders})""",
+            [user_id, *entry_ids],
+        ).fetchall()
+    }
+    if owned_ids != set(entry_ids):
+        conn.close()
+        raise ValueError("Review queue contains an entry that does not belong to this user.")
+
+    conn.executemany(
+        "UPDATE mistake_journal SET review_order = ? WHERE user_id = ? AND id = ?",
+        [(position, user_id, entry_id) for position, entry_id in enumerate(entry_ids)],
+    )
+    conn.commit()
+    conn.close()
+
+
 def set_journal_entry_completed(entry_id: int, is_completed: bool) -> None:
     conn = get_connection()
-    conn.execute(
-        """UPDATE mistake_journal
-           SET is_completed = ?,
-               completed_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE NULL END
-           WHERE id = ?""",
-        (1 if is_completed else 0, 1 if is_completed else 0, entry_id),
-    )
+    entry = conn.execute(
+        "SELECT user_id, question_id FROM mistake_journal WHERE id = ?",
+        (entry_id,),
+    ).fetchone()
+    if is_completed and entry:
+        conn.execute(
+            """UPDATE mistake_journal
+               SET is_completed = 1,
+                   completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+               WHERE user_id = ?
+                 AND question_id = ?
+                 AND COALESCE(is_completed, 0) = 0""",
+            (entry["user_id"], entry["question_id"]),
+        )
+    else:
+        conn.execute(
+            """UPDATE mistake_journal
+               SET is_completed = 0,
+                   completed_at = NULL
+               WHERE id = ?""",
+            (entry_id,),
+        )
     conn.commit()
     conn.close()
 
@@ -2037,6 +2327,7 @@ def get_answer_drilldown(
     conn = get_connection()
     query = """
         SELECT ua.id as answer_id, ua.attempt_id, ua.question_id,
+               q.question_id AS master_question_id,
                ua.selected_answer, ua.is_correct, ua.time_spent_seconds,
                ua.is_flagged, ua.section_number,
                q.passage, q.stimulus, q.choice_a, q.choice_b, q.choice_c,
@@ -2780,6 +3071,26 @@ def init_question_issue_tables() -> None:
                FOREIGN KEY (attempt_id)  REFERENCES exam_attempts(id)
            )"""
     )
+    q_cols = {r["name"] for r in conn.execute("PRAGMA table_info(questions)").fetchall()}
+    for col_name, ddl in [
+        ("is_archived", "ALTER TABLE questions ADD COLUMN is_archived INTEGER DEFAULT 0"),
+        ("archived_at", "ALTER TABLE questions ADD COLUMN archived_at TIMESTAMP"),
+        ("archive_reason", "ALTER TABLE questions ADD COLUMN archive_reason TEXT DEFAULT ''"),
+    ]:
+        if col_name not in q_cols:
+            conn.execute(ddl)
+    conn.execute(
+        """UPDATE questions
+           SET is_archived = 1,
+               archived_at = COALESCE(archived_at, CURRENT_TIMESTAMP),
+               archive_reason = CASE
+                   WHEN COALESCE(archive_reason, '') = ''
+                   THEN 'Issue reported'
+                   ELSE archive_reason
+               END
+           WHERE id IN (SELECT DISTINCT question_id FROM question_issue_reports)
+             AND COALESCE(archive_reason, '') != 'Restored by admin'"""
+    )
     conn.commit()
     conn.close()
 
@@ -2815,6 +3126,14 @@ def create_question_issue_report(
             ),
         )
         rid = cur.lastrowid
+        conn.execute(
+            """UPDATE questions
+               SET is_archived = 1,
+                   archived_at = COALESCE(archived_at, CURRENT_TIMESTAMP),
+                   archive_reason = ?
+               WHERE id = ?""",
+            (f"Issue reported: {issue_type.strip() or 'Other'}", question_id),
+        )
         conn.commit()
         return rid, None
     except Exception as exc:
@@ -2838,6 +3157,7 @@ def get_question_issue_reports(
                q.course_id, q.section_type, q.question_type, q.difficulty,
                q.passage, q.stimulus, q.choice_a, q.choice_b, q.choice_c,
                q.choice_d, q.choice_e, q.correct_answer, q.explanation,
+               q.is_archived, q.archived_at, q.archive_reason,
                c.title AS course_title
         FROM question_issue_reports r
         JOIN users u     ON u.id = r.user_id

@@ -11,7 +11,9 @@ import pandas as pd
 import io
 
 from src.auth      import require_login
-from src.utils     import page_header, sidebar_nav, require_course
+from src.utils     import (
+    page_header, sidebar_nav, require_course, question_reference_label,
+)
 from src.ui_theme  import apply_plotly_theme
 from src.analytics import get_score_history
 from src.database  import get_attempt_answers, get_course
@@ -151,5 +153,21 @@ if chosen:
                 )
             ]
             st.dataframe(pd.DataFrame(rows_type), use_container_width=True, hide_index=True)
+
+        with st.expander("Answered Questions", expanded=False):
+            for i, row in enumerate(ans_rows, start=1):
+                icon = "OK" if row.get("is_correct") else "X"
+                ref_label = question_reference_label(row, include_prefix=False)
+                title = f"Q{i}"
+                if ref_label:
+                    title += f" ({ref_label})"
+                st.markdown(
+                    f"**{title}** {icon} - Your: **{row.get('selected_answer') or '-'}** "
+                    f"| Correct: **{row.get('correct_answer') or '-'}**"
+                )
+                st.caption(str(row.get("stimulus") or "")[:200])
+                if row.get("explanation"):
+                    st.info(row["explanation"])
+                st.divider()
     else:
         st.caption("No detailed answers found for this session.")

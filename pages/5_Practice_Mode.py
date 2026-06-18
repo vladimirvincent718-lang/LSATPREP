@@ -8,6 +8,8 @@ import re
 import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from datetime import date, timedelta
+from html import escape
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
@@ -15,20 +17,24 @@ import random
 
 from src.auth         import require_login
 from src.utils        import (page_header, sidebar_nav,
-                               render_question, render_score_card, render_timer, DIFFICULTY_LABELS)
+                               render_question, render_score_card, DIFFICULTY_LABELS,
+                               get_effective_admin)
 from src.database     import (
     get_all_questions, get_all_settings, get_distinct_values,
     get_enrolled_courses, get_course_question_count, set_setting,
+    get_answer_stats,
 )
 from src.exam_engine  import (
     start_quiz, clear_quiz, is_active, current_question, next_question,
-    prev_question, record_answer, record_self_grade, pause_timer, resume_timer,
-    time_on_current_question, submit_section, persist_current_exam,
+    prev_question, record_answer, record_self_grade,
+    submit_section, persist_current_exam,
     restore_exam_draft, _st, _set, _K,
 )
 from src.analytics    import get_smart_review_questions
 from src.question_loader import is_open_ended_question
+from src.question_map import render_question_map, render_question_map_legend
 from src.pdf_export import generate_exam_pdf, make_pdf_filename
+from src.email_notifications import send_take_home_exam_pdf
 
 PRACTICE_POOL_KEY = "practice_question_pool"
 PRACTICE_NOTICE_KEY = "practice_session_notice"
@@ -44,6 +50,11 @@ PRACTICE_EXPANDED_ANSWER_KEY = "practice_expanded_answer_idxs"
 PRACTICE_TIMER_ENABLED_KEY = "practice_timer_enabled"
 PRACTICE_TIMER_SECONDS_KEY = "practice_timer_seconds"
 PRACTICE_SETUP_TIMER_SECONDS_KEY = "practice_setup_timer_seconds"
+PRACTICE_TIMER_CURRENT_IDX_KEY = "practice_timer_current_idx"
+PRACTICE_TIMER_REMAINING_KEY = "practice_timer_remaining_seconds"
+PRACTICE_TIMER_LAST_STARTED_KEY = "practice_timer_last_started_at"
+PRACTICE_TIMER_PAUSED_KEY = "practice_timer_paused"
+PRACTICE_TIMER_VISIBLE_KEY = "practice_timer_visible"
 PRACTICE_N_QUESTIONS_KEY = "practice_n_questions"
 PRACTICE_DIFFICULTY_COUNT_PREFIX = "practice_difficulty_count"
 PRACTICE_BULK_DIFFICULTY_COUNT_KEY = "practice_bulk_difficulty_count"
@@ -51,19 +62,226 @@ PRACTICE_LAST_APPLIED_BULK_DIFFICULTY_COUNT_KEY = "practice_last_applied_bulk_di
 PRACTICE_QTYPE_KEY = "practice_qtype_filter"
 PRACTICE_MODULES_KEY = "practice_module_filters"
 PRACTICE_QUESTION_ORDER_KEY = "practice_question_order"
-PRACTICE_OPEN_ENDED_MODE_KEY = "practice_open_ended_mode"
+PRACTICE_DIFFICULTY_MODE_PREFIX = "practice_difficulty_mode"
+PRACTICE_TAKE_HOME_KEY = "practice_take_home_exam"
 PRACTICE_TIMEOUT_NOTICE_KEY = "practice_timeout_notice"
 PRACTICE_TIMED_OUT_QUESTIONS_KEY = "practice_timed_out_questions"
 PRACTICE_TIMEOUT_ANSWER = "__TIMEOUT__"
 PRACTICE_SKIPPED_NOTICE_KEY = "practice_skipped_notice"
 PRACTICE_SKIPPED_QUESTIONS_KEY = "practice_skipped_questions"
 PRACTICE_SKIPPED_ANSWER = "__SKIPPED__"
+PRACTICE_REACHED_QUESTIONS_KEY = "practice_reached_questions"
+PRACTICE_DEFAULT_TIMER_SECONDS = 120
 MODULE_ALL = "All modules (randomized)"
 MODULE_RANDOM = "Random module"
 PRACTICE_LAST_SETTINGS_KEY = "practice_mode_last_settings"
 QUESTION_ORDER_RANDOM = "Randomized"
 QUESTION_ORDER_BY_DIFFICULTY = "By difficulty (1 to 5)"
 QUESTION_ORDER_OPTIONS = [QUESTION_ORDER_RANDOM, QUESTION_ORDER_BY_DIFFICULTY]
+QUESTION_MODE_MULTIPLE_CHOICE = "Multiple choice"
+QUESTION_MODE_OPEN_ENDED = "Open-ended challenge"
+QUESTION_MODE_OPTIONS = [QUESTION_MODE_MULTIPLE_CHOICE, QUESTION_MODE_OPEN_ENDED]
+
+
+def _today_bounds() -> tuple[str, str, date]:
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+    return (
+        f"{today.isoformat()} 00:00:00",
+        f"{tomorrow.isoformat()} 00:00:00",
+        today,
+    )
+
+
+def _today_label(value: date) -> str:
+    return value.strftime("%b %#d") if os.name == "nt" else value.strftime("%b %-d")
+
+
+def _latest_practice_time(answers: list[dict]) -> str:
+    if not answers:
+        return "No scored practice yet today"
+    latest = max(str(answer.get("completed_at") or "") for answer in answers)
+    return latest[11:16] if len(latest) >= 16 else latest
+
+
+def _current_practice_progress() -> str:
+    if not is_active() or _st("mode") != "practice":
+        return ""
+
+    questions = _st("questions") or []
+    answers = _st("answers") or {}
+    answered = len({
+        int(idx) if isinstance(idx, int) or str(idx).isdigit() else idx
+        for idx in answers.keys()
+    })
+    total = len(questions)
+    if not total:
+        return ""
+    return f" Current session: {answered}/{total} answered; it joins today's total when scored."
+
+
+def _render_practice_dashboard_strip(
+    enrolled_course_ids: list[int],
+    active_course_id: int | None,
+    active_course_title: str,
+) -> None:
+    completed_from, completed_to, today = _today_bounds()
+    today_answers = [
+        answer for answer in get_answer_stats(
+            user_id,
+            course_ids=enrolled_course_ids,
+            completed_from=completed_from,
+            completed_to=completed_to,
+        )
+        if answer.get("mode") == "practice"
+    ]
+    active_course_answers = [
+        answer for answer in today_answers
+        if active_course_id is not None
+        and answer.get("question_course_id") == active_course_id
+    ]
+    session_count = len({
+        answer.get("attempt_id")
+        for answer in today_answers
+        if answer.get("attempt_id") is not None
+    })
+    modules_today = {
+        str(answer.get("section_type") or "Unknown Module").strip() or "Unknown Module"
+        for answer in today_answers
+    }
+    correct_today = sum(1 for answer in today_answers if answer.get("is_correct"))
+    accuracy_today = (
+        round(correct_today / len(today_answers) * 100)
+        if today_answers
+        else None
+    )
+
+    latest_time = escape(_latest_practice_time(today_answers))
+    today_label = escape(_today_label(today))
+    safe_course = escape(active_course_title)
+    progress_note = escape(_current_practice_progress())
+    accuracy_label = f"{accuracy_today}%" if accuracy_today is not None else "-"
+
+    st.markdown(
+        f"""
+<section class="sf-practice-today-dashboard" aria-label="Practice dashboard">
+  <div class="sf-practice-today-copy">
+    <p class="sf-practice-today-eyebrow">Practice Dashboard - {today_label}</p>
+    <h2>{len(today_answers)} questions today</h2>
+    <p>Scored practice questions across your enrolled courses. Latest scored session: {latest_time}.{progress_note}</p>
+  </div>
+  <div class="sf-practice-today-metrics">
+    <div class="sf-practice-today-metric">
+      <span>{session_count}</span>
+      <p>Practice Sessions</p>
+      <small>completed today</small>
+    </div>
+    <div class="sf-practice-today-metric">
+      <span>{len(modules_today)}</span>
+      <p>Modules</p>
+      <small>practiced today</small>
+    </div>
+    <div class="sf-practice-today-metric">
+      <span>{len(active_course_answers)}</span>
+      <p>{safe_course}</p>
+      <small>active course today</small>
+    </div>
+    <div class="sf-practice-today-metric">
+      <span>{accuracy_label}</span>
+      <p>Accuracy</p>
+      <small>practice today</small>
+    </div>
+  </div>
+</section>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def _install_practice_dashboard_styles() -> None:
+    st.markdown(
+        """
+<style>
+.sf-practice-today-dashboard {
+    align-items: stretch;
+    background:
+        radial-gradient(circle at top left, rgba(29, 78, 216, 0.15), transparent 34%),
+        linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+    border: 1px solid #d8dee8;
+    border-radius: 8px;
+    box-shadow: 0 14px 34px rgba(15, 23, 42, 0.08);
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: minmax(15rem, 1.1fr) minmax(22rem, 2.4fr);
+    margin: 0.25rem 0 1.45rem;
+    padding: 1rem 1.15rem;
+}
+.sf-practice-today-copy h2 {
+    color: #0f172a;
+    font-size: 1.65rem;
+    line-height: 1.15;
+    margin: 0.2rem 0 0.35rem;
+}
+.sf-practice-today-copy p {
+    color: #53627c;
+    margin: 0;
+}
+.sf-practice-today-eyebrow {
+    color: #1d4ed8 !important;
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    margin: 0 !important;
+    text-transform: uppercase;
+}
+.sf-practice-today-metrics {
+    display: grid;
+    gap: 0.75rem;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.sf-practice-today-metric {
+    background: rgba(255, 255, 255, 0.84);
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    min-width: 0;
+    padding: 0.85rem 0.9rem;
+}
+.sf-practice-today-metric span {
+    color: #0f172a;
+    display: block;
+    font-size: 1.55rem;
+    font-weight: 850;
+    line-height: 1;
+}
+.sf-practice-today-metric p {
+    color: #172033;
+    font-weight: 750;
+    margin: 0.45rem 0 0.15rem;
+    overflow-wrap: anywhere;
+}
+.sf-practice-today-metric small {
+    color: #64748b;
+    display: block;
+    font-size: 0.78rem;
+    overflow-wrap: anywhere;
+}
+@media (max-width: 1000px) {
+    .sf-practice-today-dashboard {
+        grid-template-columns: 1fr;
+    }
+    .sf-practice-today-metrics {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+@media (max-width: 640px) {
+    .sf-practice-today-metrics {
+        grid-template-columns: 1fr;
+    }
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 def _read_last_practice_settings(settings: dict) -> dict:
@@ -80,6 +298,15 @@ def _valid_int(value, default: int, min_value: int, max_value: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(min_value, min(parsed, max_value))
+
+
+def _default_question_time_seconds(settings: dict) -> int:
+    return _valid_int(
+        settings.get("question_time_seconds"),
+        PRACTICE_DEFAULT_TIMER_SECONDS,
+        15,
+        600,
+    )
 
 
 def _saved_list(saved: dict, key: str, valid_values: set | None = None) -> list:
@@ -108,6 +335,52 @@ def _saved_difficulty_counts(saved: dict) -> dict[int, int]:
     return {difficulty: (total if difficulty == 1 else 0) for difficulty in range(1, 6)}
 
 
+def _difficulty_mode_key(difficulty: int) -> str:
+    return f"{PRACTICE_DIFFICULTY_MODE_PREFIX}_{difficulty}"
+
+
+def _saved_difficulty_modes(saved: dict) -> dict[int, str]:
+    legacy_open_ended = bool(saved.get("open_ended_mode", False))
+    default_mode = QUESTION_MODE_OPEN_ENDED if legacy_open_ended else QUESTION_MODE_MULTIPLE_CHOICE
+    raw = saved.get("difficulty_modes")
+    if not isinstance(raw, dict):
+        return {difficulty: default_mode for difficulty in range(1, 6)}
+
+    return {
+        difficulty: (
+            raw.get(str(difficulty), raw.get(difficulty))
+            if raw.get(str(difficulty), raw.get(difficulty)) in QUESTION_MODE_OPTIONS
+            else default_mode
+        )
+        for difficulty in range(1, 6)
+    }
+
+
+def _open_ended_question_copy(q: dict) -> dict:
+    question = dict(q)
+    correct = str(question.get("correct_answer") or "").strip().upper()
+    if correct in {"A", "B", "C", "D", "E"}:
+        question["_sample_answer"] = str(
+            question.get(f"choice_{correct.lower()}") or ""
+        ).strip()
+    question["_force_open_ended"] = True
+    return question
+
+
+def _apply_difficulty_question_modes(
+    questions: list[dict],
+    difficulty_modes: dict[int, str],
+) -> list[dict]:
+    transformed = []
+    for question in questions:
+        difficulty = _valid_int(question.get("difficulty"), 3, 1, 5)
+        if difficulty_modes.get(difficulty) == QUESTION_MODE_OPEN_ENDED:
+            transformed.append(_open_ended_question_copy(question))
+        else:
+            transformed.append(question)
+    return transformed
+
+
 def _difficulty_count_key(difficulty: int) -> str:
     return f"{PRACTICE_DIFFICULTY_COUNT_PREFIX}_{difficulty}"
 
@@ -133,6 +406,26 @@ def _natural_sort_key(value: str) -> list:
 
 def _question_id(q: dict) -> int | None:
     return q.get("id")
+
+
+def _answer_key_variants(idx: int) -> tuple[int, str]:
+    return idx, str(idx)
+
+
+def _dict_get_idx(data: dict, idx: int, default=None):
+    for key in _answer_key_variants(idx):
+        if key in data:
+            return data.get(key)
+    return default
+
+
+def _dict_has_idx(data: dict, idx: int) -> bool:
+    return any(key in data for key in _answer_key_variants(idx))
+
+
+def _dict_pop_idx(data: dict, idx: int) -> None:
+    for key in _answer_key_variants(idx):
+        data.pop(key, None)
 
 
 def _practice_pool() -> list[dict]:
@@ -198,10 +491,121 @@ def _swap_current_question() -> bool:
     return True
 
 
+def _practice_question_time_limit() -> int:
+    return _valid_int(
+        st.session_state.get(PRACTICE_TIMER_SECONDS_KEY),
+        PRACTICE_DEFAULT_TIMER_SECONDS,
+        15,
+        600,
+    )
+
+
+def _practice_timer_remaining() -> float:
+    if not st.session_state.get(PRACTICE_TIMER_ENABLED_KEY):
+        return 0.0
+    seconds = _practice_question_time_limit()
+    remaining = float(st.session_state.get(PRACTICE_TIMER_REMAINING_KEY, seconds))
+    if st.session_state.get(PRACTICE_TIMER_PAUSED_KEY):
+        return max(0.0, min(float(seconds), remaining))
+    started_at = float(st.session_state.get(PRACTICE_TIMER_LAST_STARTED_KEY) or time.time())
+    return max(0.0, min(float(seconds), remaining - (time.time() - started_at)))
+
+
+def _sync_practice_timer_to_exam_state() -> None:
+    seconds = _practice_question_time_limit()
+    remaining = _practice_timer_remaining()
+    now = time.time()
+    _set("time_limit", seconds)
+    _set("section_started", now - (seconds - remaining))
+    _set("q_start_time", now - (seconds - remaining))
+    _set("timer_paused", bool(st.session_state.get(PRACTICE_TIMER_PAUSED_KEY)))
+    _set("timer_paused_at", now if st.session_state.get(PRACTICE_TIMER_PAUSED_KEY) else None)
+    _set("timer_visible", bool(st.session_state.get(PRACTICE_TIMER_VISIBLE_KEY, True)))
+
+
+def _pause_practice_timer() -> None:
+    if not st.session_state.get(PRACTICE_TIMER_ENABLED_KEY):
+        return
+    st.session_state[PRACTICE_TIMER_REMAINING_KEY] = _practice_timer_remaining()
+    st.session_state[PRACTICE_TIMER_PAUSED_KEY] = True
+    _sync_practice_timer_to_exam_state()
+    persist_current_exam(user_id)
+
+
+def _resume_practice_timer() -> None:
+    if not st.session_state.get(PRACTICE_TIMER_ENABLED_KEY):
+        return
+    st.session_state[PRACTICE_TIMER_REMAINING_KEY] = _practice_timer_remaining()
+    st.session_state[PRACTICE_TIMER_LAST_STARTED_KEY] = time.time()
+    st.session_state[PRACTICE_TIMER_PAUSED_KEY] = False
+    _sync_practice_timer_to_exam_state()
+    persist_current_exam(user_id)
+
+
+def _render_practice_timer(seconds: float, total_seconds: float, key_prefix: str) -> None:
+    visible = bool(st.session_state.get(PRACTICE_TIMER_VISIBLE_KEY, True))
+    paused = bool(st.session_state.get(PRACTICE_TIMER_PAUSED_KEY))
+    pct = max(0.0, min(1.0, seconds / total_seconds)) if total_seconds else 0
+    m, s = divmod(int(seconds), 60)
+
+    if visible:
+        suffix = "paused" if paused else "remaining"
+        st.markdown(
+            f'<div class="sf-timer-card"><div class="sf-timer-label">{m:02d}:{s:02d} {suffix}</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.progress(pct)
+    else:
+        st.caption("Timer hidden. You can turn it back on from any question.")
+
+    show_col, pause_col = st.columns(2)
+    with show_col:
+        show_label = "Hide" if visible else "Show"
+        if st.button(show_label, key=f"{key_prefix}_show", use_container_width=True):
+            st.session_state[PRACTICE_TIMER_VISIBLE_KEY] = not visible
+            _sync_practice_timer_to_exam_state()
+            st.rerun()
+    with pause_col:
+        pause_label = "Resume" if paused else "Pause"
+        if st.button(pause_label, key=f"{key_prefix}_pause", use_container_width=True):
+            if paused:
+                _resume_practice_timer()
+            else:
+                _pause_practice_timer()
+            st.rerun()
+
+
 def _start_practice_question_clock() -> None:
     if st.session_state.get(PRACTICE_TIMER_ENABLED_KEY):
-        resume_timer()
-        _set("q_start_time", time.time())
+        seconds = _practice_question_time_limit()
+        st.session_state[PRACTICE_TIMER_REMAINING_KEY] = float(seconds)
+        st.session_state[PRACTICE_TIMER_LAST_STARTED_KEY] = time.time()
+        st.session_state[PRACTICE_TIMER_PAUSED_KEY] = False
+        st.session_state[PRACTICE_TIMER_VISIBLE_KEY] = True
+        st.session_state[PRACTICE_TIMER_CURRENT_IDX_KEY] = _st("current_idx") or 0
+        _sync_practice_timer_to_exam_state()
+
+
+def _apply_active_question_timer_settings(
+    enabled: bool,
+    seconds: int,
+    save_as_default: bool,
+) -> None:
+    seconds = _valid_int(seconds, PRACTICE_DEFAULT_TIMER_SECONDS, 15, 600)
+    st.session_state[PRACTICE_TIMER_ENABLED_KEY] = bool(enabled)
+    st.session_state[PRACTICE_TIMER_SECONDS_KEY] = int(seconds) if enabled else 0
+    st.session_state[PRACTICE_SETUP_TIMER_SECONDS_KEY] = int(seconds)
+    st.session_state[PRACTICE_TIMER_VISIBLE_KEY] = bool(enabled)
+    if enabled:
+        _start_practice_question_clock()
+    else:
+        _set("time_limit", 0)
+        _set("timer_visible", False)
+        _set("timer_paused", False)
+        _set("timer_paused_at", None)
+    if save_as_default:
+        set_setting(user_id, "question_time_seconds", str(int(seconds)))
+    persist_current_exam(user_id)
 
 
 def _go_to_practice_question(idx: int) -> None:
@@ -210,6 +614,31 @@ def _go_to_practice_question(idx: int) -> None:
         return
     st.session_state[_K["current_idx"]] = max(0, min(idx, len(questions) - 1))
     _start_practice_question_clock()
+
+
+def _mark_practice_question_reached(idx: int) -> None:
+    questions = _st("questions") or []
+    if not questions or not (0 <= idx < len(questions)):
+        return
+    reached = st.session_state.get(PRACTICE_REACHED_QUESTIONS_KEY, set())
+    if not isinstance(reached, set):
+        reached = set(reached or [])
+    reached.add(idx)
+    st.session_state[PRACTICE_REACHED_QUESTIONS_KEY] = reached
+
+
+def _practice_reached_indices(current_idx: int) -> set[int]:
+    questions = _st("questions") or []
+    answers = _st("answers") or {}
+    reached = st.session_state.get(PRACTICE_REACHED_QUESTIONS_KEY, set())
+    if not isinstance(reached, set):
+        reached = set(reached or [])
+    for idx in answers.keys():
+        if isinstance(idx, int) or str(idx).isdigit():
+            reached.add(int(idx))
+    if questions:
+        reached.add(max(0, min(current_idx, len(questions) - 1)))
+    return {idx for idx in reached if 0 <= idx < len(questions)}
 
 
 def _timed_out_answer_for_current_question(current_idx: int, q: dict) -> str:
@@ -231,6 +660,62 @@ def _open_answer_review_for_question(current_idx: int) -> None:
     st.session_state[PRACTICE_EXPANDED_ANSWER_KEY] = expanded_answers
 
 
+def _reset_practice_question_for_redo(idx: int) -> bool:
+    questions = _st("questions") or []
+    if not questions or not (0 <= idx < len(questions)):
+        return False
+
+    answers = _st("answers") or {}
+    _dict_pop_idx(answers, idx)
+    _set("answers", answers)
+
+    self_grades = _st("self_grades") or {}
+    _dict_pop_idx(self_grades, idx)
+    _set("self_grades", self_grades)
+
+    expanded_answers = st.session_state.get(PRACTICE_EXPANDED_ANSWER_KEY, set())
+    expanded_answers.discard(idx)
+    st.session_state[PRACTICE_EXPANDED_ANSWER_KEY] = expanded_answers
+
+    timed_out_questions = st.session_state.get(PRACTICE_TIMED_OUT_QUESTIONS_KEY, set())
+    timed_out_questions.discard(idx)
+    st.session_state[PRACTICE_TIMED_OUT_QUESTIONS_KEY] = timed_out_questions
+
+    skipped_questions = st.session_state.get(PRACTICE_SKIPPED_QUESTIONS_KEY, set())
+    skipped_questions.discard(idx)
+    st.session_state[PRACTICE_SKIPPED_QUESTIONS_KEY] = skipped_questions
+
+    st.session_state.pop(PRACTICE_TIMEOUT_NOTICE_KEY, None)
+    st.session_state.pop(PRACTICE_SKIPPED_NOTICE_KEY, None)
+    st.session_state.pop(f"q_radio_{idx}", None)
+    st.session_state.pop(f"q_open_ended_{idx}", None)
+    st.session_state.pop(f"q_self_grade_{idx}", None)
+
+    _set("current_idx", idx)
+    if not st.session_state.get(PRACTICE_TIMER_ENABLED_KEY) and (_st("time_limit") or 0) > 0:
+        st.session_state[PRACTICE_TIMER_ENABLED_KEY] = True
+        st.session_state[PRACTICE_TIMER_SECONDS_KEY] = int(_st("time_limit") or PRACTICE_DEFAULT_TIMER_SECONDS)
+    _start_practice_question_clock()
+    persist_current_exam(user_id)
+    return True
+
+
+def _pending_practice_answer(current_idx: int, q: dict, rendered_answer: str | None) -> str:
+    if is_open_ended_question(q):
+        return str(
+            rendered_answer
+            if rendered_answer is not None
+            else st.session_state.get(f"q_open_ended_{current_idx}", "")
+        ).strip()
+
+    if rendered_answer:
+        return rendered_answer
+
+    widget_value = st.session_state.get(f"q_radio_{current_idx}")
+    match = re.match(r"\*\*([A-E])\.\*\*", str(widget_value or ""))
+    return match.group(1) if match else ""
+
+
 def _mark_current_question_timed_out(current_idx: int, q: dict) -> None:
     record_answer(current_idx, _timed_out_answer_for_current_question(current_idx, q))
     if is_open_ended_question(q):
@@ -239,7 +724,7 @@ def _mark_current_question_timed_out(current_idx: int, q: dict) -> None:
     timed_out_questions.add(current_idx)
     st.session_state[PRACTICE_TIMED_OUT_QUESTIONS_KEY] = timed_out_questions
     _open_answer_review_for_question(current_idx)
-    pause_timer()
+    _pause_practice_timer()
     st.session_state[PRACTICE_TIMEOUT_NOTICE_KEY] = current_idx
 
 
@@ -255,7 +740,7 @@ def _skip_current_question() -> None:
     skipped_questions.add(current_idx)
     st.session_state[PRACTICE_SKIPPED_QUESTIONS_KEY] = skipped_questions
     _open_answer_review_for_question(current_idx)
-    pause_timer()
+    _pause_practice_timer()
     st.session_state[PRACTICE_SKIPPED_NOTICE_KEY] = current_idx
 
 def _render_pdf_download(label: str = "Download Practice PDF") -> None:
@@ -423,6 +908,7 @@ def _install_difficulty_slider_helpers() -> None:
 user_id  = require_login()
 username = st.session_state.get("username", "")
 sidebar_nav(username)
+real_admin, admin = get_effective_admin(user_id)
 restore_exam_draft(user_id, modes={"practice"})
 
 enrolled_courses = get_enrolled_courses(user_id)
@@ -441,6 +927,14 @@ default_course_ids = (
     if active_course_id in course_titles
     else [enrolled_courses[0]["id"]]
 )
+dashboard_active_course_id = default_course_ids[0]
+dashboard_active_course_title = course_titles[dashboard_active_course_id]
+_install_practice_dashboard_styles()
+_render_practice_dashboard_strip(
+    enrolled_course_ids=list(course_titles.keys()),
+    active_course_id=dashboard_active_course_id,
+    active_course_title=dashboard_active_course_title,
+)
 
 page_header("✏️ Practice Mode", "Drill questions at your own pace")
 
@@ -451,6 +945,7 @@ settings  = get_all_settings(user_id)
 hard_mode = settings.get("hard_mode", "false") == "true"
 show_exp  = settings.get("show_explanations", "always")
 last_practice_settings = _read_last_practice_settings(settings)
+default_question_time_seconds = _default_question_time_seconds(settings)
 
 if not is_active() and "last_report" in st.session_state:
     report = st.session_state.pop("last_report")
@@ -508,6 +1003,13 @@ if not is_active():
         difficulty_key = _difficulty_count_key(difficulty)
         if difficulty_key not in st.session_state:
             st.session_state[difficulty_key] = saved_count
+    saved_difficulty_modes = _saved_difficulty_modes(last_practice_settings)
+    for difficulty, saved_mode in saved_difficulty_modes.items():
+        difficulty_mode_key = _difficulty_mode_key(difficulty)
+        if difficulty_mode_key not in st.session_state:
+            st.session_state[difficulty_mode_key] = saved_mode
+        elif st.session_state[difficulty_mode_key] not in QUESTION_MODE_OPTIONS:
+            st.session_state[difficulty_mode_key] = QUESTION_MODE_MULTIPLE_CHOICE
     if PRACTICE_USE_WEAKNESS_KEY not in st.session_state:
         st.session_state[PRACTICE_USE_WEAKNESS_KEY] = bool(
             last_practice_settings.get("use_weakness", True)
@@ -517,9 +1019,9 @@ if not is_active():
             last_practice_settings.get("use_timer", True)
         )
     if PRACTICE_SETUP_TIMER_SECONDS_KEY not in st.session_state:
-        st.session_state[PRACTICE_SETUP_TIMER_SECONDS_KEY] = _valid_int(
-            last_practice_settings.get("timer_seconds"), 120, 30, 300
-        )
+        st.session_state[PRACTICE_SETUP_TIMER_SECONDS_KEY] = default_question_time_seconds
+    else:
+        st.session_state[PRACTICE_SETUP_TIMER_SECONDS_KEY] = default_question_time_seconds
     if PRACTICE_BULK_DIFFICULTY_COUNT_KEY not in st.session_state:
         st.session_state[PRACTICE_BULK_DIFFICULTY_COUNT_KEY] = _valid_int(
             last_practice_settings.get("bulk_difficulty_count"), 0, 0, 100
@@ -538,9 +1040,9 @@ if not is_active():
         st.session_state[PRACTICE_QUESTION_ORDER_KEY] = (
             saved_order if saved_order in QUESTION_ORDER_OPTIONS else QUESTION_ORDER_RANDOM
         )
-    if PRACTICE_OPEN_ENDED_MODE_KEY not in st.session_state:
-        st.session_state[PRACTICE_OPEN_ENDED_MODE_KEY] = bool(
-            last_practice_settings.get("open_ended_mode", False)
+    if PRACTICE_TAKE_HOME_KEY not in st.session_state:
+        st.session_state[PRACTICE_TAKE_HOME_KEY] = bool(
+            last_practice_settings.get("take_home_exam", False)
         )
     if PRACTICE_MODULES_KEY not in st.session_state:
         st.session_state[PRACTICE_MODULES_KEY] = _saved_list(
@@ -619,28 +1121,46 @@ if not is_active():
                 "questions farther out, and mastered items appear less often."
             ),
         )
-        open_ended_mode = st.checkbox(
-            "Open-ended challenge - hide answer choices",
-            key=PRACTICE_OPEN_ENDED_MODE_KEY,
+        with st.expander("Advanced"):
+            st.markdown("##### Question Mode by Difficulty")
+            st.caption(
+                "Use open-ended challenge to hide answer choices for selected "
+                "difficulty levels while keeping other levels multiple choice."
+            )
+            difficulty_modes = {}
+            mode_cols = st.columns(5)
+            for difficulty, mode_col in zip(range(1, 6), mode_cols):
+                with mode_col:
+                    difficulty_modes[difficulty] = st.selectbox(
+                        f"Level {difficulty}",
+                        QUESTION_MODE_OPTIONS,
+                        key=_difficulty_mode_key(difficulty),
+                        help=DIFFICULTY_LABELS.get(difficulty, ""),
+                    )
+        take_home_exam = st.checkbox(
+            "Create take-home exam PDF and email it to me",
+            key=PRACTICE_TAKE_HOME_KEY,
             help=(
-                "Multiple choice is the default. Turn this on when you want to "
-                "remove the options and self-grade your written response."
+                "Generate the same practice set as a PDF, send it to your email on file, "
+                "and keep a download button available here."
             ),
         )
         use_timer = st.checkbox(
-            "⏱ Enable per-question timer (optional)",
+            "Enable per-question timer (optional)",
             key=PRACTICE_USE_TIMER_KEY,
         )
         timer_secs = (
             st.number_input(
                 "Seconds per question",
-                30,
-                300,
+                15,
+                600,
                 key=PRACTICE_SETUP_TIMER_SECONDS_KEY,
+                step=5,
             )
             if use_timer else None
         )
-        submitted = st.button("▶ Start Practice", use_container_width=True)
+        start_label = "Create Take-Home Exam" if take_home_exam else "Start Practice"
+        submitted = st.button(start_label, use_container_width=True)
 
     if submitted:
         if not selected_course_ids:
@@ -670,8 +1190,16 @@ if not is_active():
                 str(difficulty): int(count)
                 for difficulty, count in difficulty_counts.items()
             },
+            "difficulty_modes": {
+                str(difficulty): mode
+                for difficulty, mode in difficulty_modes.items()
+            },
             "use_weakness": bool(use_weakness),
-            "open_ended_mode": bool(open_ended_mode),
+            "open_ended_mode": all(
+                mode == QUESTION_MODE_OPEN_ENDED
+                for mode in difficulty_modes.values()
+            ),
+            "take_home_exam": bool(take_home_exam),
             "use_timer": bool(use_timer),
             "question_order": question_order,
             "timer_seconds": int(timer_secs or st.session_state.get(PRACTICE_SETUP_TIMER_SECONDS_KEY, 120)),
@@ -769,14 +1297,30 @@ if not is_active():
         if question_order == QUESTION_ORDER_RANDOM:
             random.shuffle(questions)
 
-        question_time_limit = int(timer_secs or 0) if use_timer else 0
+        questions = _apply_difficulty_question_modes(questions, difficulty_modes)
+        replacement_pool = _apply_difficulty_question_modes(
+            replacement_pool,
+            difficulty_modes,
+        )
+
+        question_time_limit = _valid_int(
+            timer_secs,
+            PRACTICE_DEFAULT_TIMER_SECONDS,
+            15,
+            600,
+        ) if use_timer else 0
         clear_quiz()
         st.session_state[PRACTICE_POOL_KEY] = replacement_pool
         st.session_state[PRACTICE_TIMER_ENABLED_KEY] = bool(question_time_limit)
         st.session_state[PRACTICE_TIMER_SECONDS_KEY] = question_time_limit
+        st.session_state[PRACTICE_TIMER_REMAINING_KEY] = float(question_time_limit)
+        st.session_state[PRACTICE_TIMER_LAST_STARTED_KEY] = time.time()
+        st.session_state[PRACTICE_TIMER_PAUSED_KEY] = False
+        st.session_state[PRACTICE_TIMER_VISIBLE_KEY] = bool(question_time_limit)
         st.session_state[PRACTICE_TIMED_OUT_QUESTIONS_KEY] = set()
         st.session_state[PRACTICE_SKIPPED_QUESTIONS_KEY] = set()
         st.session_state[PRACTICE_EXPANDED_ANSWER_KEY] = set()
+        st.session_state[PRACTICE_REACHED_QUESTIONS_KEY] = {0}
         st.session_state.pop(PRACTICE_TIMEOUT_NOTICE_KEY, None)
         st.session_state.pop(PRACTICE_SKIPPED_NOTICE_KEY, None)
         section_label = (
@@ -796,8 +1340,36 @@ if not is_active():
                 }
                 for cid in selected_course_ids
             ],
+            include_answer_key=not take_home_exam,
         )
         st.session_state[PRACTICE_PDF_NAME_KEY] = make_pdf_filename(practice_label)
+        if take_home_exam:
+            course_name = (
+                course_titles[selected_course_ids[0]]
+                if len(selected_course_ids) == 1
+                else "Multiple Courses"
+            )
+            result = send_take_home_exam_pdf(
+                user_id,
+                course_name=course_name,
+                module_name=section_label,
+                exam_label=practice_label,
+                pdf_bytes=st.session_state[PRACTICE_PDF_KEY],
+                pdf_filename=st.session_state[PRACTICE_PDF_NAME_KEY],
+                question_count=len(questions),
+            )
+            if result.sent:
+                st.success(result.message)
+            else:
+                st.warning(result.message)
+            if selected_module:
+                st.info(f"Generated module: {selected_module}")
+            for shortage in shortage_messages:
+                st.info(shortage)
+            _render_pdf_download("Download Take-Home Exam PDF")
+            from src.voice_exam import cleanup_voice_exam_panel
+            cleanup_voice_exam_panel()
+            st.stop()
         start_quiz(
             user_id=user_id,
             mode="practice",
@@ -806,7 +1378,7 @@ if not is_active():
             hard_mode=hard_mode,
             time_limit_seconds=question_time_limit,
             course_id=attempt_course_id,
-            open_ended_mode=open_ended_mode,
+            open_ended_mode=False,
         )
         notices = []
         if selected_module:
@@ -830,29 +1402,51 @@ instant_fb   = st.session_state.get("practice_instant_fb", True)
 timed_out_questions = st.session_state.get(PRACTICE_TIMED_OUT_QUESTIONS_KEY, set())
 skipped_questions = st.session_state.get(PRACTICE_SKIPPED_QUESTIONS_KEY, set())
 session_time_limit = _st("time_limit") or 0
-question_time_limit = int(
-    st.session_state.get(PRACTICE_TIMER_SECONDS_KEY)
-    or session_time_limit
-    or 0
+timer_enabled = (
+    bool(st.session_state.get(PRACTICE_TIMER_ENABLED_KEY))
+    if PRACTICE_TIMER_ENABLED_KEY in st.session_state
+    else (0 < session_time_limit < 99999)
 )
-if question_time_limit > 300 and len(questions):
-    question_time_limit = max(1, int(question_time_limit / len(questions)))
-timer_enabled = bool(st.session_state.get(PRACTICE_TIMER_ENABLED_KEY)) or (
-    0 < session_time_limit < 99999
-)
+question_time_limit = _practice_question_time_limit() if timer_enabled else 0
 
 total    = len(questions)
-answered = len(answers_dict)
+answered = len({
+    int(idx) if isinstance(idx, int) or str(idx).isdigit() else idx
+    for idx in answers_dict.keys()
+})
 q        = current_question()
+_mark_practice_question_reached(current_idx)
+current_answered = _dict_has_idx(answers_dict, current_idx)
 
 if q is None:
     st.error("Session error: no questions loaded.")
     clear_quiz()
     st.rerun()
 
-if timer_enabled and current_idx not in answers_dict:
-    question_elapsed = time_on_current_question()
-    if question_time_limit and question_elapsed >= question_time_limit:
+if timer_enabled:
+    st.session_state[PRACTICE_TIMER_SECONDS_KEY] = question_time_limit
+    _set("time_limit", question_time_limit)
+    if (
+        not current_answered
+        and (
+            PRACTICE_TIMER_REMAINING_KEY not in st.session_state
+            or PRACTICE_TIMER_LAST_STARTED_KEY not in st.session_state
+            or _st("q_start_time") is None
+            or session_time_limit != question_time_limit
+            or st.session_state.get(PRACTICE_TIMER_CURRENT_IDX_KEY) != current_idx
+            or bool(_st("timer_paused")) != bool(st.session_state.get(PRACTICE_TIMER_PAUSED_KEY, False))
+        )
+    ):
+        _start_practice_question_clock()
+
+if timer_enabled and not current_answered:
+    remaining = _practice_timer_remaining()
+    _sync_practice_timer_to_exam_state()
+    if (
+        question_time_limit
+        and not st.session_state.get(PRACTICE_TIMER_PAUSED_KEY)
+        and remaining <= 0
+    ):
         _mark_current_question_timed_out(current_idx, q)
         st.rerun()
 
@@ -864,13 +1458,44 @@ if notice:
 from src.voice_exam import render_voice_exam_panel
 render_voice_exam_panel(q, current_idx, total)
 
-if timer_enabled and current_idx not in answers_dict:
+if timer_enabled and not current_answered:
     st_autorefresh(interval=1_000, key="practice_timer_refresh")
-    remaining = max(0.0, question_time_limit - time_on_current_question())
-    render_timer(remaining, question_time_limit, key_prefix="practice_timer")
+    remaining = _practice_timer_remaining()
+    _render_practice_timer(remaining, question_time_limit, key_prefix="practice_timer")
 elif timer_enabled:
-    remaining = max(0.0, question_time_limit - time_on_current_question())
-    render_timer(remaining, question_time_limit, key_prefix="practice_timer")
+    remaining = _practice_timer_remaining()
+    _render_practice_timer(remaining, question_time_limit, key_prefix="practice_timer")
+
+with st.expander("Timer Settings"):
+    with st.form("active_practice_timer_settings"):
+        active_timer_enabled = st.toggle(
+            "Enable per-question timer",
+            value=bool(timer_enabled),
+        )
+        active_timer_seconds = st.number_input(
+            "Seconds per question",
+            min_value=15,
+            max_value=600,
+            value=int(question_time_limit or default_question_time_seconds),
+            step=5,
+            disabled=not active_timer_enabled,
+        )
+        save_default_timer = st.checkbox(
+            "Make this my default per-question timer",
+            value=False,
+        )
+        save_timer_settings = st.form_submit_button(
+            "Apply Timer Settings",
+            use_container_width=True,
+        )
+    if save_timer_settings:
+        _apply_active_question_timer_settings(
+            active_timer_enabled,
+            active_timer_seconds,
+            save_default_timer,
+        )
+        st.success("Timer settings updated for this practice session.")
+        st.rerun()
 
 st.progress(answered / total if total else 0,
             text=f"Progress: {answered}/{total} answered")
@@ -891,14 +1516,33 @@ with nav_mid:
         _go_to_practice_question(jump - 1); st.rerun()
 st.divider()
 
-selected      = answers_dict.get(current_idx, "")
+selected      = _dict_get_idx(answers_dict, current_idx, "")
 is_flagged    = current_idx in flagged_set
-already_ans   = current_idx in answers_dict
+already_ans   = _dict_has_idx(answers_dict, current_idx)
 show_answer   = instant_fb and already_ans
 expanded_answers = st.session_state.get(PRACTICE_EXPANDED_ANSWER_KEY, set())
 auto_expand_answer = show_answer and current_idx in expanded_answers
 timed_out_notice_idx = st.session_state.pop(PRACTICE_TIMEOUT_NOTICE_KEY, None)
 skipped_notice_idx = st.session_state.pop(PRACTICE_SKIPPED_NOTICE_KEY, None)
+timed_out_current = current_idx in timed_out_questions
+skipped_current = current_idx in skipped_questions
+
+if admin and already_ans:
+    with st.expander("Admin correction", expanded=timed_out_current or skipped_current):
+        st.caption(
+            "Use this when a timer or app glitch marked the question before the student "
+            "had a fair attempt."
+        )
+        if st.button("Redo this question: clear answer and reset timer", use_container_width=True):
+            if not real_admin:
+                st.error("Permission denied. Real admin access required.")
+            elif _reset_practice_question_for_redo(current_idx):
+                st.session_state[PRACTICE_NOTICE_KEY] = (
+                    f"Question {current_idx + 1} was reset. It will count like a fresh attempt."
+                )
+                st.rerun()
+            else:
+                st.warning("This question could not be reset.")
 
 picked = render_question(
     q=q, idx=current_idx, total=total,
@@ -907,8 +1551,6 @@ picked = render_question(
 )
 persist_current_exam(user_id)
 
-timed_out_current = current_idx in timed_out_questions
-skipped_current = current_idx in skipped_questions
 if timed_out_notice_idx == current_idx or selected == PRACTICE_TIMEOUT_ANSWER or timed_out_current:
     st.error("Time expired before you submitted. This question was marked wrong.")
 if skipped_notice_idx == current_idx or selected == PRACTICE_SKIPPED_ANSWER or skipped_current:
@@ -922,8 +1564,8 @@ if open_ended and already_ans:
         record_self_grade(current_idx, False)
         self_grades = _st("self_grades") or {}
     else:
-        has_existing_grade = current_idx in self_grades
-        existing_grade = self_grades.get(current_idx)
+        has_existing_grade = _dict_has_idx(self_grades, current_idx)
+        existing_grade = _dict_get_idx(self_grades, current_idx)
         self_grade_choice = st.radio(
             "Self-grade this written response:",
             options=["Correct", "Incorrect"],
@@ -939,12 +1581,13 @@ if open_ended and already_ans:
 
 if not already_ans:
     if st.button("✔ Submit Answer", type="primary", use_container_width=True):
-        if not picked and not open_ended:
+        submitted_answer = _pending_practice_answer(current_idx, q, picked)
+        if not submitted_answer and not open_ended:
             _skip_current_question()
             st.rerun()
         else:
-            record_answer(current_idx, picked)
-            pause_timer()
+            record_answer(current_idx, submitted_answer)
+            _pause_practice_timer()
             _open_answer_review_for_question(current_idx)
             st.rerun()
 else:
@@ -973,10 +1616,12 @@ st.divider()
 
 col_end, col_quit = st.columns(2)
 with col_end:
-    if st.button("🏁 Finish Session & See Score", use_container_width=True):
+    if st.button("Finish and Score Reached Questions", use_container_width=True):
+        reached_indices = _practice_reached_indices(current_idx)
         ungraded_open_ended = [
             i for i, question in enumerate(questions)
-            if is_open_ended_question(question)
+            if i in reached_indices
+            and is_open_ended_question(question)
             and str(answers_dict.get(i, "")).strip()
             and i not in self_grades
         ]
@@ -995,12 +1640,29 @@ with col_quit:
         clear_quiz(); st.rerun()
 
 if st.session_state.get(PRACTICE_CONFIRM_FINISH_KEY):
-    st.warning("Are you sure you want to submit this session and see your score?")
+    reached_indices = _practice_reached_indices(current_idx)
+    reached_count = len(reached_indices)
+    excluded_count = max(0, total - reached_count)
+    st.warning("Finish this practice session and score only the questions you reached?")
+    st.caption(
+        f"You reached {reached_count} of {total} question(s). "
+        f"When you finish, {excluded_count} unreached question(s) will not count "
+        "as wrong or appear in Review Mistakes. This session will close immediately."
+    )
+    st.caption("Skipped questions and submitted blank answers still count as incorrect.")
     confirm_col, cancel_col = st.columns(2)
     with confirm_col:
-        if st.button("Yes, submit session", type="primary", use_container_width=True):
+        if st.button(
+            f"Score {reached_count} and End Session",
+            type="primary",
+            use_container_width=True,
+        ):
             st.session_state.pop(PRACTICE_CONFIRM_FINISH_KEY, None)
-            report = submit_section(user_id)
+            # Close the active UI before writing results so a simultaneous
+            # rerun or second click cannot keep this session open.
+            _set("active", False)
+            with st.spinner("Scoring and closing this practice session..."):
+                report = submit_section(user_id, question_indices=reached_indices)
             st.session_state["last_report"] = report
             clear_quiz(); st.rerun()
     with cancel_col:
@@ -1011,17 +1673,17 @@ if st.session_state.get(PRACTICE_CONFIRM_FINISH_KEY):
 # ── Sidebar question map ──────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("**Question Map**")
-    st.caption("🟢 Correct  🔴 Wrong  ⬜ Unanswered  🚩 Flagged")
-    cols = st.columns(5)
-    for i in range(total):
-        ans  = answers_dict.get(i, "")
+    render_question_map_legend(scored=True)
+
+    def _practice_map_state(i: int) -> dict[str, object]:
+        ans  = _dict_get_idx(answers_dict, i, "")
         flag = i in flagged_set
         if i in skipped_questions or i in timed_out_questions:
             icon = "ðŸ”´"
-        elif i in answers_dict:
+        elif _dict_has_idx(answers_dict, i):
             if is_open_ended_question(questions[i]):
-                if i in self_grades:
-                    icon = "🟢" if self_grades[i] else "🔴"
+                if _dict_has_idx(self_grades, i):
+                    icon = "🟢" if _dict_get_idx(self_grades, i) else "🔴"
                 else:
                     icon = "⬜"
             else:
@@ -1031,8 +1693,35 @@ with st.sidebar:
             icon = "⬜"
         if flag:
             icon = "🚩"
+        if i in skipped_questions or i in timed_out_questions:
+            status = "wrong"
+        elif _dict_has_idx(answers_dict, i):
+            if is_open_ended_question(questions[i]):
+                if _dict_has_idx(self_grades, i):
+                    status = "correct" if _dict_get_idx(self_grades, i) else "wrong"
+                else:
+                    status = "unanswered"
+            else:
+                correct_a = (questions[i].get("correct_answer") or "").upper()
+                status = "correct" if ans.upper() == correct_a else "wrong"
+        else:
+            status = "unanswered"
+        return {
+            "status": status,
+            "flagged": flag,
+            "help": f"Go to question {i + 1}",
+        }
         if cols[i % 5].button(icon, key=f"map_{i}"):
             _go_to_practice_question(i); st.rerun()
+
+    selected_map_idx = render_question_map(
+        total=total,
+        current_idx=current_idx,
+        state_for_index=_practice_map_state,
+        key_prefix="map",
+    )
+    if selected_map_idx is not None:
+        _go_to_practice_question(selected_map_idx); st.rerun()
 
 # ── Score report ──────────────────────────────────────────────────────────────
 if not is_active() and "last_report" in st.session_state:

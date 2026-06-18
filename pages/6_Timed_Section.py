@@ -10,7 +10,8 @@ from streamlit_autorefresh import st_autorefresh
 
 from src.auth        import require_login
 from src.utils       import (page_header, sidebar_nav, require_course,
-                               render_question, render_score_card, render_timer)
+                               render_question, render_score_card, render_timer,
+                               question_reference_label)
 from src.database    import get_all_questions, get_all_settings, get_distinct_values, get_course
 from src.exam_engine import (
     start_quiz, clear_quiz, is_active, current_question,
@@ -19,6 +20,9 @@ from src.exam_engine import (
     persist_current_exam, restore_exam_draft, _st, _set, _K,
 )
 from src.question_loader import is_open_ended_question
+from src.question_map import render_question_map, render_question_map_legend
+from src.pdf_export import generate_exam_pdf, make_pdf_filename
+from src.email_notifications import notify_exam_started
 
 TIMED_CONFIRM_SUBMIT_KEY = "timed_confirm_submit"
 
@@ -38,6 +42,10 @@ page_header("⏱ Timed Exam", f"One timed section — {course_title}")
 
 if st.session_state.pop("_exam_restored_notice", False):
     st.success("Your in-progress timed section was restored with your saved answers and remaining time.")
+
+email_notice = st.session_state.pop("exam_email_notice", None)
+if email_notice:
+    st.info(email_notice)
 
 settings  = get_all_settings(user_id)
 hard_mode = settings.get("hard_mode", "false") == "true"
@@ -97,6 +105,14 @@ if not is_active():
             )
             st.stop()
         questions = random.sample(pool, min(int(n_questions), len(pool)))
+        exam_label = f"Timed Section: {section_type}"
+        pdf_bytes = generate_exam_pdf(
+            questions=questions,
+            title=exam_label,
+            subtitle=f"{course_title} timed exam",
+            distribution=[{"course": course_title, "q_count": len(questions)}],
+        )
+        pdf_filename = make_pdf_filename(exam_label)
         clear_quiz()
         start_quiz(
             user_id=user_id,
@@ -108,6 +124,17 @@ if not is_active():
             course_id=course_id,
             open_ended_mode=open_ended_mode,
         )
+        result = notify_exam_started(
+            user_id,
+            course_name=course_title,
+            module_name=section_type,
+            exam_label=exam_label,
+            pdf_bytes=pdf_bytes,
+            pdf_filename=pdf_filename,
+            question_count=len(questions),
+        )
+        if result.sent or result.message != "Email notifications are off.":
+            st.session_state["exam_email_notice"] = result.message
         st.rerun()
     from src.voice_exam import cleanup_voice_exam_panel
     cleanup_voice_exam_panel()
@@ -239,16 +266,30 @@ if st.session_state.get(TIMED_CONFIRM_SUBMIT_KEY):
 # ── Sidebar question map ──────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("**Question Map**")
-    st.caption("🟢 Answered  ⬜ Unanswered  🚩 Flagged")
-    cols = st.columns(5)
-    for i in range(total):
+    render_question_map_legend(scored=False)
+
+    def _timed_map_state(i: int) -> dict[str, object]:
         ans  = answers_dict.get(i, "")
         flag = i in flagged_set
         icon = "🚩" if flag else ("🟢" if ans else "⬜")
+        return {
+            "status": "answered" if ans else "unanswered",
+            "flagged": flag,
+            "help": f"Go to question {i + 1}",
+        }
         if cols[i % 5].button(icon, key=f"tmap_{i}"):
             st.session_state[_K["current_idx"]] = i; st.rerun()
 
 # ── Score report ──────────────────────────────────────────────────────────────
+    selected_map_idx = render_question_map(
+        total=total,
+        current_idx=current_idx,
+        state_for_index=_timed_map_state,
+        key_prefix="tmap",
+    )
+    if selected_map_idx is not None:
+        st.session_state[_K["current_idx"]] = selected_map_idx; st.rerun()
+
 if not is_active() and "timed_report" in st.session_state:
     report = st.session_state.pop("timed_report")
     st.success("Section complete!")
@@ -263,7 +304,11 @@ if not is_active() and "timed_report" in st.session_state:
                 sel    = row.get("selected_answer", "")
                 corr   = row.get("correct_answer", "")
                 icon   = "✅" if row.get("is_correct") else "❌"
-                st.markdown(f"**Q{i+1}** {icon} — Your: **{sel}** | Correct: **{corr}**")
+                ref_label = question_reference_label(row, include_prefix=False)
+                title = f"**Q{i+1}**"
+                if ref_label:
+                    title += f" ({ref_label})"
+                st.markdown(f"{title} {icon} — Your: **{sel}** | Correct: **{corr}**")
                 st.caption(row.get("stimulus", "")[:200])
                 if row.get("explanation"):
                     st.info(row["explanation"])

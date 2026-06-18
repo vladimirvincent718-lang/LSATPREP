@@ -251,6 +251,65 @@ def get_score_history(user_id: int,
 
 
 # ── Weakness-weighted question selection ──────────────────────────────────────
+def get_module_attempt_history(
+    user_id: int,
+    course_id: int | None = None,
+    course_ids: list[int] | None = None,
+    completed_from=None,
+    completed_to=None,
+) -> pd.DataFrame:
+    """Return one row per module per completed attempt."""
+    answers = get_answer_stats(
+        user_id,
+        course_id=course_id,
+        course_ids=course_ids,
+        completed_from=completed_from,
+        completed_to=completed_to,
+    )
+    if not answers:
+        return pd.DataFrame()
+
+    grouped: dict[tuple, dict] = {}
+    for answer in answers:
+        attempt_id = answer.get("attempt_id")
+        if attempt_id is None:
+            continue
+        course_title = str(answer.get("course_title") or "Unknown Course").strip() or "Unknown Course"
+        module = str(answer.get("section_type") or "Unknown Module").strip() or "Unknown Module"
+        key = (course_title, module, attempt_id)
+        row = grouped.setdefault(
+            key,
+            {
+                "Course": course_title,
+                "Module": module,
+                "Date": answer.get("completed_at"),
+                "Mode": answer.get("mode") or "",
+                "Attempt ID": attempt_id,
+                "Questions": 0,
+                "Correct": 0,
+            },
+        )
+        row["Questions"] += 1
+        row["Correct"] += int(bool(answer.get("is_correct")))
+
+    rows = []
+    for row in grouped.values():
+        total = row["Questions"]
+        row["% Correct"] = round(row["Correct"] / total * 100, 1) if total else 0
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values(["Course", "Module", "Date", "Attempt ID"])
+    df["Attempt #"] = df.groupby(["Course", "Module"]).cumcount() + 1
+    latest_attempt = df.groupby(["Course", "Module"])["Attempt #"].transform("max")
+    df["Latest"] = df["Attempt #"].eq(latest_attempt)
+    return df.sort_values(["Date", "Course", "Module"], ascending=[False, True, True])
+
+
 def get_weakness_weighted_questions(
     user_id: int,
     all_questions: list[dict],

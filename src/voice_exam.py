@@ -77,8 +77,12 @@ def build_question_data(q: dict, idx: int, total: int) -> dict:
 
 _TTS_ENGINE_JS = """
 (function(){
-  if (window._sfTTSEngine) return;
+  if (window._sfTTSEngine && window._sfTTSEngine.version === 'direct-speak-v5') return;
+  if (window._sfTTSEngine) {
+    try { window._sfTTSEngine.stop(); } catch(e) {}
+  }
   window._sfTTSEngine = {
+    version: 'direct-speak-v5',
     _gen: 0,
 
     /* Cancel synchronously (no delayed side-effects). */
@@ -160,12 +164,12 @@ _TTS_ENGINE_JS = """
       /* Chrome loads voices asynchronously the first time. */
       if (ss.getVoices().length > 0) {
         /* Voices already available — still wait 60 ms for the cancel to clear. */
-        setTimeout(doSpeak, 60);
+        doSpeak();
       } else {
         /* Wait for voiceschanged, then speak (with the same 60 ms settle). */
         var handler = function() {
           ss.removeEventListener('voiceschanged', handler);
-          setTimeout(doSpeak, 60);
+          doSpeak();
         };
         ss.addEventListener('voiceschanged', handler);
         /* Safety: if the event never fires (some browsers), try after 1 s anyway. */
@@ -193,6 +197,9 @@ _PANEL_CSS = """
   -webkit-tap-highlight-color:transparent;}
 #sf-vep-fab:hover{transform:translateY(-2px);box-shadow:0 6px 24px rgba(124,58,237,.65);}
 #sf-vep-fab:active{transform:scale(.93);}
+#sf-vep-fab.sf-playing{
+  background:linear-gradient(135deg,#0F766E 0%,#115E59 100%);
+  box-shadow:0 4px 18px rgba(15,118,110,.45);}
 #sf-vep-fab.sf-listening{
   background:linear-gradient(135deg,#DC2626 0%,#991B1B 100%);
   animation:sf-pulse 1.4s ease-in-out infinite;}
@@ -310,6 +317,7 @@ if(!P||!doc) return;
 
 /* Question data */
 var Q=__QUESTION_DATA__;
+var V='settings-space-v5';
 
 /* Keys */
 var SK='_sfVoiceState', TK='_sfTTSEngine';
@@ -321,7 +329,9 @@ var hasSTT=!!SRC;
 
 /* ── Inject TTS engine into parent head ──────────────────────────────────── */
 function ensureTTSEngine(){
-  if(P[TK]) return;
+  if(P[TK]&&P[TK].version==='direct-speak-v5') return;
+  if(P[TK]){try{P[TK].stop();}catch(e){}P[TK]=null;}
+  var old=doc.getElementById('sf-tts-engine');if(old)old.remove();
   var s=doc.createElement('script');
   s.id='sf-tts-engine';
   s.textContent=__TTS_ENGINE__;
@@ -335,13 +345,14 @@ if(!P[SK]){
     _shouldStop:false, _pausedAt:0, _speakOffset:0,
     speed:1.0, fullText:'', charIdx:0,
     listening:false, recognition:null,
-    autoRead:true, requireConfirm:true, showTranscript:true, voiceEnabled:true,
+    autoRead:false, requireConfirm:true, showTranscript:true, voiceEnabled:true,
     pendingAnswer:null, currentIdx:-1, destroyed:false,
     _cbProgress:null, _cbEnd:null, _cbError:null,
   };
 }
 var S=P[SK];
 S.destroyed=false;
+if(S.version!==V){S.autoRead=false;S.version=V;S._forceStopOnBoot=true;}
 if(typeof S.panelCollapsed==='undefined') S.panelCollapsed=false;
 S._cbProgress=function(){updateProg();};
 S._cbEnd=function(){setStatus('Finished');updateCtrl();updateProg();};
@@ -389,7 +400,7 @@ function panelHTML(){
     +'<button class="sf-cfbtn" id="sf-vep-conf-yes">\u2713\u202FConfirm</button>'
     +'<button class="sf-cfbtn" id="sf-vep-conf-no">\u2715\u202FChange</button></div>'
     +'<div id="sf-vep-settings-row">'
-    +'<label class="sf-srow"><input type="checkbox" id="sf-v-autoread"> Auto-read next Q</label>'
+    +'<label class="sf-srow"><input type="checkbox" id="sf-v-autoread"> Auto-play next question</label>'
     +'<label class="sf-srow"><input type="checkbox" id="sf-v-confirm"> Require confirmation</label>'
     +'<label class="sf-srow"><input type="checkbox" id="sf-v-transcript"> Show transcript</label>'
     +'<label class="sf-srow"><input type="checkbox" id="sf-v-voice"'+ns+'> Voice input</label>'
@@ -397,21 +408,27 @@ function panelHTML(){
 }
 
 function ensureFAB(){
-  if(doc.getElementById('sf-vep-fab')) return;
+  var old=doc.getElementById('sf-vep-fab');
+  if(old&&old.dataset.version===V) return;
+  if(old) old.remove();
   var f=doc.createElement('button');
   f.id='sf-vep-fab';
-  f.setAttribute('aria-label','Open Voice Exam Mode');
+  f.dataset.version=V;
+  f.setAttribute('aria-label','Open voice settings');
   f.setAttribute('aria-expanded','false');
-  f.setAttribute('title','Voice Exam Mode');
-  f.innerHTML='\uD83C\uDFA4';
+  f.setAttribute('title','Voice settings');
+  f.innerHTML='\u2699';
   f.addEventListener('click',togglePanel);
   doc.body.appendChild(f);
 }
 
 function ensurePanel(){
-  if(doc.getElementById('sf-vep-panel')) return;
+  var old=doc.getElementById('sf-vep-panel');
+  if(old&&old.dataset.version===V) return;
+  if(old) old.remove();
   var p=doc.createElement('div');
   p.id='sf-vep-panel';
+  p.dataset.version=V;
   p.setAttribute('role','region');
   p.setAttribute('aria-label','Voice Exam Controls');
   p.innerHTML=panelHTML();
@@ -426,11 +443,11 @@ function wirePanel(panel){
   panel.dataset.wired='1';
 
   $('sf-vep-close').addEventListener('click',function(){
-    S.panelOpen=false; S.panelCollapsed=false; applyPanelState(); hardStop(); stopSTT();
+    S.panelOpen=false; S.panelCollapsed=false; applyPanelState(); stopSTT();
   });
   $('sf-vep-collapse').addEventListener('click',function(){
     S.panelOpen=true; S.panelCollapsed=!S.panelCollapsed; applyPanelState();
-    if(S.panelCollapsed){hardStop(); stopSTT(); setStatus('Collapsed');}
+    if(S.panelCollapsed){stopSTT(); setStatus('Collapsed');}
   });
   $('sf-vep-play').addEventListener('click',function(){
     S._shouldStop=false;
@@ -484,6 +501,9 @@ function buildFull(){
   ['A','B','C','D','E'].forEach(function(l){if(Q.choices[l])p.push(l+'. '+Q.choices[l]);});
   return p.join('  ');
 }
+function buildQuestionOnly(){
+  return (Q.stimulus||'').replace(/\s+/g,' ').trim();
+}
 function buildChoices(){
   var p=['Answer choices.'];
   ['A','B','C','D','E'].forEach(function(l){if(Q.choices[l])p.push(l+'. '+Q.choices[l]);});
@@ -491,7 +511,7 @@ function buildChoices(){
 }
 function speakQuestion(){
   if(!hasTTS){setStatus('TTS not supported in this browser');return;}
-  S.fullText=buildFull(); S.charIdx=0; speakFrom(0);
+  S.fullText=buildQuestionOnly(); S.charIdx=0; speakFrom(0);
 }
 function speakChoices(){
   if(!hasTTS) return;
@@ -690,6 +710,14 @@ function updateCtrl(){
     play.setAttribute('aria-label',S.paused?'Resume reading':'Play question');
     if(pause)pause.disabled=true;
   }
+  updateFab();
+}
+function updateFab(){
+  var fab=$('sf-vep-fab');if(!fab)return;
+  fab.classList.remove('sf-playing');
+  fab.innerHTML='\u2699';
+  fab.setAttribute('aria-label',S.panelOpen?'Close voice settings':'Open voice settings');
+  fab.setAttribute('title','Voice settings');
 }
 function updateProg(){
   var bar=$('sf-vep-pg');if(!bar||!S.fullText||!S.fullText.length)return;
@@ -700,6 +728,7 @@ function setMicState(on){
   if(on){mic.classList.add('sf-listening');mic.setAttribute('aria-label','Stop listening');mic.innerHTML='\uD83D\uDD34';}
   else{mic.classList.remove('sf-listening');mic.setAttribute('aria-label','Speak your answer');mic.innerHTML='\uD83C\uDF99';}
   if(fab)fab.classList.toggle('sf-listening',on);
+  updateFab();
 }
 function syncSettings(){
   function cb(id,val){var el=$(id);if(el)el.checked=val;}
@@ -717,34 +746,71 @@ function applyPanelState(){
     collapse.setAttribute('aria-label',S.panelCollapsed?'Expand voice panel':'Collapse voice panel');
     collapse.setAttribute('title',S.panelCollapsed?'Expand voice panel':'Collapse voice panel');
   }
-  if(S.panelOpen){panel.classList.add('sf-open');fab.setAttribute('aria-expanded','true');
-    fab.innerHTML=S.panelCollapsed?'\uD83C\uDFA4':'\u2715';
-    fab.setAttribute('aria-label',S.panelCollapsed?'Expand Voice Exam Mode':'Close Voice Exam Mode');}
-  else{panel.classList.remove('sf-open');panel.classList.remove('sf-collapsed');fab.setAttribute('aria-expanded','false');
-    fab.innerHTML='\uD83C\uDFA4';fab.setAttribute('aria-label','Open Voice Exam Mode');}
+  if(S.panelOpen){panel.classList.add('sf-open');fab.setAttribute('aria-expanded','true');}
+  else{panel.classList.remove('sf-open');panel.classList.remove('sf-collapsed');fab.setAttribute('aria-expanded','false');}
+  updateFab();
+}
+function playText(text, openPanel){
+  if(!hasTTS){setStatus('TTS not supported in this browser');return;}
+  var cleaned=(text||'').replace(/\s+/g,' ').trim();
+  if(!cleaned){setStatus('No question text to read');return;}
+  if(openPanel!==false){
+    S.panelOpen=true; S.panelCollapsed=false;
+    applyPanelState(); syncQLabel(); syncSettings();
+  }
+  S.fullText=cleaned; S.charIdx=0; S._shouldStop=false;
+  hardStop(); S._shouldStop=false; speakFrom(0);
 }
 function togglePanel(){
   if(S.panelOpen&&S.panelCollapsed){S.panelCollapsed=false;}
   else{S.panelOpen=!S.panelOpen;if(!S.panelOpen)S.panelCollapsed=false;}
   applyPanelState();
-  if(S.panelOpen){syncQLabel();syncSettings();
-    if(!S.panelCollapsed&&S.autoRead&&hasTTS)setTimeout(function(){S._shouldStop=false;speakQuestion();},350);}
-  else{hardStop();stopSTT();}
+  if(S.panelOpen){syncQLabel();syncSettings();}
+  else{stopSTT();}
 }
+function isInteractiveTarget(target){
+  if(!target)return false;
+  if(target.isContentEditable)return true;
+  var tag=target.tagName||'';
+  if(tag==='SELECT')return true;
+  if(tag==='INPUT'||tag==='TEXTAREA')return !target.readOnly&&!target.disabled;
+  return tag==='BUTTON'||tag==='A';
+}
+function handleKeydown(e){
+  if((e.code!=='Space'&&e.key!==' ')||e.repeat||e.altKey||e.ctrlKey||e.metaKey||e.shiftKey)return;
+  if(isInteractiveTarget(e.target))return;
+  e.preventDefault();
+  if(S.speaking&&!S.paused){
+    hardStop();setStatus('Stopped \u2014 press Space to read again');
+  }else{
+    playText(buildQuestionOnly(),false);
+  }
+}
+P._sfQuestionAudio={
+  playText:function(text, opts){opts=opts||{};playText(text, opts.openPanel);},
+  stop:function(){hardStop();},
+  isSpeaking:function(){return !!(S.speaking&&!S.paused);}
+};
 
 /* ── MutationObserver ────────────────────────────────────────────────────── */
 if(P._sfVepObs){try{P._sfVepObs.disconnect();}catch(e){}P._sfVepObs=null;}
-P._sfVepObs=new MutationObserver(function(){
-  if(S.destroyed) return;
-  var nf=!doc.getElementById('sf-vep-fab'),np=!doc.getElementById('sf-vep-panel');
-  if(nf)ensureFAB();if(np)ensurePanel();
-  if(nf||np){applyPanelState();updateCtrl();setMicState(S.listening);syncSettings();syncQLabel();}
-});
-P._sfVepObs.observe(doc.body,{childList:true,subtree:false});
+if(doc.body){
+  P._sfVepObs=new MutationObserver(function(){
+    if(S.destroyed) return;
+    var nf=!doc.getElementById('sf-vep-fab'),np=!doc.getElementById('sf-vep-panel');
+    if(nf)ensureFAB();if(np)ensurePanel();
+    if(nf||np){applyPanelState();updateCtrl();setMicState(S.listening);syncSettings();syncQLabel();}
+  });
+  P._sfVepObs.observe(doc.body,{childList:true,subtree:false});
+}
+if(P._sfVepKeydown){doc.removeEventListener('keydown',P._sfVepKeydown);}
+P._sfVepKeydown=handleKeydown;
+doc.addEventListener('keydown',P._sfVepKeydown);
 
 /* ── Question-change handler ─────────────────────────────────────────────── */
 function onNewQuestion(){
-  S.currentIdx=Q.idx;S.pendingAnswer=null;S.charIdx=0;S.fullText=buildFull();
+  hardStop();
+  S.currentIdx=Q.idx;S.pendingAnswer=null;S.charIdx=0;S.fullText=buildQuestionOnly();
   var conf=$('sf-vep-confirm');if(conf)conf.style.display='none';
   syncQLabel();updateProg();
   if(S.panelOpen&&!S.panelCollapsed&&S.autoRead&&hasTTS){
@@ -756,6 +822,7 @@ ensureTTSEngine();
 tts=P[TK];
 ensureStyles();ensureFAB();ensurePanel();
 applyPanelState();updateCtrl();setMicState(S.listening);syncSettings();syncQLabel();
+if(S._forceStopOnBoot){S._forceStopOnBoot=false;hardStop();setStatus('Ready');}
 if(S.currentIdx!==Q.idx) onNewQuestion();
 
 })();
@@ -769,10 +836,12 @@ _CLEANUP_JS = """<script>
   var P=window.parent;if(!P)return;
   if(P._sfVoiceState){P._sfVoiceState.destroyed=true;}
   if(P._sfVepObs){try{P._sfVepObs.disconnect();}catch(e){}P._sfVepObs=null;}
+  if(P._sfVepKeydown){P.document.removeEventListener('keydown',P._sfVepKeydown);P._sfVepKeydown=null;}
   if(P._sfTTSEngine){try{P._sfTTSEngine.stop();}catch(e){}}
   ['sf-vep-fab','sf-vep-panel','sf-vep-style','sf-tts-engine'].forEach(function(id){
     var el=P.document.getElementById(id);if(el)el.remove();
   });
+  P._sfQuestionAudio=null;
   P._sfVoiceState=null;P._sfTTSEngine=null;
 })();
 </script>"""

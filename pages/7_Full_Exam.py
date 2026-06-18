@@ -11,7 +11,8 @@ from streamlit_autorefresh import st_autorefresh
 
 from src.auth       import require_login
 from src.utils      import (page_header, sidebar_nav, require_course,
-                              render_question, render_score_card, render_timer)
+                              render_question, render_score_card, render_timer,
+                              question_reference_label)
 from src.database   import (get_all_settings, get_attempts, get_attempt_answers,
                               complete_attempt, get_course)
 from src.exam_engine import (
@@ -23,6 +24,9 @@ from src.exam_engine import (
 )
 from src.scoring import compute_score
 from src.question_loader import is_open_ended_question
+from src.question_map import render_question_map, render_question_map_legend
+from src.pdf_export import generate_exam_pdf, make_pdf_filename
+from src.email_notifications import notify_exam_started
 
 st.set_page_config(page_title="Full Exam · StudyForge", page_icon="📋", layout="wide")
 
@@ -40,6 +44,10 @@ page_header("📋 Full Exam Mode", f"Multi-section simulation — {course_title}
 
 if st.session_state.pop("_exam_restored_notice", False):
     st.success("Your in-progress full exam was restored with your saved answers and remaining time.")
+
+email_notice = st.session_state.pop("exam_email_notice", None)
+if email_notice:
+    st.info(email_notice)
 
 settings  = get_all_settings(user_id)
 hard_mode = settings.get("hard_mode", "false") == "true"
@@ -99,6 +107,30 @@ This mode uses the section types available in the active course question bank.
             course_id=course_id,
             open_ended_mode=open_ended_mode,
         )
+        sections = st.session_state.get(_K["full_sections"], [])
+        exam_questions = [
+            question
+            for section in sections
+            for question in section.get("questions", [])
+        ]
+        exam_label = "Full Exam"
+        pdf_bytes = generate_exam_pdf(
+            questions=exam_questions,
+            title=exam_label,
+            subtitle=f"{course_title} full exam simulation",
+            distribution=[{"course": course_title, "q_count": len(exam_questions)}],
+        )
+        result = notify_exam_started(
+            user_id,
+            course_name=course_title,
+            module_name=exam_label,
+            exam_label=exam_label,
+            pdf_bytes=pdf_bytes,
+            pdf_filename=make_pdf_filename(exam_label),
+            question_count=len(exam_questions),
+        )
+        if result.sent or result.message != "Email notifications are off.":
+            st.session_state["exam_email_notice"] = result.message
         st.session_state[KEY_EXAM_RUNNING]  = True
         st.session_state[KEY_EXAM_COMPLETE] = False
         st.session_state[KEY_ALL_REPORTS]   = []
@@ -153,8 +185,12 @@ if exam_complete():
             rows = get_attempt_answers(attempt["id"])
             for i, row in enumerate(rows):
                 icon = "✅" if row["is_correct"] else "❌"
+                ref_label = question_reference_label(row, include_prefix=False)
+                title = f"**Q{i+1}**"
+                if ref_label:
+                    title += f" ({ref_label})"
                 st.markdown(
-                    f"**Q{i+1}** {icon}  Your: **{row['selected_answer'] or '—'}** "
+                    f"{title} {icon}  Your: **{row['selected_answer'] or '—'}** "
                     f"| Correct: **{row['correct_answer']}**"
                 )
                 st.caption(str(row["stimulus"])[:200])
@@ -337,11 +373,25 @@ if st.session_state.get(KEY_CONFIRM_SUBMIT):
 
 with st.sidebar:
     st.markdown(f"**Section {section_num}/4 Question Map**")
-    st.caption("🟢 Answered  ⬜ Skipped  🚩 Flagged")
-    mcols = st.columns(5)
-    for i in range(total):
+    render_question_map_legend(scored=False)
+
+    def _full_exam_map_state(i: int) -> dict[str, object]:
         ans  = answers_dict.get(i, "")
         flag = i in flagged_set
         icon = "🚩" if flag else ("🟢" if ans else "⬜")
+        return {
+            "status": "answered" if ans else "unanswered",
+            "flagged": flag,
+            "help": f"Go to question {i + 1}",
+        }
         if mcols[i % 5].button(icon, key=f"femap_{i}"):
             st.session_state[_K["current_idx"]] = i; st.rerun()
+
+    selected_map_idx = render_question_map(
+        total=total,
+        current_idx=current_idx,
+        state_for_index=_full_exam_map_state,
+        key_prefix="femap",
+    )
+    if selected_map_idx is not None:
+        st.session_state[_K["current_idx"]] = selected_map_idx; st.rerun()
