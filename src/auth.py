@@ -18,13 +18,17 @@ Session architecture
    removes the browser cookie.
 """
 
+import base64
 import hashlib
-from datetime import datetime, timedelta
+import hmac
+import json
+import os
+from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 
 from src.database import (
-    create_user, get_user_by_username,
+    create_user, get_user_by_id, get_user_by_username,
     set_security_question, get_security_question,
     verify_security_answer, reset_password,
     create_session_token, validate_session_token,
@@ -34,12 +38,15 @@ from src.database import (
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 COOKIE_NAME   = "sf_auth"          # browser cookie that stores the session token
+SIGNED_COOKIE_NAME = "sf_auth_persist"
 LAST_USERNAME_COOKIE_NAME = "sf_last_username"
 SESSION_DAYS  = SESSION_TOKEN_DAYS  # kept in sync with the DB-level expiry
 COOKIE_STATE_KEY = "_sf_cookies"
 COOKIE_LOAD_WAIT_KEY = "_sf_waited_for_cookie_load"
 COOKIE_LOAD_ATTEMPTS_KEY = "_sf_cookie_load_attempts"
 COOKIE_LOAD_MAX_ATTEMPTS = 5
+AUTH_COOKIE_VERSION = 1
+AUTH_SECRET_ENV = "STUDYFORGE_AUTH_SECRET"
 
 SECURITY_QUESTIONS = [
     "What was the name of your first pet?",
@@ -57,6 +64,17 @@ SECURITY_QUESTIONS = [
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
+
+
+def _user_value(user, key: str, default=None):
+    if user is None:
+        return default
+    if isinstance(user, dict):
+        return user.get(key, default)
+    try:
+        return user[key]
+    except Exception:
+        return default
 
 
 def _get_cookie_controller():
@@ -79,12 +97,130 @@ def _cookie_expires() -> datetime:
     return datetime.now() + timedelta(days=SESSION_DAYS)
 
 
+def _cookie_kwargs() -> dict:
+    return {
+        "expires": _cookie_expires(),
+        "same_site": "lax",
+    }
+
+
 def _remove_cookie(cc, name: str) -> None:
     try:
         cc.remove(name)
     except KeyError:
         # CookieController removes in the browser before popping its local cache.
         pass
+
+
+def _b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def _auth_secret() -> str:
+    env_secret = os.getenv(AUTH_SECRET_ENV, "").strip()
+    if env_secret:
+        return env_secret
+    try:
+        for key in ("auth_cookie_secret", AUTH_SECRET_ENV):
+            value = st.secrets.get(key, "")
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    return "studyforge-auth-cookie-fallback"
+
+
+def _signing_key(user) -> bytes:
+    password_hash = str(_user_value(user, "password_hash", ""))
+    created_at = str(_user_value(user, "created_at", ""))
+    material = f"{_auth_secret()}:{password_hash}:{created_at}".encode("utf-8")
+    return hashlib.sha256(material).digest()
+
+
+def _signed_cookie_payload(user) -> dict:
+    return {
+        "v": AUTH_COOKIE_VERSION,
+        "uid": int(_user_value(user, "id")),
+        "username": str(_user_value(user, "username", "")),
+        "exp": int((datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)).timestamp()),
+    }
+
+
+def _encode_signed_auth_cookie(user) -> str:
+    payload = _signed_cookie_payload(user)
+    body = _b64encode(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    signature = hmac.new(
+        _signing_key(user),
+        body.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{body}.{_b64encode(signature)}"
+
+
+def _decode_signed_auth_cookie(value: str) -> dict | None:
+    try:
+        body, supplied_signature = str(value).split(".", 1)
+        payload = json.loads(_b64decode(body).decode("utf-8"))
+        if payload.get("v") != AUTH_COOKIE_VERSION:
+            return None
+        if int(payload.get("exp", 0)) <= int(datetime.now(timezone.utc).timestamp()):
+            return None
+
+        user = get_user_by_id(int(payload["uid"]))
+        if user is None:
+            return None
+        if str(_user_value(user, "username", "")).lower() != str(payload.get("username", "")).lower():
+            return None
+
+        expected_signature = _b64encode(
+            hmac.new(
+                _signing_key(user),
+                body.encode("ascii"),
+                hashlib.sha256,
+            ).digest()
+        )
+        if not hmac.compare_digest(expected_signature, supplied_signature):
+            return None
+
+        return {
+            "id": _user_value(user, "id"),
+            "username": _user_value(user, "username"),
+            "is_admin": _user_value(user, "is_admin", 0),
+            "password_hash": _user_value(user, "password_hash", ""),
+            "created_at": _user_value(user, "created_at", ""),
+        }
+    except Exception:
+        return None
+
+
+def _restore_user_state(user) -> None:
+    st.session_state["user_id"] = _user_value(user, "id")
+    st.session_state["username"] = _user_value(user, "username")
+    _remember_last_username(_user_value(user, "username", ""))
+    st.session_state.pop(COOKIE_LOAD_WAIT_KEY, None)
+    st.session_state.pop(COOKIE_LOAD_ATTEMPTS_KEY, None)
+
+
+def _write_persistent_auth_cookie(cc, user) -> None:
+    cc.set(
+        SIGNED_COOKIE_NAME,
+        _encode_signed_auth_cookie(user),
+        **_cookie_kwargs(),
+    )
+
+
+def _refresh_auth_cookies(cc, user, token: str | None = None) -> None:
+    full_user = get_user_by_id(int(_user_value(user, "id"))) or user
+    if token:
+        cc.set(COOKIE_NAME, token, **_cookie_kwargs())
+    _write_persistent_auth_cookie(cc, full_user)
 
 
 def _remember_last_username(username: str) -> None:
@@ -97,8 +233,7 @@ def _remember_last_username(username: str) -> None:
         cc.set(
             LAST_USERNAME_COOKIE_NAME,
             clean_username,
-            expires=_cookie_expires(),
-            same_site="strict",
+            **_cookie_kwargs(),
         )
     except Exception:
         pass
@@ -149,9 +284,10 @@ def restore_session_from_cookie() -> bool:
         return True
 
     try:
-        cc    = _get_cookie_controller()
+        cc = _get_cookie_controller()
         token = cc.get(COOKIE_NAME)
-        if not token:
+        signed_cookie = cc.get(SIGNED_COOKIE_NAME)
+        if not token and not signed_cookie:
             attempts = int(st.session_state.get(COOKIE_LOAD_ATTEMPTS_KEY, 0))
             cookie_cache = st.session_state.get(COOKIE_STATE_KEY)
             if attempts < COOKIE_LOAD_MAX_ATTEMPTS and not cookie_cache:
@@ -161,11 +297,26 @@ def restore_session_from_cookie() -> bool:
                     pass
             return False
 
-        user = validate_session_token(token)
+        user = validate_session_token(token) if token else None
         if not user:
+            if signed_cookie:
+                user = _decode_signed_auth_cookie(signed_cookie)
+                if user:
+                    new_token = None
+                    try:
+                        new_token = create_session_token(user["id"], days=SESSION_DAYS)
+                    except Exception:
+                        pass
+                    _restore_user_state(user)
+                    try:
+                        _refresh_auth_cookies(cc, user, new_token)
+                    except Exception:
+                        pass
+                    return True
             # Token expired or revoked — remove the stale cookie
             try:
                 _remove_cookie(cc, COOKIE_NAME)
+                _remove_cookie(cc, SIGNED_COOKIE_NAME)
             except Exception:
                 pass
             return False
@@ -177,12 +328,7 @@ def restore_session_from_cookie() -> bool:
         st.session_state.pop(COOKIE_LOAD_WAIT_KEY, None)
         st.session_state.pop(COOKIE_LOAD_ATTEMPTS_KEY, None)
         try:
-            cc.set(
-                COOKIE_NAME,
-                token,
-                expires=_cookie_expires(),
-                same_site="strict",
-            )
+            _refresh_auth_cookies(cc, user, token)
         except Exception:
             pass
         return True
@@ -268,7 +414,9 @@ def login_user(
 
     if not remember_me:
         try:
-            _remove_cookie(_get_cookie_controller(), COOKIE_NAME)
+            cc = _get_cookie_controller()
+            _remove_cookie(cc, COOKIE_NAME)
+            _remove_cookie(cc, SIGNED_COOKIE_NAME)
         except Exception:
             pass
         return True, "Logged in."
@@ -276,15 +424,8 @@ def login_user(
     # ── Create persistent token and set cookie ────────────────────────────────
     try:
         token   = create_session_token(user["id"], days=SESSION_DAYS)
-        expires = _cookie_expires()
         cc      = _get_cookie_controller()
-        cc.set(
-            COOKIE_NAME,
-            token,
-            expires=expires,
-            same_site="strict",
-            # secure=True   ← uncomment when deploying over HTTPS
-        )
+        _refresh_auth_cookies(cc, user, token)
     except Exception:
         # Cookie creation failing should NOT prevent login — the session will
         # just be non-persistent for this browser session.
@@ -304,6 +445,7 @@ def logout() -> None:
         if token:
             delete_session_token(token)
         _remove_cookie(cc, COOKIE_NAME)
+        _remove_cookie(cc, SIGNED_COOKIE_NAME)
     except Exception:
         pass
 

@@ -853,6 +853,16 @@ def get_user_by_username(username: str):
     return row
 
 
+def get_user_by_id(user_id: int):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
 def is_admin(user_id: int) -> bool:
     conn = get_connection()
     row  = conn.execute(
