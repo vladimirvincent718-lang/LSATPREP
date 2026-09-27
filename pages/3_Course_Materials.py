@@ -4,11 +4,13 @@ All enrolled users can view materials and track their own completion.
 Only admins can add, edit, or archive materials.
 """
 
-import sys, os, re, html
+import sys, os, re, html, mimetypes, uuid
+from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
 import pandas as pd
+from src.course_material_nav import course_material_nav
 
 from src.auth     import require_login
 from src.utils    import page_header, sidebar_nav, require_course, get_effective_admin
@@ -30,12 +32,16 @@ user_id  = require_login()
 username = st.session_state.get("username", "")
 sidebar_nav(username)
 
-course_id    = require_course(user_id)
+page_header("📖 Course Materials")
+course_id    = require_course(user_id, main=True)
 course       = get_course(course_id)
 course_title = course["title"] if course else "Unknown"
 real_admin, admin = get_effective_admin(user_id)
 
-page_header("📖 Course Materials", f"Course: {course_title}")
+course_material_nav("library")
+
+from src.study_progress import render_course_progress
+render_course_progress(user_id, [course_id])
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 PROGRESS_OPTIONS = ["Not Started", "In Progress", "Completed"]
@@ -55,6 +61,38 @@ TYPE_META = {
     "PDF/Document Link": ("📄", "#F97316"),
     "Other":             ("📦", "#9CA3AF"),
 }
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MATERIAL_FILES_DIR = PROJECT_ROOT / "data" / "material_files"
+UPLOAD_EXTENSIONS = ["pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "txt"]
+
+
+def _stored_material_file(mat: dict) -> Path | None:
+    """Return a safe existing file from the managed material-upload folder."""
+    raw = (mat.get("stored_file_path") or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(MATERIAL_FILES_DIR.resolve())
+    except (OSError, ValueError):
+        return None
+    return resolved if resolved.is_file() else None
+
+
+def _save_uploaded_material_file(uploaded_file) -> str:
+    """Persist an admin upload and return a portable project-relative path."""
+    MATERIAL_FILES_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix.lstrip(".") not in UPLOAD_EXTENSIONS:
+        raise ValueError("Unsupported document type.")
+    stem = re.sub(r"[^a-zA-Z0-9_-]+", "-", Path(uploaded_file.name).stem).strip("-")
+    destination = MATERIAL_FILES_DIR / f"{stem or 'material'}-{uuid.uuid4().hex[:10]}{suffix}"
+    destination.write_bytes(uploaded_file.getvalue())
+    return destination.relative_to(PROJECT_ROOT).as_posix()
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -362,6 +400,9 @@ def _render_modules_section(
         if st.button("Back to modules", key=f"back_modules_{course_id}"):
             st.session_state.pop(selected_key, None)
             st.rerun()
+        if st.button("📓 Notes for this module", key=f"module_notebook_{course_id}"):
+            st.session_state[f"notebook_open_{course_id}"] = selected_module
+            st.switch_page("pages/3b_Notebook.py")
         _render_module_resource_view(
             selected_module,
             _materials_for_module(selected_module, materials),
@@ -553,6 +594,7 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
     display_title = _extract_display_title(raw_title)
     is_doc        = _is_document_content(raw_title)
     url           = (mat.get("external_url") or "").strip()
+    stored_file   = _stored_material_file(mat)
 
     est      = mat.get("estimated_minutes") or 0
     added    = (mat.get("created_at") or "")[:10]
@@ -573,7 +615,7 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
     )
 
     with st.container(border=True):
-        row = st.columns([0.035, 0.055, 0.46, 0.15, 0.15, 0.15])
+        row = st.columns([0.035, 0.055, 0.66, 0.25] if m_type == "Video" else [0.035, 0.055, 0.46, 0.15, 0.15, 0.15])
         row[0].markdown(
             f'<div class="mat-accent-bar" style="background:{accent};height:48px"></div>',
             unsafe_allow_html=True,
@@ -592,17 +634,27 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
             unsafe_allow_html=True,
         )
 
-        for i, opt in enumerate(PROGRESS_OPTIONS):
-            s_icon = STATUS_ICONS[opt]
-            is_active = status == opt
-            if row[i + 3].button(
-                f"{s_icon} {opt}",
-                key=f"prog_{mat_id}_{opt}",
-                type="primary" if is_active else "secondary",
-                use_container_width=True,
-            ):
-                set_material_progress(user_id, mat_id, course_id, opt)
-                st.rerun()
+        if m_type == "Video":
+            with row[3]:
+                complete = status == "Completed"
+                checked = st.checkbox("Complete" if complete else "Incomplete", value=complete,
+                                      key=f"video_complete_{user_id}_{mat_id}",
+                                      help="Check to mark complete, including if you watched elsewhere. Uncheck to mark incomplete.")
+                if checked != complete:
+                    set_material_progress(user_id, mat_id, course_id, "Completed" if checked else "Not Started")
+                    st.rerun()
+        else:
+            for i, opt in enumerate(PROGRESS_OPTIONS):
+                s_icon = STATUS_ICONS[opt]
+                is_active = status == opt
+                if row[i + 3].button(
+                    f"{s_icon} {opt}",
+                    key=f"prog_{mat_id}_{opt}",
+                    type="primary" if is_active else "secondary",
+                    use_container_width=True,
+                ):
+                    set_material_progress(user_id, mat_id, course_id, opt)
+                    st.rerun()
 
     # ── Expandable body ───────────────────────────────────────────────────────
     with st.expander("Details", expanded=False):
@@ -627,6 +679,21 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
                 f'<a class="mat-link-btn" href="{safe_url}" target="_blank" rel="noopener">{link_label} ↗</a>',
                 unsafe_allow_html=True,
             )
+
+        if stored_file:
+            if stored_file.suffix.lower() == '.pdf':
+                from src.material_review_ui import render_slide_viewer
+                render_slide_viewer(stored_file, f'library_{mat_id}')
+            mime = mimetypes.guess_type(stored_file.name)[0] or "application/octet-stream"
+            st.download_button(
+                "Download document",
+                data=stored_file.read_bytes(),
+                file_name=stored_file.name,
+                mime=mime,
+                key=f"download_material_{mat_id}",
+            )
+        elif mat.get("stored_file_path") and admin:
+            st.warning("The uploaded document is missing from managed storage.")
 
         if mat.get("notes"):
             st.markdown(
@@ -684,6 +751,11 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
                         height=180,
                     )
                     e_url   = st.text_input("External URL", value=mat.get("external_url", ""))
+                    e_file = st.file_uploader(
+                        "Replace uploaded document",
+                        type=UPLOAD_EXTENSIONS,
+                        key=f"edit_file_{mat_id}",
+                    )
                     e_notes = st.text_input("Notes / tags",  value=mat.get("notes", ""))
                     ec1, ec2 = st.columns(2)
                     e_order = ec1.number_input(
@@ -699,9 +771,13 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
                     cancel_e = bc2.form_submit_button("Cancel", use_container_width=True)
 
                 if save_e:
+                    replacement_path = (
+                        _save_uploaded_material_file(e_file) if e_file is not None else None
+                    )
                     update_material(
                         mat_id, e_title, e_type,
                         e_content, e_url, e_notes,
+                        stored_file_path=replacement_path,
                         display_order=e_order, estimated_minutes=e_mins,
                         material_section=e_section,
                         module_name=e_module if e_section == "Module" else "",
@@ -715,12 +791,16 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
 
 # ── Build tabs ────────────────────────────────────────────────────────────────
 if admin:
-    tab_view, tab_add, tab_discover = st.tabs(["Materials", "Add Material", "Discover Resources"])
+    tab_review, tab_view, tab_add, tab_discover = st.tabs(["Cheat sheets & spaced review", "Materials", "Add Material", "Discover Resources"], key='course_material_tabs', on_change='rerun')
 else:
-    (tab_view,) = st.tabs(["Materials"])
+    tab_review, tab_view = st.tabs(["Cheat sheets & spaced review", "Materials"], key='course_material_tabs', on_change='rerun')
     tab_add = None
     tab_discover = None
 
+
+with tab_review:
+    from src.material_review_ui import render_course_reviews
+    render_course_reviews(user_id, course_id, track_views=tab_review.open)
 
 # ── Tab 1: View materials ─────────────────────────────────────────────────────
 with tab_view:
@@ -987,7 +1067,7 @@ if tab_add is not None:
 
                 with st.expander("Source and content", expanded=True):
                     st.caption(
-                        "Paste text or notes below. For videos, articles, and documents, add the URL too."
+                        "Paste text or notes, add an external URL, or upload a document."
                     )
                     a_content = st.text_area(
                         "Content text",
@@ -1000,6 +1080,15 @@ if tab_add is not None:
                     a_url = st.text_input(
                         "External URL",
                         placeholder="https://www.youtube.com/watch?v=...  or  https://example.com/file.pdf",
+                    )
+                    a_file = st.file_uploader(
+                        "Upload document",
+                        type=UPLOAD_EXTENSIONS,
+                        help="Accepted: PDF, Word, PowerPoint, Excel, and text files.",
+                    )
+                    a_cheat_sheet = st.checkbox(
+                        "Use as a slide cheat sheet with spaced-review reminders",
+                        help="Adds this material to Cheat sheets & spaced review; each learner has a private schedule.",
                     )
 
                 with st.expander("Display settings", expanded=False):
@@ -1029,12 +1118,17 @@ if tab_add is not None:
                     st.error("⚠️ Title is required.")
                 elif a_section == "Module" and not a_module.strip():
                     st.error("Please choose the destination module for this resource.")
-                elif a_section == "Module" and a_type in {"Video", "Link", "PDF/Document Link"} and not a_url.strip():
+                elif a_section == "Module" and a_type in {"Video", "Link"} and not a_url.strip():
                     st.error("Please add the source URL for this resource.")
-                elif not a_content.strip() and not a_url.strip():
-                    st.error("⚠️ Please provide either content text or an external URL.")
+                elif a_section == "Module" and a_type == "PDF/Document Link" and not (a_url.strip() or a_file):
+                    st.error("Please add a document URL or upload the document.")
+                elif not a_content.strip() and not a_url.strip() and a_file is None:
+                    st.error("Please provide content text, an external URL, or an uploaded document.")
                 else:
                     is_active_val = 1 if "Active" in a_active else 0
+                    stored_file_path = (
+                        _save_uploaded_material_file(a_file) if a_file is not None else ""
+                    )
                     mid, err = create_material(
                         course_id=course_id,
                         title=a_title.strip(),
@@ -1042,6 +1136,7 @@ if tab_add is not None:
                         content_text=a_content.strip(),
                         external_url=a_url.strip(),
                         notes=a_notes.strip(),
+                        stored_file_path=stored_file_path,
                         created_by_user_id=user_id,
                         display_order=int(a_order),
                         estimated_minutes=int(a_mins),
@@ -1052,6 +1147,9 @@ if tab_add is not None:
                     if err:
                         st.error(f"⚠️ {err}")
                     else:
+                        if a_cheat_sheet:
+                            from src.material_reviews import register_cheat_sheet
+                            register_cheat_sheet(mid, a_file.name if a_file else a_title.strip())
                         status_word = "added" if is_active_val else "saved as draft"
                         st.success(
                             f"✅ **{a_title.strip()}** {status_word} successfully! "

@@ -20,7 +20,8 @@ from src.utils    import (
     question_reference_label,
 )
 from src.database import (
-    get_mistake_journal, delete_journal_entry, set_journal_entry_completed,
+    get_mistake_journal, delete_journal_entry, clear_mistake_journal,
+    set_journal_entry_completed,
     get_attempts, get_attempt_answers, get_course,
     get_all_curriculums, get_curriculum_courses, get_outstanding_mistake_count,
     create_question_issue_report, get_review_activity, set_mistake_journal_order,
@@ -315,6 +316,68 @@ st.markdown(
 _render_review_dashboard_strip()
 
 page_header("🔍 Review Mistakes", f"Study your wrong answers — {course_title}")
+
+deck_entries = get_mistake_journal(user_id, course_id=course_id)
+deck_action_col, _ = st.columns([1.4, 4.6])
+with deck_action_col:
+    if st.button(
+        "↻ Reset review deck",
+        key="review_mistakes_reset_deck",
+        use_container_width=True,
+        disabled=not deck_entries,
+        help=f"Remove every review item for {course_title} without deleting score history.",
+    ):
+        st.session_state["review_mistakes_confirm_reset"] = course_id
+
+reset_course_id = st.session_state.get("review_mistakes_confirm_reset")
+if reset_course_id is not None and reset_course_id != course_id:
+    st.session_state.pop("review_mistakes_confirm_reset", None)
+    reset_course_id = None
+
+if reset_course_id == course_id:
+    st.warning(
+        f"Reset the review deck for **{course_title}**? This permanently removes "
+        f"{len(deck_entries)} review item(s), including notes and reviewed items. "
+        "Your scores and answers will not be changed."
+    )
+    confirm_col, cancel_col, _ = st.columns([1.4, 1, 3.6])
+    with confirm_col:
+        if st.button(
+            "Yes, reset deck",
+            type="primary",
+            use_container_width=True,
+            key="review_mistakes_confirm_reset_yes",
+        ):
+            removed_count = clear_mistake_journal(user_id, course_id)
+            for state_key in list(st.session_state):
+                if (
+                    state_key in {
+                        "review_mistakes_open_entry_id",
+                        "review_mistakes_open_course_id",
+                        "journal_expanded_question_ids",
+                        "curriculum_expanded_question_ids",
+                        "review_mistakes_confirm_reset",
+                    }
+                    or state_key.startswith(REVIEW_STATE_PREFIXES)
+                    or state_key.startswith(("complete_", "curriculum_complete_"))
+                ):
+                    st.session_state.pop(state_key, None)
+            st.session_state["review_mistakes_reset_notice"] = (
+                f"Review deck reset for {course_title}. Removed {removed_count} item(s)."
+            )
+            st.rerun()
+    with cancel_col:
+        if st.button(
+            "Cancel",
+            use_container_width=True,
+            key="review_mistakes_confirm_reset_cancel",
+        ):
+            st.session_state.pop("review_mistakes_confirm_reset", None)
+            st.rerun()
+
+reset_notice = st.session_state.pop("review_mistakes_reset_notice", None)
+if reset_notice:
+    st.success(reset_notice)
 
 saved_tab = st.session_state.get("review_mistakes_active_tab")
 if saved_tab not in REVIEW_TAB_LABELS:

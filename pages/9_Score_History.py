@@ -134,6 +134,13 @@ chosen = st.selectbox(
 )
 
 if chosen:
+    with st.expander("Delete this session and its score"):
+        st.caption("Use this for test runs you do not want included in your statistics. The question bank is kept.")
+        confirmed = st.checkbox("Permanently delete this selected session", key=f"delete_history_confirm_{chosen}")
+        if st.button("Delete session", disabled=not confirmed, key=f"delete_history_{chosen}"):
+            from src.exam_lifecycle import delete_exam_attempt
+            delete_exam_attempt(user_id,int(chosen))
+            st.rerun()
     ans_rows = get_attempt_answers(chosen)
     if ans_rows:
         from src.scoring import compute_score

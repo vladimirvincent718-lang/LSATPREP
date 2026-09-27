@@ -6,6 +6,7 @@ import os
 import sys
 import json
 from datetime import date, timedelta
+from html import escape
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -15,12 +16,16 @@ import streamlit as st
 
 from src.auth import require_login
 from src.analytics import get_dashboard_stats, get_module_attempt_history
+from src.practice_calendar import render_practice_calendar
+from src.mock_review import get_next_mock_summary, sync_mock_reviews
 from src.database import (
     get_all_curriculums,
     get_all_questions,
     get_answer_drilldown,
     get_answer_stats,
     get_course,
+    get_course_module_difficulty_question_counts,
+    get_course_module_question_counts,
     get_course_question_count,
     get_curriculum_courses,
     get_material_progress,
@@ -35,7 +40,7 @@ from src.database import (
 from src.ui_theme import apply_plotly_theme
 from src.utils import (
     DIFFICULTY_LABELS, course_selector, page_header, sidebar_nav,
-    question_reference_label,
+    format_module_label, module_sort_key, question_reference_label,
 )
 
 st.set_page_config(page_title="Dashboard - StudyForge", page_icon="📊", layout="wide")
@@ -226,6 +231,7 @@ def _reset_dashboard_defaults() -> None:
         "course_dashboard_time_",
         "curriculum_dashboard_time_",
         "course_cards_sort_",
+        "course_table_open_",
     )
     reset_suffixes = ("_selected_kpi",)
     for key in list(st.session_state.keys()):
@@ -261,6 +267,7 @@ def _load_saved_reports(user_id: int) -> dict:
                 {
                     "name": str(report.get("name", "")).strip(),
                     "sections": list(report.get("sections", [])),
+                    "layout": report.get("layout") if isinstance(report.get("layout"), dict) else None,
                 }
                 for report in reports
                 if isinstance(report, dict) and str(report.get("name", "")).strip()
@@ -286,6 +293,9 @@ def _apply_saved_report(user_id: int, view_mode: str, report_name: str) -> None:
     if not report:
         return
     st.session_state[_report_state_key(view_mode)] = report["sections"]
+    if report.get("layout"):
+        from src.dashboard_layout import save_layout
+        save_layout(user_id, view_mode, report["layout"])
     for key in list(st.session_state.keys()):
         if key.endswith("_selected_kpi"):
             del st.session_state[key]
@@ -320,7 +330,8 @@ def _save_current_report(user_id: int, view_mode: str, sections_key: str, name_k
         report for report in saved[view_mode]["reports"]
         if report["name"].lower() != report_name.lower()
     ]
-    reports.append({"name": report_name, "sections": sections})
+    from src.dashboard_layout import load_layout
+    reports.append({"name": report_name, "sections": sections, "layout": load_layout(user_id, view_mode, sections)})
     reports.sort(key=lambda report: report["name"].lower())
     saved[view_mode]["reports"] = reports
     if not saved[view_mode]["default"]:
@@ -369,8 +380,8 @@ def _dashboard_time_controls(key_prefix: str) -> dict:
         "Custom range",
     ]
 
-    with st.container(border=True):
-        st.markdown("### Time View")
+    with st.popover("Filters & time view", use_container_width=True):
+        st.caption("Change the reporting period or group results over time.")
         grain_col, preset_col, start_col, end_col = st.columns([1.2, 1.6, 1, 1])
         grain = grain_col.radio(
             "View by",
@@ -468,7 +479,6 @@ def _report_builder(user_id: int, view_mode: str) -> set[str]:
         "Score trend analysis",
         "Weakest courses",
         "Question reports",
-        "Course dashboard cards",
         "Accuracy by course",
         "Accuracy by module",
         "Question type and difficulty",
@@ -486,10 +496,17 @@ def _report_builder(user_id: int, view_mode: str) -> set[str]:
             section for section in default_report["sections"]
             if section in options
         ]
+    elif key not in st.session_state:
+        st.session_state[key] = (
+            []
+            if view_mode == "Curriculum"
+            else ["Performance overview"]
+        )
 
-    with st.container(border=True):
-        st.markdown("### Report Builder")
-        st.caption("Add only the dashboard sections you want to see.")
+    st.session_state[key] = [section for section in st.session_state[key] if section in options]
+    with st.popover("Customize dashboard", use_container_width=True):
+        st.caption("Choose, save, or restore the analysis sections below.")
+        st.caption("Use Arrange & restore to move or restore dashboard widgets. Use × on a widget to hide it. Saved reports include widget order and visibility.")
 
         report_names = [report["name"] for report in saved_reports[view_mode]["reports"]]
         if report_names:
@@ -569,13 +586,19 @@ def _dashboard_header(
     title: str,
     subtitle: str,
     view_mode: str,
+    time_key_prefix: str,
     current_user_id: int | None = None,
-) -> set[str]:
-    header_col, builder_col = st.columns([2.1, 1], vertical_alignment="top")
-    with header_col:
-        page_header(title, subtitle)
+) -> tuple[set[str], dict]:
+    st.caption(subtitle)
+    builder_col, time_col, layout_col = st.columns(3)
     with builder_col:
-        return _report_builder(current_user_id or globals()["user_id"], view_mode)
+        sections = _report_builder(current_user_id or globals()["user_id"], view_mode)
+    with time_col:
+        time_context = _dashboard_time_controls(time_key_prefix)
+    with layout_col:
+        from src.dashboard_layout import render_layout_editor
+        render_layout_editor(current_user_id or globals()["user_id"], view_mode, sections)
+    return sections, time_context
 
 
 def _render_trend_and_weak_list(stats: dict, weak_key: str,
@@ -1815,31 +1838,122 @@ def _course_card_rows(
                 "sort_latest": _metric_sort_value(stats["latest_percent"]),
                 "sort_best": _metric_sort_value(stats["best_percent"]),
                 "sort_average": _metric_sort_value(stats["avg_percent"]),
+                "sort_status": _performance_status_rank(stats["avg_percent"]),
+                "sort_trend": _metric_sort_value(stats["improvement_trend"]),
                 "sort_materials": material_pct,
             }
         )
     return rows
 
 
-def _render_course_card_sort_controls(rows: list[dict]) -> list[dict]:
-    sort_fields = {
-        "Curriculum order": "display_order",
-        "Course title": "sort_title",
-        "Questions in bank": "sort_questions",
-        "Sessions completed": "sort_sessions",
-        "Total Qs answered": "sort_answered",
-        "Latest score": "sort_latest",
-        "Best score": "sort_best",
-        "Avg score": "sort_average",
-        "Materials progress": "sort_materials",
-    }
+def _performance_status(percent: float | None) -> tuple[str, str]:
+    """Return a compact, scan-friendly status marker and label."""
+    if percent is None:
+        return "⚪", "Not started"
+    if percent < 60:
+        return "🔴", "Focus"
+    if percent < 75:
+        return "🟠", "Developing"
+    return "🟢", "On track"
 
-    with st.container(border=True):
-        st.markdown("#### Sort Courses")
+
+def _performance_status_rank(percent: float | None) -> int:
+    """Return the natural table sort order for performance bands."""
+    if percent is None:
+        return 0
+    if percent < 60:
+        return 1
+    if percent < 75:
+        return 2
+    return 3
+
+
+def _module_overview_rows(
+    stats: dict,
+    bank_counts: dict[str, int],
+    bank_difficulty_counts: dict[str, dict[int, int]],
+) -> list[dict]:
+    """Merge question-bank coverage and answered-question performance by module."""
+    performance = stats.get("accuracy_by_module", {})
+    difficulty_performance = stats.get("accuracy_by_module_difficulty", {})
+    module_names = sorted(set(bank_counts) | set(performance), key=module_sort_key)
+    rows = []
+    for module in module_names:
+        result = performance.get(module, {})
+        answered = int(result.get("total") or 0)
+        correct = int(result.get("correct") or 0)
+        accuracy = result.get("pct") if answered else None
+        _, status = _performance_status(accuracy)
+        difficulty_rows = []
+        for difficulty in sorted(DIFFICULTY_LABELS):
+            difficulty_result = difficulty_performance.get(module, {}).get(difficulty, {})
+            difficulty_answered = int(difficulty_result.get("total") or 0)
+            difficulty_correct = int(difficulty_result.get("correct") or 0)
+            difficulty_accuracy = (
+                difficulty_result.get("pct")
+                if difficulty_answered
+                else None
+            )
+            _, difficulty_status = _performance_status(difficulty_accuracy)
+            difficulty_rows.append(
+                {
+                    "Difficulty": DIFFICULTY_LABELS[difficulty],
+                    "Level": difficulty,
+                    "Status": difficulty_status,
+                    "Accuracy": difficulty_accuracy,
+                    "Answered": difficulty_answered,
+                    "Missed": max(0, difficulty_answered - difficulty_correct),
+                    "Question Bank": bank_difficulty_counts.get(module, {}).get(difficulty, 0),
+                }
+            )
+        rows.append(
+            {
+                "Module": format_module_label(module),
+                "_module_key": module,
+                "Status": status,
+                "Accuracy": accuracy,
+                "Answered": answered,
+                "Missed": max(0, answered - correct),
+                "Question Bank": bank_counts.get(module, 0),
+                "Difficulty Rows": difficulty_rows,
+            }
+        )
+    return rows
+
+
+def _accuracy_text(value: float | None) -> str:
+    return "—" if value is None else f"{value:.1f}%"
+
+
+def _render_module_difficulty_pivot(module_rows: list[dict], *, course_id: int) -> None:
+    from src.dashboard_layout import tracked_expander
+    for row in module_rows:
+        label = f"{row['Module']} · {_accuracy_text(row['Accuracy'])} · {row['Answered']} answered · {row['Missed']} missed · {row['Question Bank']} in bank"
+        with tracked_expander(label, user_id, view_mode, f"module_{course_id}_{row['_module_key']}"):
+            st.dataframe(row['Difficulty Rows'], hide_index=True, use_container_width=True)
+
+
+COURSE_SORT_FIELDS = {
+    'Curriculum order': 'display_order', 'Course': 'sort_title', 'Status': 'sort_status',
+    'Average score': 'sort_average', 'Latest score': 'sort_latest', 'Best score': 'sort_best',
+    'Sessions': 'sort_sessions', 'Answered': 'sort_answered', 'Question bank': 'sort_questions',
+    'Trend': 'sort_trend', 'Materials progress': 'sort_materials',
+}
+COURSE_TABLE_LAYOUT = [3.5, 1.1, .8, .8, .7, .8, .7, .8]
+COURSE_TABLE_COLUMNS = [
+    ('Course', 'Course', 'Ascending'), ('Status', 'Status', 'Ascending'),
+    ('Average', 'Average score', 'Descending'), ('Latest', 'Latest score', 'Descending'),
+    ('Sessions', 'Sessions', 'Descending'), ('Answered', 'Answered', 'Descending'),
+    ('Bank', 'Question bank', 'Descending'), ('Trend', 'Trend', 'Descending'),
+]
+
+
+def _render_course_card_sort_controls(rows: list[dict]) -> list[dict]:
+    with st.popover("Advanced sort", use_container_width=True):
         cols = st.columns([2, 1, 2, 1, 2, 1])
         level_1 = cols[0].selectbox(
             "Sort by",
-            options=list(sort_fields.keys()),
+            options=list(COURSE_SORT_FIELDS.keys()),
             key="course_cards_sort_1",
         )
         direction_1 = cols[1].selectbox(
@@ -1849,7 +1963,7 @@ def _render_course_card_sort_controls(rows: list[dict]) -> list[dict]:
         )
         level_2 = cols[2].selectbox(
             "Then by",
-            options=["None", *sort_fields.keys()],
+            options=["None", *COURSE_SORT_FIELDS.keys()],
             key="course_cards_sort_2",
         )
         direction_2 = cols[3].selectbox(
@@ -1859,7 +1973,7 @@ def _render_course_card_sort_controls(rows: list[dict]) -> list[dict]:
         )
         level_3 = cols[4].selectbox(
             "Then by",
-            options=["None", *sort_fields.keys()],
+            options=["None", *COURSE_SORT_FIELDS.keys()],
             key="course_cards_sort_3",
         )
         direction_3 = cols[5].selectbox(
@@ -1878,10 +1992,51 @@ def _render_course_card_sort_controls(rows: list[dict]) -> list[dict]:
         if field_label == "None":
             continue
         sorted_rows.sort(
-            key=lambda row: row[sort_fields[field_label]],
+            key=lambda row: row[COURSE_SORT_FIELDS[field_label]],
             reverse=(direction == "Descending"),
         )
     return sorted_rows
+
+
+def _set_course_table_sort(sort_field: str, default_direction: str) -> None:
+    """Synchronize a quick-sort header click with the advanced sort widgets."""
+    current_field = st.session_state.get("course_cards_sort_1", "Curriculum order")
+    current_direction = st.session_state.get(
+        "course_cards_sort_1_direction",
+        "Ascending",
+    )
+    if current_field == sort_field:
+        direction = "Descending" if current_direction == "Ascending" else "Ascending"
+    else:
+        direction = default_direction
+    st.session_state["course_cards_sort_1"] = sort_field
+    st.session_state["course_cards_sort_1_direction"] = direction
+    st.session_state["course_cards_sort_2"] = "None"
+    st.session_state["course_cards_sort_3"] = "None"
+
+
+def _render_course_table_header() -> None:
+    """Render one-click sort controls aligned to the collapsed course rows."""
+    current_field = st.session_state.get("course_cards_sort_1", "Curriculum order")
+    current_direction = st.session_state.get(
+        "course_cards_sort_1_direction",
+        "Ascending",
+    )
+    with st.container(key="course_table_header"):
+        columns = st.columns(COURSE_TABLE_LAYOUT, gap="small", vertical_alignment="center")
+        for index, (label, sort_field, default_direction) in enumerate(COURSE_TABLE_COLUMNS):
+            is_active = current_field == sort_field
+            arrow = " ↑" if is_active and current_direction == "Ascending" else ""
+            arrow = " ↓" if is_active and current_direction == "Descending" else arrow
+            columns[index].button(
+                f"{label}{arrow}",
+                key=f"course_table_sort_{index}",
+                help=f"Sort by {label.lower()}",
+                type="tertiary",
+                use_container_width=True,
+                on_click=_set_course_table_sort,
+                args=(sort_field, default_direction),
+            )
 
 
 def _render_weakest_courses(
@@ -1987,6 +2142,17 @@ def _comparison_courses_for_active_course(active_course_id: int) -> tuple[str, l
     return "Active Course", [get_course(active_course_id)]
 
 
+def _render_course_table_cell(column, value, *, tone: str = "") -> None:
+    classes = "sf-course-table-cell"
+    if tone:
+        classes += f" sf-course-table-cell--{tone}"
+    with column:
+        st.markdown(
+            f'<div class="{classes}">{escape(str(value))}</div>',
+            unsafe_allow_html=True,
+        )
+
+
 def _render_curriculum_course_dashboards(
     user_id: int,
     courses: list[dict],
@@ -1995,15 +2161,23 @@ def _render_curriculum_course_dashboards(
     completed_from=None,
     completed_to=None,
 ) -> None:
-    st.markdown("### Course Dashboard Cards")
-    course_rows = _render_course_card_sort_controls(
-        _course_card_rows(
-            user_id,
-            courses,
-            completed_from=completed_from,
-            completed_to=completed_to,
+    heading_col, sort_col = st.columns([3, 1], vertical_alignment="bottom")
+    with heading_col:
+        st.markdown("### Course performance")
+        st.caption(
+            "Select a column heading to sort · Open a course for its modules "
+            "· On track is 75% or higher"
         )
+    base_course_rows = _course_card_rows(
+        user_id,
+        courses,
+        completed_from=completed_from,
+        completed_to=completed_to,
     )
+    with sort_col:
+        course_rows = _render_course_card_sort_controls(base_course_rows)
+
+    _render_course_table_header()
 
     for row in course_rows:
         course = row["course"]
@@ -2014,65 +2188,93 @@ def _render_curriculum_course_dashboards(
         material_completed = row["material_completed"]
         material_pct = row["material_pct"]
 
-        with st.container(border=True):
-            st.markdown(f"#### {course['title']}")
+        marker, status = _performance_status(stats["avg_percent"])
+        trend_value = stats["improvement_trend"]
+        trend = "—" if trend_value is None else f"{trend_value:+.1f}%"
+        trend_tone = ""
+        if trend_value is not None:
+            trend_tone = "positive" if trend_value > 0 else "negative" if trend_value < 0 else "neutral"
+        open_key = f"course_table_open_{course_id}"
+        from src.dashboard_layout import load_expansion, save_expanded
+        is_open = bool(load_expansion(user_id, view_mode).get(f'course_{course_id}', False))
 
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            selected_metric = None
-            metric_items = [
-                ("questions", "Questions in Bank", q_count, None),
-                ("sessions", "Sessions Completed", stats["total_attempts"], None),
-                ("answered", "Total Qs Answered", stats["total_questions"], None),
-                (
-                    "latest",
-                    "Latest Score",
-                    _format_percent(stats["latest_percent"]),
-                    _score_delta_label(stats),
-                ),
-                ("best", "Best Score", _format_percent(stats["best_percent"]), None),
-                ("average", "Avg Score", _format_percent(stats["avg_percent"]), None),
-            ]
-            key_prefix = f"course_card_{course_id}"
-            state_key = f"{key_prefix}_selected_kpi"
-            for col, (metric_key, label, value, delta) in zip(
-                [c1, c2, c3, c4, c5, c6],
-                metric_items,
-            ):
-                button_label = f"{label}\n\n{value}"
-                if delta:
-                    button_label = f"{button_label}\n{delta}"
-                with col:
-                    if st.button(
-                        button_label,
-                        key=f"{key_prefix}_kpi_{metric_key}",
-                        use_container_width=True,
-                    ):
-                        if st.session_state.get(state_key) == metric_key:
-                            st.session_state[state_key] = None
-                        else:
-                            st.session_state[state_key] = metric_key
-                    if st.session_state.get(state_key) == metric_key:
-                        selected_metric = metric_key
+        with st.container(border=True, key=f"course_table_row_{course_id}"):
+            table_columns = st.columns(
+                COURSE_TABLE_LAYOUT,
+                gap="small",
+                vertical_alignment="center",
+            )
+            table_columns[0].button(
+                f"{'▾' if is_open else '›'} {course['title']}",
+                key=f"course_table_toggle_{course_id}",
+                help=f"{'Collapse' if is_open else 'Open'} {course['title']}",
+                type="tertiary",
+                use_container_width=True,
+                on_click=save_expanded,
+                args=(user_id, view_mode, f'course_{course_id}', not is_open),
+            )
+            _render_course_table_cell(table_columns[1], f"{marker} {status}")
+            _render_course_table_cell(
+                table_columns[2],
+                _format_percent(stats["avg_percent"]),
+            )
+            _render_course_table_cell(
+                table_columns[3],
+                _format_percent(stats["latest_percent"]),
+            )
+            _render_course_table_cell(table_columns[4], stats["total_attempts"])
+            _render_course_table_cell(table_columns[5], stats["total_questions"])
+            _render_course_table_cell(table_columns[6], q_count)
+            _render_course_table_cell(table_columns[7], trend, tone=trend_tone)
+
+            if not is_open:
+                continue
+
+            summary_cols = st.columns(5)
+            summary_cols[0].metric("Average", _format_percent(stats["avg_percent"]))
+            summary_cols[1].metric(
+                "Latest",
+                _format_percent(stats["latest_percent"]),
+                _score_delta_label(stats),
+            )
+            summary_cols[2].metric("Best", _format_percent(stats["best_percent"]))
+            summary_cols[3].metric("Sessions", stats["total_attempts"])
+            summary_cols[4].metric("Question bank", q_count)
 
             if material_total > 0:
                 st.progress(
                     material_pct / 100,
-                    text=(
-                        f"Materials: {material_completed}/{material_total} completed "
-                        f"({material_pct}%)"
-                    ),
+                    text=f"Materials {material_completed}/{material_total} complete ({material_pct}%)",
                 )
-            _render_kpi_drilldown(
-                selected_metric,
+
+            module_rows = _module_overview_rows(
                 stats,
-                course["title"],
-                user_id,
-                key_prefix=key_prefix,
-                time_grain=time_grain,
-                course_id=course_id,
-                completed_from=completed_from,
-                completed_to=completed_to,
+                get_course_module_question_counts(course_id),
+                get_course_module_difficulty_question_counts(course_id),
             )
+            if not module_rows:
+                st.caption("No modules are available for this course yet.")
+                continue
+
+            _render_module_difficulty_pivot(module_rows, course_id=course_id)
+
+            selected_module = st.selectbox(
+                "Drill into a module",
+                options=[item["_module_key"] for item in module_rows],
+                index=None,
+                placeholder="Choose a module to inspect answered questions",
+                key=f"course_card_{course_id}_module_drilldown",
+                format_func=format_module_label,
+            )
+            if selected_module:
+                _render_answer_drilldown(
+                    user_id,
+                    title=f"{course['title']} / {selected_module}",
+                    course_id=course_id,
+                    section_type=selected_module,
+                    completed_from=completed_from,
+                    completed_to=completed_to,
+                )
 
 
 def _render_module_accuracy(stats: dict, key: str = "module_accuracy_table") -> dict | None:
@@ -2191,15 +2393,213 @@ def _render_type_and_difficulty(stats: dict) -> tuple[dict | None, dict | None]:
     return selected_type, selected_diff
 
 
+def _inject_compact_dashboard_css() -> None:
+    st.markdown(
+        """
+<style>
+[data-testid="stMain"] [data-testid="stMainBlockContainer"] { padding-top: 1rem !important; }
+[data-testid="stMain"] [data-testid="stMainBlockContainer"] > [data-testid="stVerticalBlock"] {
+    gap: 0.35rem !important;
+}
+.sf-page-header {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    gap: 1rem !important;
+    margin: 0 !important;
+    padding: 0.55rem 0.8rem !important;
+}
+.sf-page-eyebrow { display: none !important; }
+.sf-page-title { font-size: 1.5rem !important; }
+.sf-page-subtitle { margin: 0 !important; font-size: 0.82rem !important; white-space: nowrap; }
+[data-testid="stExpander"] details > summary { min-height: 2.45rem !important; }
+.st-key-course_table_header {
+    background: #f8fafc;
+    border: 1px solid var(--sf-line-soft);
+    border-radius: var(--sf-radius) var(--sf-radius) 0 0;
+    padding: .28rem .7rem .2rem !important;
+}
+.st-key-course_table_header [data-testid="stHorizontalBlock"] { gap: .5rem !important; }
+[class*="st-key-course_table_sort_"] button {
+    border: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    color: var(--sf-muted) !important;
+    font-size: .7rem !important;
+    font-weight: 800 !important;
+    letter-spacing: .025em !important;
+    min-height: 1.7rem !important;
+    padding: .15rem 0 !important;
+    text-transform: uppercase !important;
+}
+[class*="st-key-course_table_sort_"] button > div {
+    justify-content: flex-start !important;
+    text-align: left !important;
+}
+[class*="st-key-course_table_sort_"] button:hover { color: var(--sf-blue) !important; }
+[class*="st-key-course_table_row_"] {
+    border-color: var(--sf-line-soft) !important;
+    border-radius: .15rem !important;
+    margin-top: -.35rem !important;
+    padding: .22rem .7rem .35rem !important;
+}
+[class*="st-key-course_table_row_"]:hover { border-color: #b9c8dc !important; }
+[class*="st-key-course_table_toggle_"] button {
+    border: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    color: var(--sf-text) !important;
+    font-weight: 720 !important;
+    min-height: 2.25rem !important;
+    padding: .2rem 0 !important;
+}
+[class*="st-key-course_table_toggle_"] button > div {
+    justify-content: flex-start !important;
+    text-align: left !important;
+}
+.sf-course-table-cell {
+    align-items: center;
+    color: var(--sf-text);
+    display: flex;
+    font-size: .8rem;
+    min-height: 2.25rem;
+    white-space: nowrap;
+}
+.sf-course-table-cell--positive { color: #16794c; font-weight: 750; }
+.sf-course-table-cell--negative { color: #b42318; font-weight: 750; }
+.sf-course-table-cell--neutral { color: var(--sf-muted); font-weight: 700; }
+.sf-module-pivot {
+    border: 1px solid var(--sf-line-soft);
+    border-radius: var(--sf-radius);
+    background: rgba(255,255,255,.78);
+    overflow-x: auto;
+}
+.sf-module-grid,
+.sf-module-row > summary,
+.sf-difficulty-row {
+    display: grid;
+    grid-template-columns: minmax(22rem, 3.2fr) minmax(7rem, 1fr) minmax(10rem, 1.25fr) repeat(3, minmax(5rem, .72fr));
+    align-items: center;
+    gap: .65rem;
+    min-width: 850px;
+}
+.sf-module-grid-header,
+.sf-difficulty-header {
+    color: var(--sf-muted);
+    font-size: .72rem;
+    font-weight: 800;
+    letter-spacing: .03em;
+    text-transform: uppercase;
+}
+.sf-module-grid-header { padding: .55rem .7rem; background: #f8fafc; }
+.sf-module-row { border-top: 1px solid var(--sf-line-soft); }
+.sf-module-row > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: .55rem .7rem;
+    transition: background .14s ease;
+}
+.sf-module-row > summary::-webkit-details-marker { display: none; }
+.sf-module-row > summary:hover { background: #f8fafc; }
+.sf-module-row[open] > summary { background: #eff6ff; }
+.sf-module-name { font-weight: 750; }
+.sf-module-name::before { content: "›"; display: inline-block; margin-right: .55rem; font-size: 1.15rem; }
+.sf-module-row[open] .sf-module-name::before { transform: rotate(90deg); }
+.sf-difficulty-panel { padding: .35rem .7rem .65rem 2rem; background: #fbfdff; }
+.sf-difficulty-row { padding: .45rem .55rem; border-top: 1px solid #edf2f7; }
+.sf-difficulty-header { border-top: 0; }
+.sf-difficulty-name { font-weight: 700; }
+.sf-score-cell { display: flex; align-items: center; gap: .55rem; }
+.sf-score-track { width: 6.5rem; height: .42rem; border-radius: 999px; background: #e6edf7; overflow: hidden; }
+.sf-score-track > span { display: block; height: 100%; background: var(--sf-blue); border-radius: inherit; }
+.sf-score-cell strong { min-width: 3.3rem; font-size: .78rem; }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+
+def _render_arranged_dashboard(uid, scope, ids, curriculum_id, stats, context, sections, mode):
+    from datetime import datetime
+    from src.practice_calendar import ZONE, load_days, totals, duration, percent
+    from src.dashboard_report import render_report_controls
+    from src.dashboard_layout import create_slots
+    from src.study_progress import render_course_progress
+    today = datetime.now(ZONE).date()
+    rows = load_days(uid, today)
+    metric = 'rolling' if st.session_state.get('practice_calendar_metric') == 'Trailing 7-day accuracy' else 'accuracy'
+    with report_tools:
+        render_report_controls(uid, scope, ids, context, sections, metric, today, rows, mode=mode, curriculum_id=curriculum_id)
+    slots = create_slots(uid, mode, sections)
+    if 'Current mock review' in slots:
+        with slots['Current mock review']:
+            from src.mock_review_analytics import render_current_review
+            render_current_review(uid, mode)
+    if 'Days till exam' in slots:
+        with slots['Days till exam']:
+            days, note = exam_countdown(get_exam_plan(uid))
+            st.metric('Days till exam', days)
+            st.caption(note)
+            render_exam_settings(uid, expanded=False)
+    if 'Next mock exam' in slots:
+        with slots['Next mock exam']:
+            mock = get_next_mock_summary(uid)
+            if mock:
+                st.markdown(f"**Next mock exam: {mock['label']}**")
+                cols = st.columns(3)
+                cols[0].metric('Date', mock['scheduled_date'].strftime('%B %d, %Y'))
+                cols[1].metric('Days remaining', mock['days_remaining'])
+                cols[2].metric('Review items remaining', mock['review_items_remaining'], delta=mock['review_progress_label'], delta_color='off')
+            else:
+                st.info('No upcoming mock exam scheduled.')
+    if 'Practice summary' in slots:
+        with slots['Practice summary']:
+            st.markdown('### All practice · Last 30 days')
+            count, seconds, accuracy = totals(rows)
+            cols = st.columns(3)
+            cols[0].metric('Total questions', f'{count:,}')
+            cols[1].metric('Active time', duration(seconds))
+            cols[2].metric('Practice accuracy', percent(accuracy))
+    if 'Practice calendar' in slots:
+        with slots['Practice calendar']:
+            render_practice_calendar(uid, scope, ids, context, sections, rows=rows, show_summary=False)
+    if 'Dashboard summary' in slots:
+        with slots['Dashboard summary']:
+            total, complete, pct = _materials_summary(uid, ids)
+            selected = _render_kpis(stats, sum(get_course_question_count(cid) for cid in ids), total, complete, pct,
+                                    key_prefix=mode.lower()+'_summary', show_materials=('Materials progress' in sections))
+            _render_kpi_drilldown(selected, stats, scope, uid, key_prefix=mode.lower()+'_summary',
+                time_grain=context['grain'], course_ids=ids, completed_from=context['completed_from'], completed_to=context['completed_to'])
+    if 'Course dashboard cards' in slots:
+        with slots['Course dashboard cards']:
+            _render_curriculum_course_dashboards(uid, [get_course(cid) for cid in ids if get_course(cid)],
+                time_grain=context['grain'], completed_from=context['completed_from'], completed_to=context['completed_to'])
+    if 'Course & module progress' in slots:
+        with slots['Course & module progress']:
+            render_course_progress(uid, ids, dashboard_mode=mode)
+    if 'Curriculum reference materials' in slots and curriculum_id is not None:
+        with slots['Curriculum reference materials']:
+            from src.curriculum_materials import render_curriculum_materials
+            render_curriculum_materials(uid, curriculum_id, dashboard_mode=mode)
+    return slots
+
 user_id = require_login()
 username = st.session_state.get("username", "")
 sidebar_nav(username)
+_inject_compact_dashboard_css()
+page_header("📊 Dashboard", "Arrange your study dashboard and preview your report")
+header_tools = st.container()
+report_tools = st.container()
+from src.exam_planning import get_exam_plan, exam_countdown, render_exam_settings
+sync_mock_reviews(user_id)
 course_id = course_selector(user_id)
 
 if course_id is None:
     page_header("📊 Dashboard", "Your performance at a glance")
     st.info("Choose an active course from the sidebar to start tracking your progress.")
     st.stop()
+
 
 view_mode = st.radio(
     "Dashboard scope",
@@ -2213,8 +2613,14 @@ view_mode = st.radio(
 if view_mode == "Course":
     course = get_course(course_id)
     title = course["title"] if course else "Unknown Course"
-    report_sections = _dashboard_header("📊 Dashboard", f"Course: {title}", view_mode)
-    time_context = _dashboard_time_controls("course_dashboard")
+    with header_tools:
+        report_sections, time_context = _dashboard_header(
+            "📊 Dashboard",
+            f"Course: {title}",
+            view_mode,
+            "course_dashboard",
+        )
+
 
     stats = get_dashboard_stats(
         user_id,
@@ -2225,198 +2631,170 @@ if view_mode == "Course":
     q_count = get_course_question_count(course_id)
     material_total, material_completed, material_pct = _materials_summary(user_id, [course_id])
 
-    selected_kpi = _render_kpis(
-        stats,
-        q_count,
-        material_total,
-        material_completed,
-        material_pct,
-        key_prefix="course_summary",
-        show_materials=("Materials progress" in report_sections),
-    )
-    st.divider()
+    slots = _render_arranged_dashboard(user_id, title, [course_id], None, stats, time_context, report_sections, view_mode)
 
-    _render_kpi_drilldown(
-        selected_kpi,
-        stats,
-        title,
-        user_id,
-        key_prefix="course_summary",
-        time_grain=time_context["grain"],
-        course_id=course_id,
-        completed_from=time_context["completed_from"],
-        completed_to=time_context["completed_to"],
-    )
-
-    supplemental_sections = {"Review activity", "Question reports"}
-    if stats["total_attempts"] == 0 and not (supplemental_sections & report_sections):
-        st.info(
-            f"No sessions completed for **{title}** yet. "
-            "Head to **Practice Mode** or **Timed Exam** to get started."
-        )
-        st.stop()
-    elif stats["total_attempts"] == 0:
-        st.info(
-            f"No completed practice sessions for **{title}** in this time frame. "
-            "Showing any review activity below."
-        )
-
-    if not report_sections:
-        st.info("Use **Report Builder** above to add charts and drilldowns.")
-
-    if "Score trend analysis" in report_sections and "Performance overview" not in report_sections:
-        selected_session = _render_score_trend(stats, key="course_standalone_score_trend")
-        if selected_session:
-            _render_answer_drilldown(
-                user_id,
-                title=f"Session - {selected_session['Date']}",
-                attempt_id=int(selected_session["Attempt ID"]),
-                course_id=course_id,
-                completed_from=time_context["completed_from"],
-                completed_to=time_context["completed_to"],
-            )
-
-    if "Daily activity" in report_sections:
-        st.divider()
-        _render_daily_activity(
-            user_id,
-            title,
-            key_prefix="course_daily_activity",
-            time_grain=time_context["grain"],
-            course_id=course_id,
-            completed_from=time_context["completed_from"],
-            completed_to=time_context["completed_to"],
-        )
-
-    if "Review activity" in report_sections:
-        st.divider()
-        _render_review_activity(
-            user_id,
-            title,
-            key_prefix="course_review_activity",
-            time_grain=time_context["grain"],
-            course_id=course_id,
-            completed_from=time_context["completed_from"],
-            completed_to=time_context["completed_to"],
-        )
-
-    if "Module attempt report" in report_sections:
-        st.divider()
-        selected_module_attempt = _render_module_attempt_report(
-            user_id,
-            key_prefix="course_module_attempt_report",
-            course_id=course_id,
-            completed_from=time_context["completed_from"],
-            completed_to=time_context["completed_to"],
-        )
-        if selected_module_attempt:
-            _render_answer_drilldown(
-                user_id,
-                title=(
-                    f"{selected_module_attempt['Module']} / "
-                    f"Attempt {int(selected_module_attempt['Attempt #'])}"
-                ),
-                attempt_id=int(selected_module_attempt["Attempt ID"]),
-                course_id=course_id,
-                section_type=selected_module_attempt["Module"],
-                completed_from=time_context["completed_from"],
-                completed_to=time_context["completed_to"],
-            )
-
-    if "Question reports" in report_sections:
-        st.divider()
-        _render_question_reports(
-            title,
-            key_prefix="course_question_reports",
-            time_grain=time_context["grain"],
-            course_id=course_id,
-        )
-
-    if "Weakest courses" in report_sections:
-        st.divider()
-        comparison_title, comparison_courses = _comparison_courses_for_active_course(course_id)
-        st.caption(f"Comparing courses in: {comparison_title}")
-        selected_weak_course = _render_weakest_courses(
-            user_id,
-            comparison_courses,
-            completed_from=time_context["completed_from"],
-            completed_to=time_context["completed_to"],
-        )
-        if selected_weak_course:
-            selected_course_id = int(selected_weak_course["Course ID"])
-            selected_course_stats = get_dashboard_stats(
-                user_id,
-                course_id=selected_course_id,
-                completed_from=time_context["completed_from"],
-                completed_to=time_context["completed_to"],
-            )
-            selected_session = _render_score_trend(
-                selected_course_stats,
-                key=f"course_scope_weakest_course_{selected_course_id}_trend",
-                heading=f"{selected_weak_course['Course']} Score Trend",
-                table_heading=f"{selected_weak_course['Course']} Sessions",
-            )
+    if 'Score trend analysis' in slots and ("Score trend analysis" in report_sections and "Performance overview" not in report_sections):
+        with slots['Score trend analysis']:
+            selected_session = _render_score_trend(stats, key="course_standalone_score_trend")
             if selected_session:
                 _render_answer_drilldown(
                     user_id,
-                    title=f"{selected_weak_course['Course']} / Session - {selected_session['Date']}",
+                    title=f"Session - {selected_session['Date']}",
                     attempt_id=int(selected_session["Attempt ID"]),
-                    course_id=selected_course_id,
+                    course_id=course_id,
                     completed_from=time_context["completed_from"],
                     completed_to=time_context["completed_to"],
                 )
 
-    if "Performance overview" in report_sections:
-        selected_session = _render_trend_and_weak_list(
-            stats,
-            weak_key="weak_modules",
-            label_key="module",
-            heading="Module Weak Spots",
-        )
-        if selected_session:
-            _render_answer_drilldown(
+    if 'Daily activity' in slots and ("Daily activity" in report_sections):
+        with slots['Daily activity']:
+            st.divider()
+            _render_daily_activity(
                 user_id,
-                title=f"Session - {selected_session['Date']}",
-                attempt_id=int(selected_session["Attempt ID"]),
+                title,
+                key_prefix="course_daily_activity",
+                time_grain=time_context["grain"],
                 course_id=course_id,
                 completed_from=time_context["completed_from"],
                 completed_to=time_context["completed_to"],
             )
 
-    if "Accuracy by module" in report_sections:
-        st.divider()
-        selected_module = _render_module_accuracy(stats, key="course_module_accuracy_table")
-        if selected_module:
-            _render_answer_drilldown(
+    if 'Review activity' in slots and ("Review activity" in report_sections):
+        with slots['Review activity']:
+            st.divider()
+            _render_review_activity(
                 user_id,
-                title=f"Module - {selected_module['Module']}",
+                title,
+                key_prefix="course_review_activity",
+                time_grain=time_context["grain"],
                 course_id=course_id,
-                section_type=selected_module["Module"],
                 completed_from=time_context["completed_from"],
                 completed_to=time_context["completed_to"],
             )
 
-    if "Question type and difficulty" in report_sections:
-        st.divider()
-        selected_type, selected_diff = _render_type_and_difficulty(stats)
-        if selected_type:
-            _render_answer_drilldown(
+    if 'Module attempt report' in slots and ("Module attempt report" in report_sections):
+        with slots['Module attempt report']:
+            st.divider()
+            selected_module_attempt = _render_module_attempt_report(
                 user_id,
-                title=f"Question Type - {selected_type['Question Type']}",
+                key_prefix="course_module_attempt_report",
                 course_id=course_id,
-                question_type=selected_type["Question Type"],
                 completed_from=time_context["completed_from"],
                 completed_to=time_context["completed_to"],
             )
-        if selected_diff:
-            _render_answer_drilldown(
-                user_id,
-                title=f"Difficulty - {selected_diff['Difficulty Label']}",
+            if selected_module_attempt:
+                _render_answer_drilldown(
+                    user_id,
+                    title=(
+                        f"{selected_module_attempt['Module']} / "
+                        f"Attempt {int(selected_module_attempt['Attempt #'])}"
+                    ),
+                    attempt_id=int(selected_module_attempt["Attempt ID"]),
+                    course_id=course_id,
+                    section_type=selected_module_attempt["Module"],
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
+
+    if 'Question reports' in slots and ("Question reports" in report_sections):
+        with slots['Question reports']:
+            st.divider()
+            _render_question_reports(
+                title,
+                key_prefix="course_question_reports",
+                time_grain=time_context["grain"],
                 course_id=course_id,
-                difficulty=int(selected_diff["_order"]),
+            )
+
+    if 'Weakest courses' in slots and ("Weakest courses" in report_sections):
+        with slots['Weakest courses']:
+            st.divider()
+            comparison_title, comparison_courses = _comparison_courses_for_active_course(course_id)
+            st.caption(f"Comparing courses in: {comparison_title}")
+            selected_weak_course = _render_weakest_courses(
+                user_id,
+                comparison_courses,
                 completed_from=time_context["completed_from"],
                 completed_to=time_context["completed_to"],
             )
+            if selected_weak_course:
+                selected_course_id = int(selected_weak_course["Course ID"])
+                selected_course_stats = get_dashboard_stats(
+                    user_id,
+                    course_id=selected_course_id,
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
+                selected_session = _render_score_trend(
+                    selected_course_stats,
+                    key=f"course_scope_weakest_course_{selected_course_id}_trend",
+                    heading=f"{selected_weak_course['Course']} Score Trend",
+                    table_heading=f"{selected_weak_course['Course']} Sessions",
+                )
+                if selected_session:
+                    _render_answer_drilldown(
+                        user_id,
+                        title=f"{selected_weak_course['Course']} / Session - {selected_session['Date']}",
+                        attempt_id=int(selected_session["Attempt ID"]),
+                        course_id=selected_course_id,
+                        completed_from=time_context["completed_from"],
+                        completed_to=time_context["completed_to"],
+                    )
+
+    if 'Performance overview' in slots and ("Performance overview" in report_sections):
+        with slots['Performance overview']:
+            selected_session = _render_trend_and_weak_list(
+                stats,
+                weak_key="weak_modules",
+                label_key="module",
+                heading="Module Weak Spots",
+            )
+            if selected_session:
+                _render_answer_drilldown(
+                    user_id,
+                    title=f"Session - {selected_session['Date']}",
+                    attempt_id=int(selected_session["Attempt ID"]),
+                    course_id=course_id,
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
+
+    if 'Accuracy by module' in slots and ("Accuracy by module" in report_sections):
+        with slots['Accuracy by module']:
+            st.divider()
+            selected_module = _render_module_accuracy(stats, key="course_module_accuracy_table")
+            if selected_module:
+                _render_answer_drilldown(
+                    user_id,
+                    title=f"Module - {selected_module['Module']}",
+                    course_id=course_id,
+                    section_type=selected_module["Module"],
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
+
+    if 'Question type and difficulty' in slots and ("Question type and difficulty" in report_sections):
+        with slots['Question type and difficulty']:
+            st.divider()
+            selected_type, selected_diff = _render_type_and_difficulty(stats)
+            if selected_type:
+                _render_answer_drilldown(
+                    user_id,
+                    title=f"Question Type - {selected_type['Question Type']}",
+                    course_id=course_id,
+                    question_type=selected_type["Question Type"],
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
+            if selected_diff:
+                _render_answer_drilldown(
+                    user_id,
+                    title=f"Difficulty - {selected_diff['Difficulty Label']}",
+                    course_id=course_id,
+                    difficulty=int(selected_diff["_order"]),
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
 
 else:
     curriculums = get_all_curriculums()
@@ -2443,6 +2821,7 @@ else:
             curriculum["title"] for curriculum in curriculums
             if curriculum["id"] == cid
         ),
+        label_visibility="collapsed",
     )
     curriculum_title = next(
         curriculum["title"] for curriculum in curriculums
@@ -2451,12 +2830,14 @@ else:
     courses = curriculum_courses[curriculum_id]
     course_ids = [course["id"] for course in courses]
 
-    report_sections = _dashboard_header(
-        "📊 Dashboard",
-        f"Curriculum: {curriculum_title}",
-        view_mode,
-    )
-    time_context = _dashboard_time_controls("curriculum_dashboard")
+    with header_tools:
+        report_sections, time_context = _dashboard_header(
+            "📊 Dashboard",
+            f"Curriculum: {curriculum_title}",
+            view_mode,
+            "curriculum_dashboard",
+        )
+
 
     if not course_ids:
         st.info("This curriculum does not have any courses yet.")
@@ -2471,264 +2852,215 @@ else:
     q_count = sum(get_course_question_count(cid) for cid in course_ids)
     material_total, material_completed, material_pct = _materials_summary(user_id, course_ids)
 
-    selected_kpi = None
-    if "Course dashboard cards" not in report_sections:
-        selected_kpi = _render_kpis(
-            stats,
-            q_count,
-            material_total,
-            material_completed,
-            material_pct,
-            key_prefix="curriculum_summary",
-            show_materials=("Materials progress" in report_sections),
-        )
-        st.divider()
+    slots = _render_arranged_dashboard(user_id, curriculum_title, course_ids, curriculum_id, stats, time_context, report_sections, view_mode)
 
-    if not report_sections:
-        st.info("Use **Report Builder** above to add charts and drilldowns.")
+    if 'Score trend analysis' in slots and ("Score trend analysis" in report_sections and "Performance overview" not in report_sections):
+        with slots['Score trend analysis']:
+            selected_session = _render_score_trend(stats, key="curriculum_standalone_score_trend")
+            if selected_session:
+                _render_answer_drilldown(
+                    user_id,
+                    title=f"Curriculum Session - {selected_session['Date']}",
+                    attempt_id=int(selected_session["Attempt ID"]),
+                    course_ids=course_ids,
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
 
-    if "Course dashboard cards" in report_sections:
-        _render_curriculum_course_dashboards(
-            user_id,
-            courses,
-            time_grain=time_context["grain"],
-            completed_from=time_context["completed_from"],
-            completed_to=time_context["completed_to"],
-        )
-        st.markdown("### Curriculum Total")
-        selected_kpi = _render_kpis(
-            stats,
-            q_count,
-            material_total,
-            material_completed,
-            material_pct,
-            key_prefix="curriculum_summary",
-            show_materials=("Materials progress" in report_sections),
-        )
-        st.divider()
-
-    _render_kpi_drilldown(
-        selected_kpi,
-        stats,
-        curriculum_title,
-        user_id,
-        key_prefix="curriculum_summary",
-        time_grain=time_context["grain"],
-        course_ids=course_ids,
-        completed_from=time_context["completed_from"],
-        completed_to=time_context["completed_to"],
-    )
-
-    supplemental_sections = {"Review activity", "Question reports"}
-    if stats["total_attempts"] == 0 and not (supplemental_sections & report_sections):
-        st.info(
-            f"No sessions completed for **{curriculum_title}** yet. "
-            "Use Practice Mode or Curriculum Exam to generate performance data."
-        )
-        st.stop()
-    elif stats["total_attempts"] == 0:
-        st.info(
-            f"No completed practice sessions for **{curriculum_title}** in this time frame. "
-            "Showing any review activity below."
-        )
-
-    if "Score trend analysis" in report_sections and "Performance overview" not in report_sections:
-        selected_session = _render_score_trend(stats, key="curriculum_standalone_score_trend")
-        if selected_session:
-            _render_answer_drilldown(
+    if 'Daily activity' in slots and ("Daily activity" in report_sections):
+        with slots['Daily activity']:
+            st.divider()
+            _render_daily_activity(
                 user_id,
-                title=f"Curriculum Session - {selected_session['Date']}",
-                attempt_id=int(selected_session["Attempt ID"]),
+                curriculum_title,
+                key_prefix="curriculum_daily_activity",
+                time_grain=time_context["grain"],
                 course_ids=course_ids,
                 completed_from=time_context["completed_from"],
                 completed_to=time_context["completed_to"],
             )
 
-    if "Daily activity" in report_sections:
-        st.divider()
-        _render_daily_activity(
-            user_id,
-            curriculum_title,
-            key_prefix="curriculum_daily_activity",
-            time_grain=time_context["grain"],
-            course_ids=course_ids,
-            completed_from=time_context["completed_from"],
-            completed_to=time_context["completed_to"],
-        )
-
-    if "Review activity" in report_sections:
-        st.divider()
-        _render_review_activity(
-            user_id,
-            curriculum_title,
-            key_prefix="curriculum_review_activity",
-            time_grain=time_context["grain"],
-            course_ids=course_ids,
-            completed_from=time_context["completed_from"],
-            completed_to=time_context["completed_to"],
-        )
-
-    if "Module attempt report" in report_sections:
-        st.divider()
-        selected_module_attempt = _render_module_attempt_report(
-            user_id,
-            key_prefix="curriculum_module_attempt_report",
-            course_ids=course_ids,
-            completed_from=time_context["completed_from"],
-            completed_to=time_context["completed_to"],
-        )
-        if selected_module_attempt:
-            _render_answer_drilldown(
+    if 'Review activity' in slots and ("Review activity" in report_sections):
+        with slots['Review activity']:
+            st.divider()
+            _render_review_activity(
                 user_id,
-                title=(
-                    f"{selected_module_attempt['Course']} / "
-                    f"{selected_module_attempt['Module']} / "
-                    f"Attempt {int(selected_module_attempt['Attempt #'])}"
-                ),
-                attempt_id=int(selected_module_attempt["Attempt ID"]),
+                curriculum_title,
+                key_prefix="curriculum_review_activity",
+                time_grain=time_context["grain"],
                 course_ids=course_ids,
-                section_type=selected_module_attempt["Module"],
                 completed_from=time_context["completed_from"],
                 completed_to=time_context["completed_to"],
             )
 
-    if "Question reports" in report_sections:
-        st.divider()
-        _render_question_reports(
-            curriculum_title,
-            key_prefix="curriculum_question_reports",
-            time_grain=time_context["grain"],
-            course_ids=course_ids,
-        )
-
-    if "Weakest courses" in report_sections:
-        st.divider()
-        selected_weak_course = _render_weakest_courses(
-            user_id,
-            courses,
-            completed_from=time_context["completed_from"],
-            completed_to=time_context["completed_to"],
-        )
-        if selected_weak_course:
-            selected_course_id = int(selected_weak_course["Course ID"])
-            selected_course_stats = get_dashboard_stats(
+    if 'Module attempt report' in slots and ("Module attempt report" in report_sections):
+        with slots['Module attempt report']:
+            st.divider()
+            selected_module_attempt = _render_module_attempt_report(
                 user_id,
-                course_id=selected_course_id,
+                key_prefix="curriculum_module_attempt_report",
+                course_ids=course_ids,
                 completed_from=time_context["completed_from"],
                 completed_to=time_context["completed_to"],
             )
-            selected_session = _render_score_trend(
-                selected_course_stats,
-                key=f"weakest_course_{selected_course_id}_trend",
-                heading=f"{selected_weak_course['Course']} Score Trend",
-                table_heading=f"{selected_weak_course['Course']} Sessions",
+            if selected_module_attempt:
+                _render_answer_drilldown(
+                    user_id,
+                    title=(
+                        f"{selected_module_attempt['Course']} / "
+                        f"{selected_module_attempt['Module']} / "
+                        f"Attempt {int(selected_module_attempt['Attempt #'])}"
+                    ),
+                    attempt_id=int(selected_module_attempt["Attempt ID"]),
+                    course_ids=course_ids,
+                    section_type=selected_module_attempt["Module"],
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
+
+    if 'Question reports' in slots and ("Question reports" in report_sections):
+        with slots['Question reports']:
+            st.divider()
+            _render_question_reports(
+                curriculum_title,
+                key_prefix="curriculum_question_reports",
+                time_grain=time_context["grain"],
+                course_ids=course_ids,
+            )
+
+    if 'Weakest courses' in slots and ("Weakest courses" in report_sections):
+        with slots['Weakest courses']:
+            st.divider()
+            selected_weak_course = _render_weakest_courses(
+                user_id,
+                courses,
+                completed_from=time_context["completed_from"],
+                completed_to=time_context["completed_to"],
+            )
+            if selected_weak_course:
+                selected_course_id = int(selected_weak_course["Course ID"])
+                selected_course_stats = get_dashboard_stats(
+                    user_id,
+                    course_id=selected_course_id,
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
+                selected_session = _render_score_trend(
+                    selected_course_stats,
+                    key=f"weakest_course_{selected_course_id}_trend",
+                    heading=f"{selected_weak_course['Course']} Score Trend",
+                    table_heading=f"{selected_weak_course['Course']} Sessions",
+                )
+                if selected_session:
+                    _render_answer_drilldown(
+                        user_id,
+                        title=f"{selected_weak_course['Course']} / Session - {selected_session['Date']}",
+                        attempt_id=int(selected_session["Attempt ID"]),
+                        course_id=selected_course_id,
+                        completed_from=time_context["completed_from"],
+                        completed_to=time_context["completed_to"],
+                    )
+
+    if 'Performance overview' in slots and ("Performance overview" in report_sections):
+        with slots['Performance overview']:
+            selected_session = _render_trend_and_weak_list(
+                stats,
+                weak_key="weak_courses",
+                label_key="course",
+                heading="Course Weak Spots",
             )
             if selected_session:
                 _render_answer_drilldown(
                     user_id,
-                    title=f"{selected_weak_course['Course']} / Session - {selected_session['Date']}",
+                    title=f"Curriculum Session - {selected_session['Date']}",
                     attempt_id=int(selected_session["Attempt ID"]),
-                    course_id=selected_course_id,
+                    course_ids=course_ids,
                     completed_from=time_context["completed_from"],
                     completed_to=time_context["completed_to"],
                 )
 
-    if "Performance overview" in report_sections:
-        selected_session = _render_trend_and_weak_list(
-            stats,
-            weak_key="weak_courses",
-            label_key="course",
-            heading="Course Weak Spots",
-        )
-        if selected_session:
+    if 'Accuracy by course' in slots and ("Accuracy by course" in report_sections):
+        with slots['Accuracy by course']:
+            st.divider()
+            selected_course = _render_course_accuracy(stats)
+            if selected_course:
+                selected_course_id = int(selected_course["Course ID"])
+                selected_course_stats = get_dashboard_stats(
+                    user_id,
+                    course_id=selected_course_id,
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
+                st.markdown(f"### Course Drilldown: {selected_course['Course']}")
+                selected_course_module = _render_module_accuracy(
+                    selected_course_stats,
+                    key=f"curriculum_course_{selected_course_id}_module_accuracy_table",
+                )
+                if selected_course_module:
+                    _render_answer_drilldown(
+                        user_id,
+                        title=f"{selected_course['Course']} / {selected_course_module['Module']}",
+                        course_id=selected_course_id,
+                        section_type=selected_course_module["Module"],
+                        completed_from=time_context["completed_from"],
+                        completed_to=time_context["completed_to"],
+                    )
+                else:
+                    _render_answer_drilldown(
+                        user_id,
+                        title=f"Course - {selected_course['Course']}",
+                        course_id=selected_course_id,
+                        completed_from=time_context["completed_from"],
+                        completed_to=time_context["completed_to"],
+                    )
+    
+            drill_course_id = st.selectbox(
+                "Drill into course",
+                options=course_ids,
+                format_func=lambda cid: next(course["title"] for course in courses if course["id"] == cid),
+            )
+            selected_course_title = next(course["title"] for course in courses if course["id"] == drill_course_id)
             _render_answer_drilldown(
                 user_id,
-                title=f"Curriculum Session - {selected_session['Date']}",
-                attempt_id=int(selected_session["Attempt ID"]),
-                course_ids=course_ids,
+                title=f"Course - {selected_course_title}",
+                course_id=drill_course_id,
                 completed_from=time_context["completed_from"],
                 completed_to=time_context["completed_to"],
             )
 
-    if "Accuracy by course" in report_sections:
-        st.divider()
-        selected_course = _render_course_accuracy(stats)
-        if selected_course:
-            selected_course_id = int(selected_course["Course ID"])
-            selected_course_stats = get_dashboard_stats(
-                user_id,
-                course_id=selected_course_id,
-                completed_from=time_context["completed_from"],
-                completed_to=time_context["completed_to"],
-            )
-            st.markdown(f"### Course Drilldown: {selected_course['Course']}")
-            selected_course_module = _render_module_accuracy(
-                selected_course_stats,
-                key=f"curriculum_course_{selected_course_id}_module_accuracy_table",
-            )
-            if selected_course_module:
+    if 'Accuracy by module' in slots and ("Accuracy by module" in report_sections):
+        with slots['Accuracy by module']:
+            st.divider()
+            selected_module = _render_module_accuracy(stats, key="curriculum_module_accuracy_table")
+            if selected_module:
                 _render_answer_drilldown(
                     user_id,
-                    title=f"{selected_course['Course']} / {selected_course_module['Module']}",
-                    course_id=selected_course_id,
-                    section_type=selected_course_module["Module"],
+                    title=f"Curriculum Module - {selected_module['Module']}",
+                    course_ids=course_ids,
+                    section_type=selected_module["Module"],
                     completed_from=time_context["completed_from"],
                     completed_to=time_context["completed_to"],
                 )
-            else:
+
+    if 'Question type and difficulty' in slots and ("Question type and difficulty" in report_sections):
+        with slots['Question type and difficulty']:
+            st.divider()
+            selected_type, selected_diff = _render_type_and_difficulty(stats)
+            if selected_type:
                 _render_answer_drilldown(
                     user_id,
-                    title=f"Course - {selected_course['Course']}",
-                    course_id=selected_course_id,
+                    title=f"Curriculum Question Type - {selected_type['Question Type']}",
+                    course_ids=course_ids,
+                    question_type=selected_type["Question Type"],
                     completed_from=time_context["completed_from"],
                     completed_to=time_context["completed_to"],
                 )
-
-        drill_course_id = st.selectbox(
-            "Drill into course",
-            options=course_ids,
-            format_func=lambda cid: next(course["title"] for course in courses if course["id"] == cid),
-        )
-        selected_course_title = next(course["title"] for course in courses if course["id"] == drill_course_id)
-        _render_answer_drilldown(
-            user_id,
-            title=f"Course - {selected_course_title}",
-            course_id=drill_course_id,
-            completed_from=time_context["completed_from"],
-            completed_to=time_context["completed_to"],
-        )
-
-    if "Accuracy by module" in report_sections:
-        st.divider()
-        selected_module = _render_module_accuracy(stats, key="curriculum_module_accuracy_table")
-        if selected_module:
-            _render_answer_drilldown(
-                user_id,
-                title=f"Curriculum Module - {selected_module['Module']}",
-                course_ids=course_ids,
-                section_type=selected_module["Module"],
-                completed_from=time_context["completed_from"],
-                completed_to=time_context["completed_to"],
-            )
-
-    if "Question type and difficulty" in report_sections:
-        st.divider()
-        selected_type, selected_diff = _render_type_and_difficulty(stats)
-        if selected_type:
-            _render_answer_drilldown(
-                user_id,
-                title=f"Curriculum Question Type - {selected_type['Question Type']}",
-                course_ids=course_ids,
-                question_type=selected_type["Question Type"],
-                completed_from=time_context["completed_from"],
-                completed_to=time_context["completed_to"],
-            )
-        if selected_diff:
-            _render_answer_drilldown(
-                user_id,
-                title=f"Curriculum Difficulty - {selected_diff['Difficulty Label']}",
-                course_ids=course_ids,
-                difficulty=int(selected_diff["_order"]),
-                completed_from=time_context["completed_from"],
-                completed_to=time_context["completed_to"],
-            )
+            if selected_diff:
+                _render_answer_drilldown(
+                    user_id,
+                    title=f"Curriculum Difficulty - {selected_diff['Difficulty Label']}",
+                    course_ids=course_ids,
+                    difficulty=int(selected_diff["_order"]),
+                    completed_from=time_context["completed_from"],
+                    completed_to=time_context["completed_to"],
+                )
