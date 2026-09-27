@@ -15,3 +15,4 @@ google-auth-oauthlib>=1.2
 keyring>=25.0
 
 faster-whisper>=1.2.1,<2
+tokenizers>=0.23.2,<1
