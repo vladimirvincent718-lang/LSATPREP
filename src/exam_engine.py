@@ -6,21 +6,35 @@ All state keys are namespaced under "exam_*" to avoid collisions.
 from __future__ import annotations
 import time
 import random
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
 from src.database import (
     create_attempt, save_answer, complete_attempt,
     add_to_journal, get_all_questions, get_setting,
-    save_exam_draft, get_latest_exam_draft, delete_exam_draft,
+    save_exam_draft, get_latest_exam_draft, get_exam_draft, get_exam_drafts,
+    delete_exam_draft,
 )
 from src.scoring import compute_score
+from src.question_ordering import arrange_question_dependencies
+
+
+COMPLETABLE_QUIZ_MODES = frozenset({
+    "practice",
+    "timed_section",
+    "curriculum_exam",
+    "full_exam",
+    "neonatal_mock",
+})
 
 
 # ── State key names ───────────────────────────────────────────────────────────
 _K = {
     "active":          "exam_active",
+    "offline_pending": "exam_offline_pending",
     "attempt_id":      "exam_attempt_id",
     "questions":       "exam_questions",
     "current_idx":     "exam_current_idx",
@@ -71,6 +85,9 @@ _DRAFT_TRANSIENT_KEYS = {
     "fe_next",
     "fe_prev",
     "fe_submit_ans",
+    # Rendered before the Practice Mode resume picker. Restoring a button's
+    # widget value after it has been instantiated raises StreamlitAPIException.
+    "practice_dashboard_toggle_button_v2",
 }
 
 _DRAFT_TRANSIENT_PREFIXES = (
@@ -180,12 +197,21 @@ def restore_exam_draft(
     user_id: int,
     modes: list[str] | tuple[str, ...] | set[str] | None = None,
     course_id=None,
+    attempt_id: int | None = None,
 ) -> bool:
-    """Restore the newest unfinished draft into session_state."""
+    """Restore a selected unfinished draft, or the newest matching draft."""
     if is_active():
         return False
-    draft = get_latest_exam_draft(user_id, modes=modes, course_id=course_id)
+    draft = (
+        get_exam_draft(user_id, attempt_id)
+        if attempt_id is not None
+        else get_latest_exam_draft(user_id, modes=modes, course_id=course_id)
+    )
     if not draft or not draft.get("state"):
+        return False
+    if modes and draft.get("mode") not in modes:
+        return False
+    if course_id is not None and draft.get("course_id") not in {None, course_id}:
         return False
 
     state = draft["state"]
@@ -202,7 +228,11 @@ def restore_exam_draft(
 
     limit = st.session_state.get(_K["time_limit"]) or 0
     remaining = state.get("exam_remaining_seconds")
-    if limit and remaining is not None:
+    uses_practice_question_timer = bool(
+        draft.get("mode") == "practice"
+        and state.get("practice_timer_enabled")
+    )
+    if limit and remaining is not None and not uses_practice_question_timer:
         elapsed = max(0.0, float(limit) - float(remaining))
         now = time.time()
         st.session_state[_K["section_started"]] = now - elapsed
@@ -246,6 +276,9 @@ def start_quiz(
     open_ended_mode: bool = False,
 ) -> int:
     """Initialise session state and create a DB attempt row. Returns attempt_id."""
+    # Final safety net for every quiz builder: never present an already-selected
+    # dependency after its prerequisite or separated from it.
+    questions = arrange_question_dependencies(questions, questions)
     questions = _apply_open_ended_mode(questions, open_ended_mode)
     attempt_id = create_attempt(
         user_id, mode, section_type,
@@ -257,6 +290,7 @@ def start_quiz(
         is_hard_mode=hard_mode,
         course_id=course_id,
     )
+    _set("offline_pending", False)
     _set("active",          True)
     _set("attempt_id",      attempt_id)
     _set("questions",       questions)
@@ -280,12 +314,147 @@ def start_quiz(
     return attempt_id
 
 
-def clear_quiz() -> None:
+def clear_quiz(delete_draft: bool = True) -> None:
     attempt_id = _st("attempt_id")
-    if attempt_id:
+    if delete_draft and attempt_id:
         delete_exam_draft(attempt_id)
     for k in _K.values():
         st.session_state.pop(k, None)
+
+
+def suspend_current_exam(user_id: int | None = None) -> bool:
+    """Save and leave an exam without submitting or deleting its draft."""
+    if not is_active():
+        return False
+    persist_current_exam(user_id)
+    clear_quiz(delete_draft=False)
+    return True
+
+
+def _draft_set(state: dict, key: str) -> set[int]:
+    value = state.get(key, [])
+    if isinstance(value, dict) and value.get("__type__") == "set":
+        value = value.get("items", [])
+    if not isinstance(value, (list, tuple, set)):
+        return set()
+    result = set()
+    for item in value:
+        try:
+            result.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _draft_index_value(values: dict, idx: int, default=None):
+    if not isinstance(values, dict):
+        return default
+    return values.get(idx, values.get(str(idx), default))
+
+
+def finalize_stale_practice_drafts(
+    user_id: int,
+    *,
+    now: datetime | None = None,
+    timezone_name: str = "America/New_York",
+) -> list[dict]:
+    """Close practice drafts from earlier local dates as of 11:59:59 PM."""
+    local_zone = ZoneInfo(timezone_name)
+    local_now = now or datetime.now(local_zone)
+    if local_now.tzinfo is None:
+        local_now = local_now.replace(tzinfo=local_zone)
+    else:
+        local_now = local_now.astimezone(local_zone)
+
+    finalized = []
+    from src.question_loader import is_open_ended_question
+
+    for draft in get_exam_drafts(user_id, modes={"practice"}):
+        state = draft.get("state") or {}
+        if state.get("exam_offline_pending"):
+            continue
+        saved_epoch = state.get("exam_saved_at")
+        try:
+            saved_local = datetime.fromtimestamp(float(saved_epoch), local_zone)
+        except (TypeError, ValueError, OSError):
+            try:
+                saved_utc = datetime.fromisoformat(str(draft.get("updated_at") or ""))
+                if saved_utc.tzinfo is None:
+                    saved_utc = saved_utc.replace(tzinfo=timezone.utc)
+                saved_local = saved_utc.astimezone(local_zone)
+            except ValueError:
+                continue
+        if saved_local.date() >= local_now.date():
+            continue
+
+        questions = state.get(_K["questions"]) or []
+        answers = state.get(_K["answers"]) or {}
+        self_grades = state.get(_K["self_grades"]) or {}
+        flagged = _draft_set(state, _K["flagged"])
+        reached = _draft_set(state, "practice_reached_questions")
+        if not reached and questions:
+            try:
+                current_idx = int(state.get(_K["current_idx"], 0))
+            except (TypeError, ValueError):
+                current_idx = 0
+            reached = set(range(max(0, current_idx) + 1))
+        reached = {idx for idx in reached if 0 <= idx < len(questions)}
+
+        cutoff_local = datetime.combine(
+            saved_local.date() + timedelta(days=1),
+            datetime_time.min,
+            tzinfo=local_zone,
+        ) - timedelta(seconds=1)
+        cutoff_utc = cutoff_local.astimezone(timezone.utc).replace(tzinfo=None)
+        cutoff_text = cutoff_utc.strftime("%Y-%m-%d %H:%M:%S")
+        attempt_id = int(draft["attempt_id"])
+        section_num = int(state.get(_K["section_num"]) or 1)
+        correct = 0
+
+        for idx in sorted(reached):
+            question = questions[idx]
+            selected = str(_draft_index_value(answers, idx, "") or "")
+            if is_open_ended_question(question):
+                is_correct = bool(selected.strip()) and bool(
+                    _draft_index_value(self_grades, idx, False)
+                )
+            else:
+                expected = str(question.get("correct_answer") or "").upper()
+                is_correct = bool(selected) and selected.upper() == expected
+            inserted = save_answer(
+                attempt_id=attempt_id,
+                question_id=int(question["id"]),
+                selected=selected,
+                is_correct=is_correct,
+                time_spent=0.0,
+                is_flagged=idx in flagged,
+                section_num=section_num,
+                submitted_at=cutoff_text,
+            )
+            if inserted and selected and not is_correct:
+                add_to_journal(user_id, int(question["id"]), attempt_id)
+            correct += int(is_correct)
+
+        total = len(reached)
+        percent = round(correct / total * 100, 1) if total else 0.0
+        report = {
+            "total": total,
+            "correct": correct,
+            "incorrect": total - correct,
+            "percent_correct": percent,
+            "auto_finished": True,
+        }
+        complete_attempt(
+            attempt_id,
+            total=total,
+            correct=correct,
+            section_scores={str(section_num): report},
+            completed_at=cutoff_text,
+        )
+        delete_exam_draft(attempt_id)
+        finalized.append({"attempt_id": attempt_id, **report})
+
+    return finalized
 
 
 def is_active() -> bool:
@@ -461,7 +630,7 @@ def submit_section(user_id: int, question_indices: list[int] | set[int] | tuple[
             is_correct = selected.upper() == (q.get("correct_answer") or "").upper()
         time_spent = max(0.0, (submitted_at - section_started) / max(len(scored_indices), 1))
 
-        save_answer(
+        inserted = save_answer(
             attempt_id=attempt_id,
             question_id=q["id"],
             selected=selected,
@@ -471,7 +640,7 @@ def submit_section(user_id: int, question_indices: list[int] | set[int] | tuple[
             section_num=section_num,
         )
 
-        if selected and not is_correct:
+        if inserted and selected and not is_correct:
             add_to_journal(user_id, q["id"], attempt_id)
 
         answer_rows.append({
@@ -489,7 +658,10 @@ def submit_section(user_id: int, question_indices: list[int] | set[int] | tuple[
         report["scored_total"] = len(scored_indices)
         report["excluded_unreached"] = max(0, len(questions) - len(scored_indices))
 
-    if mode in ("practice", "timed_section"):
+    # Every submitted quiz attempt must be finalized before analytics can see
+    # its answers. Mixed curriculum exams and each full-exam section retain
+    # their question-level course/module attribution through user_answers.
+    if mode in COMPLETABLE_QUIZ_MODES:
         complete_attempt(
             attempt_id,
             total=report["total"],
@@ -534,6 +706,11 @@ def build_full_exam_sections(
 
         chosen = q_pool[:25]
         random.shuffle(chosen)
+        chosen = arrange_question_dependencies(
+            chosen,
+            q_pool,
+            target_count=len(chosen),
+        )
         sections.append({**s, "questions": chosen})
 
     return sections

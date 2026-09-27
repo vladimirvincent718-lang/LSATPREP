@@ -92,6 +92,37 @@ class MistakeJournalQueryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             database.set_mistake_journal_order(1, [167, 169])
 
+    def test_clear_mistake_journal_only_clears_users_selected_course(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(
+            """
+            INSERT INTO courses VALUES (2, 'Other Course');
+            INSERT INTO questions
+                (id, question_id, course_id, stimulus, section_type, question_type)
+                VALUES (12, 'Q-12', 2, 'Other question', 'Module', 'Multiple Choice');
+            INSERT INTO mistake_journal
+                (id, user_id, question_id, attempt_id, created_at)
+                VALUES (169, 1, 12, 90, '2026-06-10 06:05:00');
+            INSERT INTO mistake_journal
+                (id, user_id, question_id, attempt_id, created_at)
+                VALUES (170, 2, 10, 91, '2026-06-10 06:10:00');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        deleted = database.clear_mistake_journal(1, 1)
+
+        self.assertEqual(deleted, 2)
+        conn = sqlite3.connect(self.db_path)
+        remaining = conn.execute(
+            "SELECT id, user_id, question_id FROM mistake_journal ORDER BY id"
+        ).fetchall()
+        answer_count = conn.execute("SELECT COUNT(*) FROM user_answers").fetchone()[0]
+        conn.close()
+        self.assertEqual(remaining, [(169, 1, 12), (170, 2, 10)])
+        self.assertEqual(answer_count, 2)
+
     def test_review_query_self_heals_missing_order_column(self):
         conn = sqlite3.connect(self.db_path)
         conn.execute("ALTER TABLE mistake_journal RENAME TO mistake_journal_old")

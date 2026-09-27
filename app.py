@@ -18,9 +18,11 @@ from src.auth     import (
     logout,
     restore_session_from_cookie,
     wait_for_cookie_load,
+    run_practice_daily_rollover,
 )
 from src.utils import inject_sidebar_page_labels, _review_mistakes_outstanding_count
 from src.ui_theme import feature_grid, hero, inject_modern_theme
+from src.app_status import deployment_caption
 
 if __name__ == "__main__" and get_script_run_ctx() is None:
     subprocess.run(
@@ -32,6 +34,7 @@ if __name__ == "__main__" and get_script_run_ctx() is None:
             os.path.abspath(__file__),
             "--server.headless=false",
         ],
+        cwd=ROOT,
         check=False,
     )
     sys.exit()
@@ -57,6 +60,8 @@ def main():
     inject_sidebar_page_labels(_review_mistakes_outstanding_count(user_id))
 
     if not is_logged_in():
+        with st.sidebar:
+            st.caption(deployment_caption())
         hero(
             "StudyForge",
             "A modern learning workspace for courses, materials, practice, exams, feedback, and private progress tracking.",
@@ -89,6 +94,8 @@ def main():
     else:
         username = st.session_state.get("username", "")
         user_id  = st.session_state.get("user_id")
+        if user_id:
+            run_practice_daily_rollover(user_id)
 
         with st.sidebar:
             st.markdown(f"**👤 {username}**")
@@ -118,6 +125,8 @@ def main():
             if st.button("Log Out", use_container_width=True):
                 logout()
                 st.rerun()
+            st.divider()
+            st.caption(deployment_caption())
 
         from src.utils import _inject_feedback_button, get_effective_admin
         _inject_feedback_button()

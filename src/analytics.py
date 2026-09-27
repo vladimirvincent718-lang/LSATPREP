@@ -30,6 +30,29 @@ def _accuracy_breakdown(answers: list[dict], field: str, unknown: str) -> dict:
     return grouped
 
 
+def _module_difficulty_breakdown(answers: list[dict]) -> dict[str, dict[int, dict]]:
+    """Group answer accuracy first by module, then by difficulty level."""
+    grouped: dict[str, dict[int, dict]] = {}
+    for answer in answers:
+        module = str(answer.get("section_type") or "Unknown Module").strip() or "Unknown Module"
+        difficulty = int(answer.get("difficulty") or 3)
+        result = grouped.setdefault(module, {}).setdefault(
+            difficulty,
+            {"total": 0, "correct": 0},
+        )
+        result["total"] += 1
+        result["correct"] += int(bool(answer.get("is_correct")))
+
+    for difficulty_results in grouped.values():
+        for result in difficulty_results.values():
+            result["pct"] = (
+                round(result["correct"] / result["total"] * 100, 1)
+                if result["total"]
+                else 0
+            )
+    return grouped
+
+
 def _course_breakdown(answers: list[dict]) -> dict:
     grouped: dict[str, dict] = {}
     for answer in answers:
@@ -137,6 +160,7 @@ def get_dashboard_stats(user_id: int,
         "weak_modules":     [],
         "weak_courses":     [],
         "accuracy_by_module": {},
+        "accuracy_by_module_difficulty": {},
         "accuracy_by_course": {},
         "score_trend":      pd.DataFrame(),
         "accuracy_by_type": {},
@@ -175,6 +199,7 @@ def get_dashboard_stats(user_id: int,
     # Accuracy by module / curriculum area. In this app, questions store their
     # module name in section_type.
     acc_module = _accuracy_breakdown(answers, "section_type", "Unknown Module")
+    acc_module_difficulty = _module_difficulty_breakdown(answers)
     weak_modules = _weakest_breakdown(
         acc_module,
         label_key="module",
@@ -217,6 +242,7 @@ def get_dashboard_stats(user_id: int,
         "weak_modules":      weak_modules,
         "weak_courses":      weak_courses,
         "accuracy_by_module": acc_module,
+        "accuracy_by_module_difficulty": acc_module_difficulty,
         "accuracy_by_course": acc_course,
         "score_trend":       score_trend,
         "accuracy_by_type":  acc_type,

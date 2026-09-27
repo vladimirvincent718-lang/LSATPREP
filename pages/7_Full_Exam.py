@@ -14,18 +14,20 @@ from src.utils      import (page_header, sidebar_nav, require_course,
                               render_question, render_score_card, render_timer,
                               question_reference_label)
 from src.database   import (get_all_settings, get_attempts, get_attempt_answers,
-                              complete_attempt, get_course)
+                              complete_attempt, get_course, get_exam_drafts)
 from src.exam_engine import (
     start_full_exam, advance_full_exam, submit_section,
     is_active, current_question, next_question, prev_question,
     record_answer, record_self_grade, toggle_flag, seconds_remaining, is_timed_out,
     clear_quiz, resume_timer, persist_current_exam, restore_exam_draft,
+    suspend_current_exam,
     _st, _set, _K, format_time,
 )
 from src.scoring import compute_score
 from src.question_loader import is_open_ended_question
 from src.question_map import render_question_map, render_question_map_legend
-from src.pdf_export import generate_exam_pdf, make_pdf_filename
+from src.pdf_export import make_pdf_filename
+from src.offline_exams import export_offline_exam
 from src.email_notifications import notify_exam_started
 
 st.set_page_config(page_title="Full Exam · StudyForge", page_icon="📋", layout="wide")
@@ -38,12 +40,13 @@ from src.utils import course_selector
 course_id    = require_course(user_id)
 course       = get_course(course_id)
 course_title = course["title"] if course else "Unknown"
-restore_exam_draft(user_id, modes={"full_exam"}, course_id=course_id)
-
 page_header("📋 Full Exam Mode", f"Multi-section simulation — {course_title}")
 
 if st.session_state.pop("_exam_restored_notice", False):
     st.success("Your in-progress full exam was restored with your saved answers and remaining time.")
+
+if st.session_state.pop("_exam_exit_notice", False):
+    st.success("Exam saved. You can resume it below or start another exam.")
 
 email_notice = st.session_state.pop("exam_email_notice", None)
 if email_notice:
@@ -64,6 +67,35 @@ def exam_complete(): return st.session_state.get(KEY_EXAM_COMPLETE, False)
 if not exam_running() and not exam_complete():
     from src.database import get_course_question_count
     q_count = get_course_question_count(course_id)
+
+    saved_exams = get_exam_drafts(user_id, modes={"full_exam"}, course_id=course_id)
+    if saved_exams:
+        st.subheader("Exams in progress")
+        st.caption("Resume any saved exam, or start another full exam below.")
+        for draft in saved_exams:
+            state = draft.get("state") or {}
+            section = int(state.get(_K["section_num"]) or 1)
+            questions = state.get(_K["questions"]) or []
+            answers = state.get(_K["answers"]) or {}
+            info_col, resume_col = st.columns([4, 1])
+            info_col.markdown(
+                f"**Full Exam · Section {section}**  \n"
+                f"{len(answers)}/{len(questions)} answered · saved {draft.get('updated_at', '')}"
+            )
+            if resume_col.button(
+                "Resume",
+                key=f"resume_full_exam_{draft['attempt_id']}",
+                use_container_width=True,
+            ):
+                if restore_exam_draft(
+                    user_id,
+                    modes={"full_exam"},
+                    course_id=course_id,
+                    attempt_id=int(draft["attempt_id"]),
+                ):
+                    st.rerun()
+                st.error("That exam is no longer available to resume.")
+        st.divider()
 
     st.subheader("Full Exam Simulation")
     st.markdown(f"""
@@ -109,12 +141,13 @@ This mode uses the section types available in the active course question bank.
         )
         sections = st.session_state.get(_K["full_sections"], [])
         exam_questions = [
-            question
-            for section in sections
+            {**question, "_offline_section": section_index, "_offline_scored": section.get("is_scored", True)}
+            for section_index, section in enumerate(sections, 1)
             for question in section.get("questions", [])
         ]
         exam_label = "Full Exam"
-        pdf_bytes = generate_exam_pdf(
+        pdf_bytes = export_offline_exam(
+            user_id=user_id,
             questions=exam_questions,
             title=exam_label,
             subtitle=f"{course_title} full exam simulation",
@@ -214,7 +247,8 @@ if on_break:
     st.progress(max(0.0, break_remaining / BREAK_SECONDS),
                 text=f"Break ends in {m:02d}:{s:02d}")
 
-    if break_remaining <= 0 or st.button("▶ Resume Exam Now"):
+    resume_col, exit_col = st.columns(2)
+    if break_remaining <= 0 or resume_col.button("▶ Resume Exam Now"):
         st.session_state[_K["on_break"]] = False
         sec_idx  = st.session_state.get(_K["full_sec_idx"], 2)
         sections = st.session_state.get(_K["full_sections"], [])
@@ -224,6 +258,12 @@ if on_break:
         else:
             from src.exam_engine import _start_full_section
             _start_full_section(user_id, sec_idx, sections, hard_mode, course_id)
+        st.rerun()
+    if exit_col.button("Save & Exit"):
+        suspend_current_exam(user_id)
+        for key in [KEY_EXAM_RUNNING, KEY_EXAM_COMPLETE, KEY_CONFIRM_SUBMIT]:
+            st.session_state.pop(key, None)
+        st.session_state["_exam_exit_notice"] = True
         st.rerun()
     st.stop()
 
@@ -340,12 +380,13 @@ with col_s:
         st.rerun()
 
 with col_q:
-    if not hard_mode:
-        if st.button("✖ Quit Exam", use_container_width=True):
-            for k in [KEY_EXAM_RUNNING, KEY_EXAM_COMPLETE]:
-                st.session_state.pop(k, None)
-            st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
-            clear_quiz(); st.rerun()
+    if st.button("Save & Exit", use_container_width=True):
+        suspend_current_exam(user_id)
+        for k in [KEY_EXAM_RUNNING, KEY_EXAM_COMPLETE]:
+            st.session_state.pop(k, None)
+        st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
+        st.session_state["_exam_exit_notice"] = True
+        st.rerun()
 
 if st.session_state.get(KEY_CONFIRM_SUBMIT):
     detail = (

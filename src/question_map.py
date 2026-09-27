@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from html import escape
 
 import streamlit as st
 
@@ -19,30 +18,10 @@ def _status_mark(status: str, flagged: bool) -> str:
     if flagged:
         return "F"
     if status in {"answered", "correct"}:
-        return "&check;"
+        return "✓"
     if status == "wrong":
-        return "&times;"
+        return "×"
     return ""
-
-
-def _consume_clicked_index(param_name: str, total: int) -> int | None:
-    raw_value = st.query_params.get(param_name)
-    if isinstance(raw_value, list):
-        raw_value = raw_value[0] if raw_value else None
-    try:
-        clicked_idx = int(raw_value) if raw_value is not None else None
-    except (TypeError, ValueError):
-        clicked_idx = None
-
-    if raw_value is not None:
-        try:
-            del st.query_params[param_name]
-        except Exception:
-            st.query_params.clear()
-
-    if clicked_idx is None or not (0 <= clicked_idx < total):
-        return None
-    return clicked_idx
 
 
 def render_question_map(
@@ -54,9 +33,6 @@ def render_question_map(
     columns: int = 4,
 ) -> int | None:
     """Render a legible, numbered question map and return the clicked index."""
-
-    param_name = f"{key_prefix}_goto"
-    clicked_idx = _consume_clicked_index(param_name, total)
 
     st.markdown(
         """
@@ -95,56 +71,53 @@ def render_question_map(
 .sf-qmap-swatch.flagged {
   background: linear-gradient(135deg, #f59e0b 0 50%, #f8fafc 50% 100%);
 }
-.sf-qmap-grid {
-  display: grid;
-  gap: 0.62rem;
-  margin-top: 0.85rem;
+div[class*="_qmap_state_"] {
+  margin-bottom: 0.3rem;
 }
-.sf-qmap-tile {
-  align-items: center;
+div[class*="_qmap_state_"] .stButton button {
   border: 2px solid transparent;
   border-radius: 0.5rem;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.18);
-  display: flex;
   font-weight: 800;
   height: 2.4rem;
-  justify-content: center;
   line-height: 1;
-  min-width: 0;
-  position: relative;
-  text-decoration: none !important;
+  min-height: 2.4rem;
+  padding: 0.25rem;
 }
-.sf-qmap-tile:hover {
+div[class*="_qmap_state_"] .stButton button:hover {
   filter: brightness(1.06);
   transform: translateY(-1px);
 }
-.sf-qmap-number {
+div[class*="_qmap_state_"] .stButton button p {
   font-size: 0.95rem;
+  font-weight: 800;
 }
-.sf-qmap-mark {
-  bottom: 0.18rem;
-  font-size: 0.72rem;
-  position: absolute;
-  right: 0.24rem;
-}
-.sf-qmap-tile.correct,
-.sf-qmap-tile.answered {
+div[class*="_qmap_state_correct"] .stButton button,
+div[class*="_qmap_state_answered"] .stButton button {
   background: #16a34a;
+  border-color: #16a34a;
   color: #ffffff !important;
 }
-.sf-qmap-tile.wrong {
+div[class*="_qmap_state_correct"] .stButton button p,
+div[class*="_qmap_state_answered"] .stButton button p,
+div[class*="_qmap_state_wrong"] .stButton button p {
+  color: #ffffff !important;
+}
+div[class*="_qmap_state_wrong"] .stButton button {
   background: #dc2626;
+  border-color: #dc2626;
   color: #ffffff !important;
 }
-.sf-qmap-tile.unanswered,
-.sf-qmap-tile.skipped {
+div[class*="_qmap_state_unanswered"] .stButton button,
+div[class*="_qmap_state_skipped"] .stButton button {
   background: #f8fafc;
+  border-color: #f8fafc;
   color: #0f172a !important;
 }
-.sf-qmap-tile.flagged {
+div[class*="_qmap_flagged"] .stButton button {
   border-color: #f59e0b;
 }
-.sf-qmap-tile.current {
+div[class*="_qmap_current"] .stButton button {
   outline: 3px solid #38bdf8;
   outline-offset: 1px;
 }
@@ -153,38 +126,33 @@ def render_question_map(
         unsafe_allow_html=True,
     )
 
-    tiles = []
-    for i in range(total):
-        state = state_for_index(i)
-        status = _state_class(state)
-        flagged = bool(state.get("flagged"))
-        classes = [
-            "sf-qmap-tile",
-            status,
-            "flagged" if flagged else "",
-            "current" if i == current_idx else "",
-        ]
-        mark = _status_mark(status, flagged)
-        help_text = escape(str(state.get("help") or f"Go to question {i + 1}"))
-        tiles.append(
-            (
-                f'<a class="{" ".join(c for c in classes if c)}" '
-                f'href="?{param_name}={i}" title="{help_text}">'
-                f'<span class="sf-qmap-number">{i + 1}</span>'
-                f'<span class="sf-qmap-mark">{mark}</span>'
-                '</a>'
-            )
-        )
+    clicked_idx = None
+    for row_start in range(0, total, columns):
+        row_columns = st.columns(columns, gap="small")
+        for column_offset, i in enumerate(range(row_start, min(row_start + columns, total))):
+            state = state_for_index(i)
+            status = _state_class(state)
+            flagged = bool(state.get("flagged"))
+            mark = _status_mark(status, flagged)
+            # A native Streamlit button keeps the click in the current app view.
+            # The state words in the container key also provide stable CSS hooks.
+            state_key = f"{key_prefix}_qmap_state_{status}"
+            if flagged:
+                state_key += "_qmap_flagged"
+            if i == current_idx:
+                state_key += "_qmap_current"
+            state_key += f"_{i}"
+            label = f"{i + 1} {mark}" if mark else str(i + 1)
+            with row_columns[column_offset]:
+                with st.container(key=state_key):
+                    if st.button(
+                        label,
+                        key=f"{key_prefix}_qmap_button_{i}",
+                        help=str(state.get("help") or f"Go to question {i + 1}"),
+                        use_container_width=True,
+                    ):
+                        clicked_idx = i
 
-    st.markdown(
-        (
-            f'<div class="sf-qmap-grid" '
-            f'style="grid-template-columns: repeat({columns}, minmax(0, 1fr));">'
-            + "".join(tiles)
-            + "</div>"
-        ),
-        unsafe_allow_html=True,
-    )
     return clicked_idx
 
 

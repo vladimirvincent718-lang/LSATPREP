@@ -40,6 +40,24 @@ _MODERN_THEME_CSS = """
     padding-bottom: 4.5rem;
 }
 
+/* Streamlit still applies vertical-block gaps around invisible helpers. Keep
+   injected CSS/JS from consuming the first several hundred pixels of a page. */
+[data-testid="stMainBlockContainer"] [data-testid="stElementContainer"]:has(style),
+[data-testid="stMainBlockContainer"] [data-testid="stElementContainer"]:has(iframe[height="0"]),
+[data-testid="stMainBlockContainer"] [data-testid="stElementContainer"][height="0px"]:has([data-testid="stIFrame"]),
+[data-testid="stMainBlockContainer"] [data-testid="stElementContainer"]:has(#sf-feedback-fab-marker) {
+    display: none !important;
+}
+
+[data-testid="stMainBlockContainer"] [data-testid="stElementContainer"]:has(#sf-feedback-fab-marker)
+  + [data-testid="stElementContainer"] {
+    position: absolute !important;
+    left: -9999px !important;
+    width: 1px !important;
+    height: 1px !important;
+    overflow: hidden !important;
+}
+
 h1, h2, h3, h4, h5, h6,
 [data-testid="stMarkdownContainer"] h1,
 [data-testid="stMarkdownContainer"] h2,

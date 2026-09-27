@@ -9,6 +9,14 @@ import streamlit as st
 import sqlite3
 import hashlib
 
+from src.app_status import (
+    backup_receipt,
+    create_database_backup,
+    deployment_caption,
+    format_local_timestamp,
+    get_deployment_status,
+)
+
 from src.auth     import require_login
 from src.utils    import page_header, sidebar_nav, get_effective_admin, DIFFICULTY_LABELS
 from src.database import (
@@ -22,6 +30,12 @@ from src.email_notifications import (
     TEST_START_COUNT_KEY,
     USER_EMAIL_KEY,
 )
+from src.professional_specialty import (
+    DEFAULT_SPECIALTY,
+    PROFESSIONAL_SPECIALTY_SETTING,
+    normalize_specialty,
+    specialty_label,
+)
 from src.exam_engine import persist_current_exam
 
 st.set_page_config(page_title="Settings · StudyForge", page_icon="⚙️", layout="wide")
@@ -29,18 +43,52 @@ st.set_page_config(page_title="Settings · StudyForge", page_icon="⚙️", layo
 user_id  = require_login()
 username = st.session_state.get("username", "")
 sidebar_nav(username)
-page_header("⚙️ Settings", "Configure difficulty, timing, and your account")
+page_header("⚙️ Settings", "Configure learning preferences, timing, and your account")
 
 settings = get_all_settings(user_id)
 real_admin, admin = get_effective_admin(user_id)
 
-tab_general, tab_hard, tab_account, tab_backup = st.tabs(
-    ["🎛 General", "⚡ Hard Mode", "👤 Account", "💾 Backup"]
+tab_general, tab_learning, tab_hard, tab_account, tab_backup = st.tabs(
+    ["🎛 General", "💼 Learning", "⚡ Hard Mode", "👤 Account", "💾 Backup"]
 )
 
 # ── General settings ──────────────────────────────────────────────────────────
 with tab_general:
     st.markdown("### General Settings")
+    with st.expander("Phone access"):
+        from src.mobile_access import PUBLIC_APP_URL, phone_links
+        phone_link, hostname_link = phone_links()
+        st.link_button("Open StudyForge from anywhere", PUBLIC_APP_URL)
+        st.code(PUBLIC_APP_URL, language=None)
+        st.caption("This opens the existing Streamlit Cloud deployment. If it is asleep, tap the wake-up button. Local edits and progress are not automatically synced to the hosted app.")
+        st.markdown("**Home Wi-Fi link to this computer**")
+        st.caption("Connect your phone to this computer's home Wi-Fi. Keep the computer on and awake.")
+        if phone_link:
+            st.link_button("Open StudyForge on your phone", phone_link)
+            st.code(phone_link, language=None)
+        st.caption("Alternative link (if your network supports computer names):")
+        st.code(hostname_link, language=None)
+        st.caption("On your phone, use Safari's Share → Add to Home Screen or Chrome's menu → Add to Home screen.")
+    from src.study_progress import METHODS, preferences
+    progress_prefs = preferences(settings)
+    with st.expander("Progress colors"):
+        with st.form("progress_colors"):
+            progress_method = st.selectbox("Score used for colors", list(METHODS),
+                index=list(METHODS).index(progress_prefs["method"]), format_func=METHODS.get, key="progress_method_input")
+            st.caption("The last 3 sessions balance recent improvement with stability. Averages are weighted by questions answered. Only completed sessions count.")
+            progress_yellow = st.number_input("Yellow starts at (%)", 0, 99, progress_prefs["yellow"], key="progress_yellow_input")
+            progress_green = st.number_input("Green starts at (%)", 1, 100, progress_prefs["green"], key="progress_green_input")
+            st.caption("Below yellow is red. No history is gray. Review-window activity is tracked separately from your score.")
+            save_progress = st.form_submit_button("Save Progress Colors")
+        if save_progress:
+            if progress_yellow >= progress_green:
+                st.error("Green must start above yellow.")
+            else:
+                set_setting(user_id, "progress_method", progress_method)
+                set_setting(user_id, "progress_yellow", str(progress_yellow))
+                set_setting(user_id, "progress_green", str(progress_green))
+                st.success("Progress colors saved across courses and modules.")
+
     with st.form("general_settings"):
         sec_time = st.slider(
             "Default Section Time (minutes)",
@@ -68,6 +116,7 @@ with tab_general:
             ),
             format_func=lambda x: f"{x} - {DIFFICULTY_LABELS.get(x, x)}",
         )
+        st.markdown("#### Question behavior")
         show_exp = st.selectbox(
             "Show Explanations",
             options=["always", "after_section", "after_exam"],
@@ -78,6 +127,14 @@ with tab_general:
                 "always = instant feedback after each answer  \n"
                 "after_section = only at end of section  \n"
                 "after_exam = only after full exam"
+            ),
+        )
+        auto_submit_answers = st.toggle(
+            "Practice Mode: submit multiple-choice answers on selection",
+            value=settings.get("auto_submit_answers", "false") == "true",
+            help=(
+                "Your first option click is submitted immediately, shows whether it "
+                "was right or wrong, and replaces Submit Answer with Next Question."
             ),
         )
         q_mix = st.selectbox(
@@ -102,6 +159,11 @@ with tab_general:
         set_setting(user_id, "min_difficulty",       str(diff_range[0]))
         set_setting(user_id, "max_difficulty",       str(diff_range[1]))
         set_setting(user_id, "show_explanations",    show_exp)
+        set_setting(
+            user_id,
+            "auto_submit_answers",
+            "true" if auto_submit_answers else "false",
+        )
         set_setting(user_id, "question_mix",         q_mix)
         if (
             st.session_state.get("exam_active")
@@ -114,6 +176,48 @@ with tab_general:
             st.session_state["exam_timer_visible"] = True
             persist_current_exam(user_id)
         st.success("General settings saved.")
+
+# ── Learning preferences ────────────────────────────────────────────────────
+with tab_learning:
+    st.markdown("### Learning Preferences")
+    st.markdown(
+        "Choose the default question lens for Practice Mode. Manage the shared lens list "
+        "in Question Bank Manager → Manage Questions → Lenses."
+    )
+    from src.question_lenses import get_lenses
+    lens_options = list(get_lenses())
+    with st.form("learning_preferences"):
+        current_specialty = normalize_specialty(
+            settings.get(PROFESSIONAL_SPECIALTY_SETTING, DEFAULT_SPECIALTY)
+        )
+        professional_specialty = st.selectbox(
+            "Default question lens",
+            options=lens_options,
+            index=lens_options.index(current_specialty),
+            format_func=specialty_label,
+            help=(
+                "This is preselected when you start a new Practice Mode session. "
+                "You can override it for an individual session."
+            ),
+        )
+        save_learning = st.form_submit_button(
+            "💾 Save Learning Preferences",
+            use_container_width=True,
+        )
+
+    if save_learning:
+        set_setting(
+            user_id,
+            PROFESSIONAL_SPECIALTY_SETTING,
+            normalize_specialty(professional_specialty),
+        )
+        st.session_state["practice_professional_specialty"] = normalize_specialty(
+            professional_specialty
+        )
+        st.session_state["practice_question_lens"] = normalize_specialty(professional_specialty)
+        st.success(
+            f"Default question lens saved as {specialty_label(professional_specialty)}."
+        )
 
 # ── Hard mode settings ────────────────────────────────────────────────────────
 with tab_hard:
@@ -206,6 +310,8 @@ with tab_account:
         st.divider()
 
     if admin:
+        from src.offline_email import render_mailbox_settings
+        render_mailbox_settings()
         st.markdown("#### Email Delivery")
         st.caption(
             "These app-wide SMTP settings power exam-start emails. "
@@ -386,22 +492,47 @@ with tab_account:
 with tab_backup:
     st.markdown("### 💾 Database Backup")
     st.markdown(
-        "Download a copy of the SQLite database. "
-        "Keep it safe — it contains all your courses, questions, and scores."
+        "Download a consistent copy of the SQLite database. "
+        "The dated filename and receipt record exactly when it was prepared."
     )
 
     try:
-        with open(str(DB_PATH), "rb") as f:
-            db_bytes = f.read()
+        if "prepared_database_backup" not in st.session_state:
+            st.session_state.prepared_database_backup = create_database_backup(DB_PATH)
+        if st.button("Prepare a fresh backup", use_container_width=True):
+            st.session_state.prepared_database_backup = create_database_backup(DB_PATH)
+
+        prepared_backup = st.session_state.prepared_database_backup
+        deployment = get_deployment_status()
+
+        st.info(deployment_caption(deployment))
+        created_label = format_local_timestamp(
+            prepared_backup.created_at, include_seconds=True
+        )
+        activity_label = format_local_timestamp(
+            prepared_backup.latest_activity_at, include_seconds=True
+        )
+        st.markdown(f"**Backup prepared:** {created_label}")
+        st.markdown(f"**Latest database activity:** {activity_label}")
+
         st.download_button(
-            "⬇️ Download lsat_app.db",
-            data=db_bytes,
-            file_name="lsat_app.db",
+            "⬇️ Download dated database backup",
+            data=prepared_backup.data,
+            file_name=prepared_backup.database_filename,
             mime="application/octet-stream",
             use_container_width=True,
         )
-        size_kb = os.path.getsize(str(DB_PATH)) // 1024
-        st.caption(f"Database size: {size_kb} KB  ·  Path: {DB_PATH}")
+        st.download_button(
+            "Download backup receipt",
+            data=backup_receipt(prepared_backup, deployment),
+            file_name=prepared_backup.receipt_filename,
+            mime="text/plain",
+            use_container_width=True,
+        )
+        size_kb = len(prepared_backup.data) // 1024
+        st.caption(
+            f"Database size: {size_kb:,} KB · SHA-256: {prepared_backup.sha256}"
+        )
     except FileNotFoundError:
         st.warning("Database file not found.")
 
@@ -413,4 +544,5 @@ with tab_backup:
         if st.button("♻️ Restore Database", type="secondary"):
             with open(str(DB_PATH), "wb") as f:
                 f.write(restore_file.read())
+            st.session_state.pop("prepared_database_backup", None)
             st.success("Database restored. Please refresh the app.")

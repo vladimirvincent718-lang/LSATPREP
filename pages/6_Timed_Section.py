@@ -21,8 +21,10 @@ from src.exam_engine import (
 )
 from src.question_loader import is_open_ended_question
 from src.question_map import render_question_map, render_question_map_legend
-from src.pdf_export import generate_exam_pdf, make_pdf_filename
+from src.pdf_export import make_pdf_filename
+from src.offline_exams import export_offline_exam
 from src.email_notifications import notify_exam_started
+from src.question_ordering import arrange_question_dependencies
 
 TIMED_CONFIRM_SUBMIT_KEY = "timed_confirm_submit"
 
@@ -57,10 +59,13 @@ if not is_active():
     course_sections = get_distinct_values("section_type", course_id=course_id)
     section_opts    = course_sections if course_sections else ["General"]
 
+    from src.study_progress import load_progress, status, label as progress_label, render_course_progress
+    progress = load_progress(user_id, settings)
+    render_course_progress(user_id, [course_id])
     with st.form("timed_setup"):
         col1, col2 = st.columns(2)
         with col1:
-            section_type = st.selectbox("Section Type", section_opts)
+            section_type = st.selectbox("Section Type", section_opts, format_func=lambda module: progress_label(module, status(progress, [course_id], module), progress["window"]))
             n_questions  = st.number_input("Number of Questions", 5, 50, 25)
         with col2:
             if hard_mode:
@@ -105,14 +110,12 @@ if not is_active():
             )
             st.stop()
         questions = random.sample(pool, min(int(n_questions), len(pool)))
-        exam_label = f"Timed Section: {section_type}"
-        pdf_bytes = generate_exam_pdf(
-            questions=questions,
-            title=exam_label,
-            subtitle=f"{course_title} timed exam",
-            distribution=[{"course": course_title, "q_count": len(questions)}],
+        questions = arrange_question_dependencies(
+            questions,
+            pool,
+            target_count=len(questions),
         )
-        pdf_filename = make_pdf_filename(exam_label)
+        exam_label = f"Timed Section: {section_type}"
         clear_quiz()
         start_quiz(
             user_id=user_id,
@@ -124,6 +127,14 @@ if not is_active():
             course_id=course_id,
             open_ended_mode=open_ended_mode,
         )
+        pdf_bytes = export_offline_exam(
+            user_id=user_id, attempt_id=st.session_state.get("exam_attempt_id"),
+            questions=st.session_state.get("exam_questions", questions),
+            title=exam_label,
+            subtitle=f"{course_title} timed exam",
+            distribution=[{"course": course_title, "q_count": len(questions)}],
+        )
+        pdf_filename = make_pdf_filename(exam_label)
         result = notify_exam_started(
             user_id,
             course_name=course_title,

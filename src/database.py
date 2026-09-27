@@ -201,6 +201,7 @@ def init_database() -> None:
         time_spent_seconds  REAL    DEFAULT 0,
         is_flagged          INTEGER DEFAULT 0,
         section_number      INTEGER DEFAULT 1,
+        submitted_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (attempt_id)  REFERENCES exam_attempts(id),
         FOREIGN KEY (question_id) REFERENCES questions(id)
     );
@@ -247,6 +248,38 @@ def init_database() -> None:
         value   TEXT,
         UNIQUE(user_id, key),
         FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    -- Manually entered practice completed outside StudyForge.
+    CREATE TABLE IF NOT EXISTS external_practice_entries (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id         INTEGER NOT NULL,
+        entry_date      TEXT    NOT NULL,
+        source          TEXT    NOT NULL,
+        correct_count   INTEGER NOT NULL DEFAULT 0 CHECK(correct_count >= 0),
+        incorrect_count INTEGER NOT NULL DEFAULT 0 CHECK(incorrect_count >= 0),
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, entry_date, source),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    -- Active time recorded while a study timer is running. One attempt may
+    -- contribute to more than one course or calendar date.
+    CREATE TABLE IF NOT EXISTS study_time_entries (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id         INTEGER NOT NULL,
+        attempt_id      INTEGER NOT NULL,
+        course_id       INTEGER NOT NULL,
+        activity_date   TEXT    NOT NULL,
+        mode            TEXT    NOT NULL DEFAULT 'practice',
+        active_seconds  REAL    NOT NULL DEFAULT 0 CHECK(active_seconds >= 0),
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, attempt_id, course_id, activity_date, mode),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (attempt_id) REFERENCES exam_attempts(id) ON DELETE CASCADE,
+        FOREIGN KEY (course_id) REFERENCES courses(id)
     );
 
     -- App-wide settings for admin-managed integrations.
@@ -301,6 +334,7 @@ def init_database() -> None:
         material_type       TEXT DEFAULT 'Reading',
         content_text        TEXT DEFAULT '',
         external_url        TEXT DEFAULT '',
+        stored_file_path    TEXT DEFAULT '',
         notes               TEXT DEFAULT '',
         material_section    TEXT DEFAULT 'Module',
         module_name         TEXT DEFAULT '',
@@ -358,6 +392,15 @@ def init_database() -> None:
         init_responsive_tables()
     except Exception:
         pass
+    # Additive, idempotent specialty-course catalog. Kept in its own module so
+    # the shared LMS schema and existing courses remain backward compatible.
+    from src.neonatal_ccrn import ensure_schema_and_catalog
+    ensure_schema_and_catalog()
+    # Automated mock planning is additive and keeps its own migration isolated.
+    from src.mock_review import ensure_mock_review_schema
+    ensure_mock_review_schema()
+    from src.question_explanations import ensure_question_explanations_schema
+    ensure_question_explanations_schema()
 
 
 # ── Migration — safe, idempotent, runs on every startup ───────────────────────
@@ -444,6 +487,37 @@ def _migrate_database() -> None:
                FOREIGN KEY (user_id)     REFERENCES users(id),
                FOREIGN KEY (question_id) REFERENCES questions(id),
                FOREIGN KEY (attempt_id)  REFERENCES exam_attempts(id)
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS external_practice_entries (
+               id              INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id         INTEGER NOT NULL,
+               entry_date      TEXT    NOT NULL,
+               source          TEXT    NOT NULL,
+               correct_count   INTEGER NOT NULL DEFAULT 0 CHECK(correct_count >= 0),
+               incorrect_count INTEGER NOT NULL DEFAULT 0 CHECK(incorrect_count >= 0),
+               created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(user_id, entry_date, source),
+               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+           )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS study_time_entries (
+               id              INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id         INTEGER NOT NULL,
+               attempt_id      INTEGER NOT NULL,
+               course_id       INTEGER NOT NULL,
+               activity_date   TEXT    NOT NULL,
+               mode            TEXT    NOT NULL DEFAULT 'practice',
+               active_seconds  REAL    NOT NULL DEFAULT 0 CHECK(active_seconds >= 0),
+               created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(user_id, attempt_id, course_id, activity_date, mode),
+               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+               FOREIGN KEY (attempt_id) REFERENCES exam_attempts(id) ON DELETE CASCADE,
+               FOREIGN KEY (course_id) REFERENCES courses(id)
            )"""
     )
 
@@ -578,6 +652,7 @@ def _migrate_database() -> None:
     # ── 2. Legacy column additions ────────────────────────────────────────────
     q_cols  = cols("questions")
     ea_cols = cols("exam_attempts")
+    ua_cols = cols("user_answers")
     if "course_id" not in q_cols:
         conn.execute("ALTER TABLE questions ADD COLUMN course_id INTEGER")
     for col_name, ddl in [
@@ -589,6 +664,8 @@ def _migrate_database() -> None:
             conn.execute(ddl)
     if "course_id" not in ea_cols:
         conn.execute("ALTER TABLE exam_attempts ADD COLUMN course_id INTEGER")
+    if "submitted_at" not in ua_cols:
+        conn.execute("ALTER TABLE user_answers ADD COLUMN submitted_at TIMESTAMP")
 
     # ── 3. courses: add created_by_user_id if missing ─────────────────────────
     c_cols = cols("courses")
@@ -623,6 +700,7 @@ def _migrate_database() -> None:
         ("module_name",        "ALTER TABLE course_materials ADD COLUMN module_name TEXT DEFAULT ''"),
         ("display_order",      "ALTER TABLE course_materials ADD COLUMN display_order INTEGER DEFAULT 0"),
         ("estimated_minutes",  "ALTER TABLE course_materials ADD COLUMN estimated_minutes INTEGER DEFAULT 0"),
+        ("stored_file_path",   "ALTER TABLE course_materials ADD COLUMN stored_file_path TEXT DEFAULT ''"),
     ]:
         if col_name not in m_cols:
             conn.execute(ddl)
@@ -1130,6 +1208,46 @@ def get_course_question_count(course_id: int) -> int:
     return n
 
 
+def get_course_module_question_counts(course_id: int) -> dict[str, int]:
+    """Return active question-bank counts grouped by module for one course."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT COALESCE(NULLIF(TRIM(section_type), ''), 'Unknown Module') AS module,
+                  COUNT(*) AS question_count
+           FROM questions
+           WHERE course_id = ? AND COALESCE(is_archived, 0) = 0
+           GROUP BY COALESCE(NULLIF(TRIM(section_type), ''), 'Unknown Module')
+           ORDER BY module COLLATE NOCASE""",
+        (course_id,),
+    ).fetchall()
+    conn.close()
+    return {str(row["module"]): int(row["question_count"]) for row in rows}
+
+
+def get_course_module_difficulty_question_counts(course_id: int) -> dict[str, dict[int, int]]:
+    """Return active question-bank counts grouped by module and difficulty."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT COALESCE(NULLIF(TRIM(section_type), ''), 'Unknown Module') AS module,
+                  COALESCE(difficulty, 3) AS difficulty,
+                  COUNT(*) AS question_count
+           FROM questions
+           WHERE course_id = ? AND COALESCE(is_archived, 0) = 0
+           GROUP BY COALESCE(NULLIF(TRIM(section_type), ''), 'Unknown Module'),
+                    COALESCE(difficulty, 3)
+           ORDER BY module COLLATE NOCASE, difficulty""",
+        (course_id,),
+    ).fetchall()
+    conn.close()
+
+    counts: dict[str, dict[int, int]] = {}
+    for row in rows:
+        counts.setdefault(str(row["module"]), {})[int(row["difficulty"])] = int(
+            row["question_count"]
+        )
+    return counts
+
+
 # ── Duplicate-course detection and cleanup ────────────────────────────────────
 def get_duplicate_course_groups() -> list:
     """
@@ -1456,18 +1574,21 @@ def get_all_questions(
     include_archived: bool = False,
 ) -> list:
     conn   = get_connection()
-    query  = "SELECT * FROM questions WHERE difficulty BETWEEN ? AND ?"
+    query  = ("SELECT q.*, c.title AS course_title "
+              "FROM questions q "
+              "LEFT JOIN courses c ON c.id = q.course_id "
+              "WHERE q.difficulty BETWEEN ? AND ?")
     params = [min_difficulty, max_difficulty]
     if not include_archived:
-        query += " AND COALESCE(is_archived, 0) = 0"
+        query += " AND COALESCE(q.is_archived, 0) = 0"
     if course_id is not None:
-        query += " AND course_id = ?"
+        query += " AND q.course_id = ?"
         params.append(course_id)
     if section_type and section_type != "All":
-        query += " AND section_type = ?"
+        query += " AND q.section_type = ?"
         params.append(section_type)
     if question_type and question_type != "All":
-        query += " AND question_type = ?"
+        query += " AND q.question_type = ?"
         params.append(question_type)
     query += " ORDER BY RANDOM()"
     rows = conn.execute(query, params).fetchall()
@@ -1642,49 +1763,62 @@ def create_attempt(user_id: int, mode: str, section_type: str,
 
 
 def complete_attempt(attempt_id: int, total: int, correct: int,
-                     section_scores: dict) -> None:
+                     section_scores: dict, completed_at: str | None = None) -> None:
     pct  = round(correct / total * 100, 1) if total else 0
     conn = get_connection()
     conn.execute(
         """UPDATE exam_attempts
-           SET completed_at = CURRENT_TIMESTAMP,
+           SET completed_at = COALESCE(?, CURRENT_TIMESTAMP),
                total_questions = ?, correct_answers = ?,
                raw_score = ?, percent_correct = ?,
                section_scores_json = ?
            WHERE id = ? AND completed_at IS NULL""",
-        (total, correct, correct, pct, json.dumps(section_scores), attempt_id),
+        (completed_at, total, correct, correct, pct, json.dumps(section_scores), attempt_id),
     )
     conn.commit()
     conn.close()
 
 
+def _ensure_user_answer_submitted_at(conn: sqlite3.Connection) -> None:
+    columns = {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in conn.execute("PRAGMA table_info(user_answers)").fetchall()
+    }
+    if "submitted_at" not in columns:
+        conn.execute("ALTER TABLE user_answers ADD COLUMN submitted_at TIMESTAMP")
+
+
 def save_answer(attempt_id: int, question_id: int, selected: str,
                 is_correct: bool, time_spent: float,
-                is_flagged: bool, section_num: int) -> None:
+                is_flagged: bool, section_num: int,
+                submitted_at: str | None = None) -> bool:
     conn = get_connection()
+    _ensure_user_answer_submitted_at(conn)
     inserted = conn.execute(
         """INSERT INTO user_answers
            (attempt_id, question_id, selected_answer, is_correct,
-            time_spent_seconds, is_flagged, section_number)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
+            time_spent_seconds, is_flagged, section_number, submitted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
            ON CONFLICT(attempt_id, question_id, section_number) DO NOTHING""",
         (attempt_id, question_id, selected, int(is_correct),
-         round(time_spent, 2), int(is_flagged), section_num),
+         round(time_spent, 2), int(is_flagged), section_num, submitted_at),
     )
     conn.execute(
         """UPDATE user_answers
            SET selected_answer = ?,
                is_correct = ?,
                time_spent_seconds = ?,
-               is_flagged = ?
+               is_flagged = ?,
+               submitted_at = COALESCE(submitted_at, ?, CURRENT_TIMESTAMP)
            WHERE attempt_id = ? AND question_id = ? AND section_number = ?""",
         (selected, int(is_correct), round(time_spent, 2), int(is_flagged),
-         attempt_id, question_id, section_num),
+         submitted_at, attempt_id, question_id, section_num),
     )
     if inserted.rowcount:
         _update_question_review_state(conn, attempt_id, question_id, is_correct)
     conn.commit()
     conn.close()
+    return bool(inserted.rowcount)
 
 
 def save_exam_draft(
@@ -1752,6 +1886,64 @@ def get_latest_exam_draft(
     return draft
 
 
+def get_exam_drafts(
+    user_id: int,
+    modes: list[str] | tuple[str, ...] | set[str] | None = None,
+    course_id=None,
+) -> list[dict]:
+    """Return every unfinished draft, newest first, for a resume picker."""
+    conn = get_connection()
+    query = (
+        """SELECT ed.*, ea.started_at, ea.section_type
+           FROM exam_drafts ed
+           JOIN exam_attempts ea ON ea.id = ed.attempt_id
+           WHERE ed.user_id = ? AND ea.completed_at IS NULL"""
+    )
+    params: list = [user_id]
+    if modes:
+        placeholders = ",".join("?" for _ in modes)
+        query += f" AND ed.mode IN ({placeholders})"
+        params.extend(list(modes))
+    if course_id is not None:
+        query += " AND (ed.course_id = ? OR ed.course_id IS NULL)"
+        params.append(course_id)
+    query += " ORDER BY ed.updated_at DESC, ed.id DESC"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+
+    drafts = []
+    for row in rows:
+        draft = dict(row)
+        try:
+            draft["state"] = json.loads(draft.get("state_json") or "{}")
+        except json.JSONDecodeError:
+            draft["state"] = {}
+        drafts.append(draft)
+    return drafts
+
+
+def get_exam_draft(user_id: int, attempt_id: int) -> dict | None:
+    """Return one unfinished draft, enforcing ownership."""
+    conn = get_connection()
+    row = conn.execute(
+        """SELECT ed.*, ea.completed_at, ea.started_at, ea.section_type
+           FROM exam_drafts ed
+           JOIN exam_attempts ea ON ea.id = ed.attempt_id
+           WHERE ed.user_id = ? AND ed.attempt_id = ?
+             AND ea.completed_at IS NULL""",
+        (user_id, attempt_id),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    draft = dict(row)
+    try:
+        draft["state"] = json.loads(draft.get("state_json") or "{}")
+    except json.JSONDecodeError:
+        draft["state"] = {}
+    return draft
+
+
 def delete_exam_draft(attempt_id: int) -> None:
     conn = get_connection()
     conn.execute("DELETE FROM exam_drafts WHERE attempt_id = ?", (attempt_id,))
@@ -1781,6 +1973,7 @@ def _update_question_review_state(
     attempt_id: int,
     question_id: int,
     is_correct: bool,
+    answered_at: str | None = None,
 ) -> None:
     """Advance the spaced-review state for one answered question."""
     conn.execute(
@@ -1814,7 +2007,7 @@ def _update_question_review_state(
     if not attempt or not question:
         return
 
-    now = datetime.now()
+    now = datetime.fromisoformat(answered_at) if answered_at else datetime.now()
     existing = conn.execute(
         """SELECT * FROM user_question_review
            WHERE user_id = ? AND question_id = ?""",
@@ -1952,7 +2145,9 @@ _DEFAULTS = {
     "min_difficulty":         "1",
     "max_difficulty":         "5",
     "show_explanations":      "always",
+    "auto_submit_answers":    "false",
     "question_mix":           "balanced",
+    "professional_specialty": "standard",
 }
 
 
@@ -2218,6 +2413,23 @@ def delete_journal_entry(entry_id: int) -> None:
     conn.close()
 
 
+def clear_mistake_journal(user_id: int, course_id: int) -> int:
+    """Delete one user's review deck for a course without deleting score history."""
+    conn = get_connection()
+    cursor = conn.execute(
+        """DELETE FROM mistake_journal
+           WHERE user_id = ?
+             AND question_id IN (
+                 SELECT id FROM questions WHERE course_id = ?
+             )""",
+        (user_id, course_id),
+    )
+    deleted_count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return max(int(deleted_count or 0), 0)
+
+
 def set_mistake_journal_order(user_id: int, ordered_entry_ids: list[int]) -> None:
     """Persist a user's preferred review-queue order."""
     entry_ids = [int(entry_id) for entry_id in ordered_entry_ids]
@@ -2277,6 +2489,303 @@ def set_journal_entry_completed(entry_id: int, is_completed: bool) -> None:
     conn.close()
 
 
+# ── External practice ─────────────────────────────────────────────────────────
+def _ensure_external_practice_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS external_practice_entries (
+               id              INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id         INTEGER NOT NULL,
+               entry_date      TEXT    NOT NULL,
+               source          TEXT    NOT NULL,
+               correct_count   INTEGER NOT NULL DEFAULT 0 CHECK(correct_count >= 0),
+               incorrect_count INTEGER NOT NULL DEFAULT 0 CHECK(incorrect_count >= 0),
+               created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(user_id, entry_date, source),
+               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+           )"""
+    )
+    conn.commit()
+
+
+def normalize_external_practice_source(source: str) -> str:
+    """Return a stable display name for a manually entered practice source."""
+    cleaned = " ".join(str(source or "").strip().split())
+    if not cleaned:
+        raise ValueError("Practice source is required.")
+    if cleaned.casefold() in {
+        "kaplan",
+        "kaplan schweser",
+        "schweser",
+        "schweser kaplan",
+    }:
+        return "Kaplan"
+    return cleaned
+
+
+def save_external_practice_entry(
+    user_id: int,
+    entry_date: str,
+    source: str,
+    correct_count: int,
+    incorrect_count: int,
+) -> None:
+    """Create or replace one user's totals for a source on a calendar date."""
+    source = normalize_external_practice_source(source)
+    correct_count = int(correct_count)
+    incorrect_count = int(incorrect_count)
+    if correct_count < 0 or incorrect_count < 0:
+        raise ValueError("Question counts cannot be negative.")
+
+    conn = get_connection()
+    _ensure_external_practice_table(conn)
+    conn.execute(
+        """INSERT INTO external_practice_entries
+               (user_id, entry_date, source, correct_count, incorrect_count)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, entry_date, source) DO UPDATE SET
+               correct_count = excluded.correct_count,
+               incorrect_count = excluded.incorrect_count,
+               updated_at = CURRENT_TIMESTAMP""",
+        (int(user_id), str(entry_date), source, correct_count, incorrect_count),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_external_practice_entry(
+    user_id: int,
+    entry_id: int,
+    entry_date: str,
+    source: str,
+    correct_count: int,
+    incorrect_count: int,
+) -> bool:
+    """Update one external-practice row if it belongs to the given user."""
+    source = normalize_external_practice_source(source)
+    correct_count = int(correct_count)
+    incorrect_count = int(incorrect_count)
+    if correct_count < 0 or incorrect_count < 0:
+        raise ValueError("Question counts cannot be negative.")
+    if correct_count + incorrect_count == 0:
+        raise ValueError("Enter at least one correct or incorrect question.")
+
+    conn = get_connection()
+    _ensure_external_practice_table(conn)
+    duplicate = conn.execute(
+        """SELECT id FROM external_practice_entries
+           WHERE user_id = ? AND entry_date = ? AND source = ? AND id <> ?""",
+        (int(user_id), str(entry_date), source, int(entry_id)),
+    ).fetchone()
+    if duplicate is not None:
+        conn.close()
+        raise ValueError(
+            "An entry already exists for that date and source. Edit or delete that row instead."
+        )
+
+    updated = conn.execute(
+        """UPDATE external_practice_entries
+           SET entry_date = ?, source = ?, correct_count = ?, incorrect_count = ?,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND user_id = ?""",
+        (
+            str(entry_date),
+            source,
+            correct_count,
+            incorrect_count,
+            int(entry_id),
+            int(user_id),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return bool(updated.rowcount)
+
+
+def delete_external_practice_entry(user_id: int, entry_id: int) -> bool:
+    """Delete one external-practice row if it belongs to the given user."""
+    conn = get_connection()
+    _ensure_external_practice_table(conn)
+    deleted = conn.execute(
+        "DELETE FROM external_practice_entries WHERE id = ? AND user_id = ?",
+        (int(entry_id), int(user_id)),
+    )
+    conn.commit()
+    conn.close()
+    return bool(deleted.rowcount)
+
+
+def get_external_practice_entries(
+    user_id: int,
+    entry_from: str | None = None,
+    entry_to: str | None = None,
+) -> list[dict]:
+    """Return manually entered practice rows, newest first."""
+    conn = get_connection()
+    _ensure_external_practice_table(conn)
+    query = """SELECT id, entry_date, source, correct_count, incorrect_count,
+                      correct_count + incorrect_count AS total_count,
+                      updated_at
+               FROM external_practice_entries
+               WHERE user_id = ?"""
+    params: list = [int(user_id)]
+    if entry_from is not None:
+        query += " AND entry_date >= ?"
+        params.append(str(entry_from))
+    if entry_to is not None:
+        query += " AND entry_date < ?"
+        params.append(str(entry_to))
+    query += " ORDER BY entry_date DESC, source COLLATE NOCASE"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_external_practice_sources(user_id: int) -> list[str]:
+    """Return stable source choices, with Kaplan always available first."""
+    conn = get_connection()
+    _ensure_external_practice_table(conn)
+    rows = conn.execute(
+        """SELECT DISTINCT source
+           FROM external_practice_entries
+           WHERE user_id = ? AND source <> 'Kaplan'
+           ORDER BY source COLLATE NOCASE""",
+        (int(user_id),),
+    ).fetchall()
+    conn.close()
+    return ["Kaplan", *(str(row["source"]) for row in rows)]
+
+
+# ── Active study time ────────────────────────────────────────────────────────
+def _ensure_study_time_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS study_time_entries (
+               id              INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id         INTEGER NOT NULL,
+               attempt_id      INTEGER NOT NULL,
+               course_id       INTEGER NOT NULL,
+               activity_date   TEXT    NOT NULL,
+               mode            TEXT    NOT NULL DEFAULT 'practice',
+               active_seconds  REAL    NOT NULL DEFAULT 0 CHECK(active_seconds >= 0),
+               created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(user_id, attempt_id, course_id, activity_date, mode),
+               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+               FOREIGN KEY (attempt_id) REFERENCES exam_attempts(id) ON DELETE CASCADE,
+               FOREIGN KEY (course_id) REFERENCES courses(id)
+           )"""
+    )
+    conn.commit()
+
+
+def add_study_time(
+    user_id: int,
+    attempt_id: int,
+    course_id: int,
+    active_seconds: float,
+    *,
+    activity_date: str,
+    mode: str = "practice",
+) -> float:
+    """Add a positive active-time interval and return the updated entry total."""
+    seconds = round(max(0.0, float(active_seconds)), 3)
+    if seconds <= 0:
+        return 0.0
+
+    conn = get_connection()
+    _ensure_study_time_table(conn)
+    conn.execute(
+        """INSERT INTO study_time_entries
+               (user_id, attempt_id, course_id, activity_date, mode, active_seconds)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, attempt_id, course_id, activity_date, mode)
+           DO UPDATE SET
+               active_seconds = active_seconds + excluded.active_seconds,
+               updated_at = CURRENT_TIMESTAMP""",
+        (
+            int(user_id),
+            int(attempt_id),
+            int(course_id),
+            str(activity_date),
+            str(mode or "practice"),
+            seconds,
+        ),
+    )
+    row = conn.execute(
+        """SELECT active_seconds FROM study_time_entries
+           WHERE user_id = ? AND attempt_id = ? AND course_id = ?
+             AND activity_date = ? AND mode = ?""",
+        (
+            int(user_id),
+            int(attempt_id),
+            int(course_id),
+            str(activity_date),
+            str(mode or "practice"),
+        ),
+    ).fetchone()
+    conn.commit()
+    conn.close()
+    return float(row["active_seconds"] if row else 0.0)
+
+
+def get_study_time_entries(
+    user_id: int,
+    *,
+    entry_from: str | None = None,
+    entry_to: str | None = None,
+    course_ids: list[int] | tuple[int, ...] | set[int] | None = None,
+    mode: str | None = None,
+) -> list[dict]:
+    """Return daily active-time totals grouped by course and mode."""
+    conn = get_connection()
+    _ensure_study_time_table(conn)
+    query = """SELECT ste.activity_date, ste.course_id, c.title AS course_title,
+                      ste.mode, SUM(ste.active_seconds) AS active_seconds
+               FROM study_time_entries ste
+               JOIN courses c ON c.id = ste.course_id
+               WHERE ste.user_id = ?"""
+    params: list = [int(user_id)]
+    if entry_from is not None:
+        query += " AND ste.activity_date >= ?"
+        params.append(str(entry_from))
+    if entry_to is not None:
+        query += " AND ste.activity_date < ?"
+        params.append(str(entry_to))
+    if course_ids:
+        normalized_ids = sorted({int(course_id) for course_id in course_ids})
+        placeholders = ",".join("?" for _ in normalized_ids)
+        query += f" AND ste.course_id IN ({placeholders})"
+        params.extend(normalized_ids)
+    if mode is not None:
+        query += " AND ste.mode = ?"
+        params.append(str(mode))
+    query += " GROUP BY ste.activity_date, ste.course_id, c.title, ste.mode"
+    query += " ORDER BY ste.activity_date DESC, c.title COLLATE NOCASE"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_study_time_total(
+    user_id: int,
+    *,
+    entry_from: str | None = None,
+    entry_to: str | None = None,
+    course_id: int | None = None,
+    mode: str | None = None,
+) -> float:
+    """Return total active seconds for the requested user/date/course scope."""
+    course_ids = [int(course_id)] if course_id is not None else None
+    rows = get_study_time_entries(
+        user_id,
+        entry_from=entry_from,
+        entry_to=entry_to,
+        course_ids=course_ids,
+        mode=mode,
+    )
+    return sum(float(row.get("active_seconds") or 0.0) for row in rows)
+
+
 # ── Analytics raw queries ─────────────────────────────────────────────────────
 def get_answer_stats(
     user_id: int,
@@ -2284,18 +2793,37 @@ def get_answer_stats(
     course_ids=None,
     completed_from=None,
     completed_to=None,
+    include_in_progress_practice: bool = False,
+    include_answer_details: bool = False,
 ) -> list:
     conn   = get_connection()
-    query  = """
-        SELECT ua.attempt_id, ua.is_correct, ua.time_spent_seconds, ua.is_flagged,
+    if include_in_progress_practice:
+        _ensure_user_answer_submitted_at(conn)
+    activity_time = (
+        "COALESCE(ua.submitted_at, ea.completed_at)"
+        if include_in_progress_practice
+        else "ea.completed_at"
+    )
+    completion_filter = (
+        "(ea.completed_at IS NOT NULL OR "
+        "(ea.mode = 'practice' AND ua.submitted_at IS NOT NULL))"
+        if include_in_progress_practice
+        else "ea.completed_at IS NOT NULL"
+    )
+    answer_details = (
+        "ua.id AS answer_id, ua.question_id, ua.selected_answer,"
+        if include_answer_details else ""
+    )
+    query  = f"""
+        SELECT {answer_details} ua.attempt_id, ua.is_correct, ua.time_spent_seconds, ua.is_flagged,
                q.section_type, q.question_type, q.difficulty,
                q.course_id as question_course_id, c.title as course_title,
-               ea.mode, ea.completed_at, ea.course_id
+               ea.mode, {activity_time} AS completed_at, ea.course_id
         FROM user_answers ua
         JOIN exam_attempts ea ON ua.attempt_id = ea.id
         JOIN questions q      ON ua.question_id = q.id
         LEFT JOIN courses c   ON q.course_id = c.id
-        WHERE ea.user_id = ? AND ea.completed_at IS NOT NULL"""
+        WHERE ea.user_id = ? AND {completion_filter}"""
     params = [user_id]
     if course_ids is not None:
         course_ids = [cid for cid in course_ids if cid is not None]
@@ -2309,12 +2837,12 @@ def get_answer_stats(
         query += " AND q.course_id = ?"
         params.append(course_id)
     if completed_from is not None:
-        query += " AND ea.completed_at >= ?"
+        query += f" AND {activity_time} >= ?"
         params.append(str(completed_from))
     if completed_to is not None:
-        query += " AND ea.completed_at < ?"
+        query += f" AND {activity_time} < ?"
         params.append(str(completed_to))
-    query += " ORDER BY ea.completed_at"
+    query += f" ORDER BY {activity_time}"
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -2536,6 +3064,7 @@ def replace_course_modules(course_id: int, module_names: list[str]) -> tuple:
 def create_material(course_id: int, title: str,
                     material_type: str, content_text: str = "",
                     external_url: str = "", notes: str = "",
+                    stored_file_path: str = "",
                     created_by_user_id=None,
                     display_order: int = 0,
                     estimated_minutes: int = 0,
@@ -2569,12 +3098,12 @@ def create_material(course_id: int, title: str,
     cur = conn.execute(
         """INSERT INTO course_materials
            (course_id, created_by_user_id, title, normalized_title,
-            material_type, content_text, external_url, notes,
+            material_type, content_text, external_url, stored_file_path, notes,
             material_section, module_name,
             display_order, estimated_minutes, is_active)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (course_id, created_by_user_id, title.strip(), nt,
-         material_type, content_text, external_url.strip(), notes,
+         material_type, content_text, external_url.strip(), stored_file_path.strip(), notes,
          material_section if material_section in MATERIAL_SECTIONS else "Module",
          module_name.strip(),
          display_order, estimated_minutes, is_active),
@@ -2607,6 +3136,7 @@ def get_materials(course_id: int) -> list:
 
 def update_material(material_id: int, title: str, material_type: str,
                     content_text: str, external_url: str, notes: str,
+                    stored_file_path: str | None = None,
                     display_order: int = 0,
                     estimated_minutes: int = 0,
                     material_section: str = "Module",
@@ -2616,14 +3146,15 @@ def update_material(material_id: int, title: str, material_type: str,
     conn.execute(
         """UPDATE course_materials
            SET title = ?, normalized_title = ?, material_type = ?,
-               content_text = ?, external_url = ?, notes = ?,
+               content_text = ?, external_url = ?,
+               stored_file_path = COALESCE(?, stored_file_path), notes = ?,
                material_section = ?, module_name = ?,
                display_order = ?, estimated_minutes = ?,
                is_active = COALESCE(?, is_active),
                updated_at = CURRENT_TIMESTAMP
            WHERE id = ?""",
         (title.strip(), _normalize_title(title), material_type, content_text,
-         external_url.strip(), notes,
+         external_url.strip(), stored_file_path, notes,
          material_section if material_section in MATERIAL_SECTIONS else "Module",
          module_name.strip(), display_order, estimated_minutes, is_active, material_id),
     )

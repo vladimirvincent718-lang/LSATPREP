@@ -46,6 +46,9 @@ sidebar_nav(username)
 page_header("🎓 Curriculum Builder",
             "Group courses into larger learning paths")
 
+from src.exam_planning import render_exam_settings
+render_exam_settings(user_id, get_all_curriculums())
+
 real_admin, admin = get_effective_admin(user_id)
 
 # ── Tab setup ─────────────────────────────────────────────────────────────────

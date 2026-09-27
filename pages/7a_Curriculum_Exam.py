@@ -26,13 +26,14 @@ from src.database   import (
     get_curriculum_courses, get_weight_presets,
     get_all_questions, get_course_question_count,
     get_attempt_answers, create_weight_preset,
-    init_curriculum_tables,
+    init_curriculum_tables, get_exam_drafts,
 )
 from src.exam_engine import (
     start_quiz, submit_section, is_active, current_question,
     next_question, prev_question, record_answer, record_self_grade, toggle_flag,
     seconds_remaining, is_timed_out, clear_quiz,
-    persist_current_exam, restore_exam_draft, _K, _st, _set, format_time,
+    persist_current_exam, restore_exam_draft, suspend_current_exam,
+    _K, _st, _set, format_time,
 )
 from src.question_loader import is_open_ended_question
 from src.question_map import render_question_map, render_question_map_legend
@@ -40,8 +41,10 @@ from src.curriculum_allocation import (
     equal_allocation, preset_allocation, manual_allocation, random_allocation,
     AllocationResult,
 )
-from src.pdf_export import generate_exam_pdf, make_pdf_filename
+from src.pdf_export import make_pdf_filename
+from src.offline_exams import export_offline_exam
 from src.email_notifications import notify_exam_started
+from src.question_ordering import arrange_question_dependencies
 from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Curriculum Exam · StudyForge",
@@ -51,7 +54,6 @@ init_curriculum_tables()
 user_id  = require_login()
 username = st.session_state.get("username", "")
 sidebar_nav(username)
-restore_exam_draft(user_id, modes={"curriculum_exam"})
 page_header("📝 Curriculum Exam Builder",
             "Build exams from a single course, multiple courses, or a full curriculum")
 
@@ -71,6 +73,9 @@ if email_notice:
 if st.session_state.pop("_exam_restored_notice", False):
     st.success("Your in-progress exam was restored with your saved answers and remaining time.")
 
+if st.session_state.pop("_exam_exit_notice", False):
+    st.success("Exam saved. You can resume it below or start another exam.")
+
 def get_stage():  return st.session_state.get(KEY_STAGE, "setup")
 def set_stage(s): st.session_state[KEY_STAGE] = s
 
@@ -79,20 +84,36 @@ def _launch_exam(uid, questions, label, timed, mins, course_id, dist):
     if not questions:
         st.error("No questions assembled. Check settings and try again.")
         return
-    st.session_state[KEY_EXAM_PDF] = generate_exam_pdf(
-        questions=questions,
-        title=label,
-        subtitle="Generated practice test",
-        distribution=dist,
+    course_ids = {
+        question.get("course_id")
+        for question in questions
+        if question.get("course_id") is not None
+    }
+    available_questions = []
+    for selected_course_id in course_ids:
+        available_questions.extend(get_all_questions(course_id=selected_course_id))
+    questions = arrange_question_dependencies(
+        questions,
+        available_questions or questions,
+        target_count=len(questions),
     )
-    st.session_state[KEY_EXAM_PDF_NAME] = make_pdf_filename(label)
     start_quiz(
-        user_id=uid, mode="curriculum_exam", questions=questions,
+        user_id=uid,
+        mode="mock_exam" if str(label).startswith("Weighted Mock:") else "curriculum_exam",
+        questions=questions,
         section_type="Mixed", hard_mode=False,
         time_limit_seconds=(mins * 60) if timed else 0,
         section_num=1, course_id=course_id,
         open_ended_mode=st.session_state.get(KEY_OPEN_ENDED_MODE, False),
     )
+    st.session_state[KEY_EXAM_PDF] = export_offline_exam(
+        user_id=uid, attempt_id=st.session_state.get("exam_attempt_id"),
+        questions=st.session_state.get("exam_questions", questions),
+        title=label,
+        subtitle="Generated practice test",
+        distribution=dist,
+    )
+    st.session_state[KEY_EXAM_PDF_NAME] = make_pdf_filename(label)
     course_name = dist[0].get("course", "Course") if len(dist or []) == 1 else "Multiple Courses"
     result = notify_exam_started(
         uid,
@@ -278,12 +299,14 @@ if get_stage() == "running":
             st.session_state[KEY_CONFIRM_SUBMIT] = True
             st.rerun()
     with c_quit:
-        if st.button("Quit", use_container_width=True):
+        if st.button("Save & Exit", use_container_width=True):
+            suspend_current_exam(user_id)
             set_stage("setup")
             for k in [KEY_DISTRIBUTION, KEY_EXAM_PDF, KEY_EXAM_PDF_NAME]:
                 st.session_state.pop(k, None)
             st.session_state.pop(KEY_CONFIRM_SUBMIT, None)
-            clear_quiz(); st.rerun()
+            st.session_state["_exam_exit_notice"] = True
+            st.rerun()
     if st.session_state.get(KEY_CONFIRM_SUBMIT):
         detail = (
             f" {unanswered} question(s) are unanswered."
@@ -329,6 +352,34 @@ if get_stage() == "running":
 # ═════════════════════════════════════════════════════════════════════════════
 # SETUP
 # ═════════════════════════════════════════════════════════════════════════════
+saved_exams = get_exam_drafts(user_id, modes={"curriculum_exam"})
+if saved_exams:
+    st.subheader("Exams in progress")
+    st.caption("Resume any saved exam, or keep scrolling to build another one.")
+    for draft in saved_exams:
+        state = draft.get("state") or {}
+        label = state.get(KEY_EXAM_SOURCE) or "Practice Exam"
+        questions = state.get(_K["questions"]) or []
+        answers = state.get(_K["answers"]) or {}
+        info_col, resume_col = st.columns([4, 1])
+        info_col.markdown(
+            f"**{label}**  \n"
+            f"{len(answers)}/{len(questions)} answered · saved {draft.get('updated_at', '')}"
+        )
+        if resume_col.button(
+            "Resume",
+            key=f"resume_curriculum_exam_{draft['attempt_id']}",
+            use_container_width=True,
+        ):
+            if restore_exam_draft(
+                user_id,
+                modes={"curriculum_exam"},
+                attempt_id=int(draft["attempt_id"]),
+            ):
+                st.rerun()
+            st.error("That exam is no longer available to resume.")
+    st.divider()
+
 st.subheader("Step 1 - Choose Exam Source")
 SOURCE_OPTIONS = [
     "Single Course",
@@ -352,6 +403,10 @@ st.checkbox(
 )
 
 
+from src.study_progress import load_progress, status, label as progress_label, render_selector_colors
+progress = load_progress(user_id)
+render_selector_colors()
+
 # ── A: Single Course ──────────────────────────────────────────────────────────
 if source == SOURCE_OPTIONS[0]:
     st.subheader("Single Course Exam")
@@ -359,7 +414,7 @@ if source == SOURCE_OPTIONS[0]:
         st.warning("No courses available."); st.stop()
     cid_map = {c["id"]: c["title"] for c in all_courses}
     sel_cid = st.selectbox("Course", list(cid_map.keys()),
-                           format_func=lambda x: cid_map[x], key="sc_cid")
+                           format_func=lambda x: progress_label(cid_map[x], status(progress, [x]), progress["window"]), key="sc_cid")
     q_count = get_course_question_count(sel_cid)
     st.caption(f"Available questions: **{q_count}**")
     if q_count < 1:
@@ -383,7 +438,7 @@ elif source == SOURCE_OPTIONS[1]:
         st.warning("No courses available."); st.stop()
     cid_map  = {c["id"]: c["title"] for c in all_courses}
     sel_cids = st.multiselect("Select courses to include", list(cid_map.keys()),
-                              format_func=lambda x: cid_map[x], key="mc_cids")
+                              format_func=lambda x: progress_label(cid_map[x], status(progress, [x]), progress["window"]), key="mc_cids")
     total_avail = sum(get_course_question_count(cid) for cid in sel_cids)
     if sel_cids: st.caption(f"Total available: **{total_avail}**")
     max_sl = max(5, min(total_avail, 200)) if sel_cids else 5
@@ -427,7 +482,7 @@ elif source == SOURCE_OPTIONS[2]:
         "Courses to include (default: all)",
         options=all_cids,
         default=all_cids,
-        format_func=lambda x: next(c["title"] for c in curr_courses if c["id"] == x),
+        format_func=lambda x: progress_label(next(c["title"] for c in curr_courses if c["id"] == x), status(progress, [x]), progress["window"]),
         key="cs_sel_courses",
     )
     if not sel_cids:
@@ -653,7 +708,7 @@ elif source == SOURCE_OPTIONS[4]:
         "Courses to include in the random mix",
         options=list(cid_map.keys()),
         default=list(cid_map.keys())[:min(4, len(all_courses))],
-        format_func=lambda x: cid_map[x],
+        format_func=lambda x: progress_label(cid_map[x], status(progress, [x]), progress["window"]),
         key="rm_cids",
     )
     if not sel_cids:

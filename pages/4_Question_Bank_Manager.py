@@ -17,7 +17,37 @@ import streamlit as st
 import pandas as pd
 import io
 import re
+import html
 from datetime import datetime
+
+
+def _select_detail_question(question_id: int) -> None:
+    """Move the detail selector before Streamlit instantiates its widget."""
+    st.session_state["qbm_detail_question_id"] = question_id
+
+
+def _browser_searchable_question_index(
+    questions: list[dict],
+    course_titles: dict[int, str],
+) -> str:
+    """Render grid references as real DOM text for browser Find."""
+    items = []
+    for q in questions:
+        bank_id = html.escape(str(q.get("id", "")))
+        master_id = html.escape(str(q.get("question_id", "")))
+        course = html.escape(course_titles.get(q.get("course_id"), ""))
+        stimulus = html.escape(" ".join(str(q.get("stimulus", "")).split()))
+        items.append(
+            f'<div class="qbm-browser-index-row" role="listitem" '
+            f'id="qbm-browser-question-{bank_id}">'
+            f'<strong>#{bank_id}</strong> · {master_id} · {course} · {stimulus}'
+            "</div>"
+        )
+
+    return """
+        <div class="qbm-browser-index" role="list"
+             aria-label="Browser-searchable question index">
+    """ + "".join(items) + "</div>"
 
 
 def _clean_module_label(value: str) -> str:
@@ -124,6 +154,7 @@ def _question_bank_analytics_rows(selected_course_ids: list[int],
     return rows
 
 from src.auth            import require_login
+from src.course_material_nav import course_material_nav
 from src.utils           import (
     page_header, sidebar_nav, require_course, DIFFICULTY_LABELS,
     get_effective_admin, question_reference_label,
@@ -151,52 +182,96 @@ user_id  = require_login()
 username = st.session_state.get("username", "")
 sidebar_nav(username)
 
-course_id    = require_course(user_id)
-course       = get_course(course_id)
-course_title = course["title"] if course else "Unknown"
 real_admin, admin = get_effective_admin(user_id)
 
 page_header("🗂 Question Bank Manager",
-            "Shared questions across active courses")
+            "Build, import, and manage question banks across subjects")
+course_material_nav("questions")
 
-# ── Build tabs based on role ──────────────────────────────────────────────────
-if admin:
-    tab_browse, tab_reports, tab_archive, tab_upload, tab_template = st.tabs(
-        ["🔎 Browse Questions", "Report Issues", "Archived Questions", "⬆️ Upload Files", "📄 Download Template"]
-    )
+available_courses = get_all_courses() if admin else get_enrolled_courses(user_id)
+course_options = {c["id"]: c["title"] for c in available_courses}
+if not course_options:
+    st.info("No courses are available. Add a course or enroll in one to manage its question bank.")
+    st.stop()
+if st.session_state.get("qbm_course_id") not in course_options:
+    active = st.session_state.get("active_course_id")
+    st.session_state["qbm_course_id"] = active if active in course_options else next(iter(course_options))
+course_id = st.selectbox("Subject / course", list(course_options),
+                         format_func=lambda cid: course_options[cid], key="qbm_course_id")
+course = get_course(course_id)
+course_title = course_options[course_id]
+if st.session_state.get("_qbm_scope") != course_id:
+    # Clear pending upload files and course-bound filters before their widgets render.
+    for key in list(st.session_state):
+        if key.startswith(("qbank_", "qbm_detail_", "_qbm_last_search", "b_",
+                           "ccrn_convert_batches", "ccrn_import_batches", "ccrn_bulk_")):
+            del st.session_state[key]
+    st.session_state["qbm_browse_courses"] = [course_id]
+    st.session_state["answer_key_courses"] = [course_id]
+    st.session_state["qir_course_filter"] = [course_id]
+    st.session_state["qbm_archive_course_filter"] = [course_id]
+    st.session_state["_qbm_scope"] = course_id
+
+from src.question_lenses import get_lenses, question_lens
+LENSES = get_lenses()
+lens_filter = st.selectbox("Question lens", ["all", *LENSES],
+    format_func=lambda value: "All lenses" if value == "all" else LENSES[value], key="b_lens")
+st.caption("Choose the lens once here for this workspace and new import batches. All lenses shows every lens and creates new batches as Standard / no lens. Existing batches retain their saved labels until you explicitly apply this selection.")
+
+is_ccrn = course_title.strip().casefold() == "neonatal ccrn"
+labels = ["Dashboard", "Coverage", "Paste & Batch Import", "Manage Questions"]
+if is_ccrn:
+    labels.append("Exam Preparation")
+workspace_tabs = st.tabs(labels)
+tab_dashboard, tab_coverage, tab_imports, tab_manage = workspace_tabs[:4]
+tab_queue = tab_imports
+with tab_imports:
+    st.caption(f"Import destination: {course_title}. Paste, convert, review, and import saved batches below.")
+    if not admin:
+        st.info("An administrator can import questions for this subject.")
+with tab_manage:
+    manage_labels = ["Browse Questions"]
+    if is_ccrn:
+        manage_labels.append("Module & Batch Filters")
+    if admin:
+        manage_labels += ["Report Issues", "Archived Questions", "Answer Key", "Lenses"]
+    manage_tabs = dict(zip(manage_labels, st.tabs(manage_labels)))
+    tab_browse = manage_tabs["Browse Questions"]
+    tab_reports = manage_tabs.get("Report Issues")
+    tab_archive = manage_tabs.get("Archived Questions")
+    tab_answer_key = manage_tabs.get("Answer Key")
+
+if is_ccrn:
+    from src.neonatal_ccrn import ensure_schema_and_catalog
+    from src.ccrn_bank_workspace import render_ccrn_workspace
+    ensure_schema_and_catalog()
+    render_ccrn_workspace(course_id, user_id, admin, [
+        tab_dashboard, workspace_tabs[4], tab_coverage, tab_queue,
+        manage_tabs["Module & Batch Filters"],
+    ])
 else:
-    tab_browse, tab_template = st.tabs(
-        ["🔎 Browse Questions", "📄 Download Template"]
-    )
-    tab_upload = None
-    tab_reports = None
-    tab_archive = None
+    from src.question_bank_workspace import render_subject_workspace
+    render_subject_workspace(course_id, course_title, user_id, admin,
+                             tab_dashboard, tab_coverage, tab_queue)
 
+
+if admin:
+    with tab_answer_key:
+        from src.answer_key_ui import render_answer_key
+        key_scope = [course_id]
+        render_answer_key(key_scope, user_id)
+
+if admin:
+    with manage_tabs['Lenses']:
+        from src.question_lens_ui import render_lens_manager
+        render_lens_manager(course_id, course_title)
 
 # ── Tab: Browse ───────────────────────────────────────────────────────────────
 with tab_browse:
     browse_courses = get_all_courses() if admin else get_enrolled_courses(user_id)
     course_titles = {c["id"]: c["title"] for c in browse_courses}
     course_counts = {c["id"]: get_course_question_count(c["id"]) for c in browse_courses}
-    default_course_ids = (
-        [course_id]
-        if course_id in course_titles
-        else ([browse_courses[0]["id"]] if browse_courses else [])
-    )
-
-    selected_course_ids = st.multiselect(
-        "Active Courses",
-        options=list(course_titles.keys()),
-        default=default_course_ids,
-        format_func=lambda cid: f"{course_titles[cid]} ({course_counts.get(cid, 0)} Q)",
-        help="Type to search, then select one or more courses to browse.",
-        key="qbm_browse_courses",
-    )
-    selected_course_ids = [cid for cid in selected_course_ids if cid in course_titles]
-
-    if not selected_course_ids:
-        st.warning("Select at least one active course to browse its question bank.")
-        st.stop()
+    selected_course_ids = [course_id]
 
     total = sum(course_counts.get(cid, 0) for cid in selected_course_ids)
     metric_label = (
@@ -204,13 +279,16 @@ with tab_browse:
         if len(selected_course_ids) == 1
         else "Questions in selected courses"
     )
-    st.metric(metric_label, total)
+    matching_count = sum(1 for q in get_all_questions(course_id=course_id)
+                         if lens_filter == 'all' or question_lens(q) == lens_filter)
+    st.metric(metric_label + (f" · {LENSES[lens_filter]}" if lens_filter != 'all' else ''), matching_count)
+    st.caption(f"{total:,} total active questions in this subject across all lenses.")
 
     if total == 0:
         selected_names = ", ".join(course_titles[cid] for cid in selected_course_ids)
-        msg = f"No questions in **{selected_names}** yet."
+        msg = f"No questions in **{selected_names}** yet." if selected_names else "No courses selected for browsing."
         if admin:
-            msg += " Use the **Upload CSV** tab above to add questions."
+            msg += " Use the **Paste & Batch Import** tab above to add questions."
         else:
             msg += " An admin will upload questions soon."
         st.info(msg)
@@ -265,6 +343,10 @@ with tab_browse:
             ],
             key="qbm_question_search_fields",
         )
+        st.caption(
+            "Tip: this search automatically opens the first matching question below. "
+            "For Ctrl+F or Cmd+F, use the browser-searchable index beneath the filters."
+        )
         if q_search.strip() and not q_search_fields:
             st.warning("Choose at least one column to search.")
 
@@ -277,6 +359,9 @@ with tab_browse:
                 max_difficulty=d_max,
                 course_id=cid,
             ))
+        if lens_filter != "all":
+            questions = [q for q in questions if question_lens(q) == lens_filter]
+        st.caption(f"{len(questions):,} questions match the selected filters and lens.")
         questions.sort(
             key=lambda q: (
                 course_titles.get(q.get("course_id"), ""),
@@ -284,6 +369,9 @@ with tab_browse:
                 q.get("id") or 0,
             )
         )
+        # Keep the non-text-filtered list for Previous/Next. A Bank # search may
+        # return one row, but the user still needs to inspect its nearest neighbor.
+        navigation_questions = list(questions)
         questions = _filter_questions_by_column_search(
             questions,
             query=q_search,
@@ -292,11 +380,59 @@ with tab_browse:
             course_titles=course_titles,
         )
 
+        navigation_ids = [q["id"] for q in navigation_questions]
+        search_signature = (
+            q_search.strip(),
+            q_match_mode,
+            tuple(q_search_fields),
+            tuple(q["id"] for q in questions),
+        )
+        if q_search.strip() and questions:
+            if st.session_state.get("_qbm_last_search_signature") != search_signature:
+                st.session_state["qbm_detail_question_id"] = questions[0]["id"]
+            st.session_state["_qbm_last_search_signature"] = search_signature
+        else:
+            st.session_state["_qbm_last_search_signature"] = None
+
+        if (
+            navigation_ids
+            and st.session_state.get("qbm_detail_question_id") not in navigation_ids
+        ):
+            st.session_state["qbm_detail_question_id"] = navigation_ids[0]
+
         st.caption(f"{len(questions)} question(s) match the filters")
 
         if not questions:
             st.info("No questions match those filters.")
         else:
+            st.markdown("##### Browser-searchable question index")
+            st.caption(
+                "Use Ctrl+F (Windows) or Cmd+F (Mac) here. Browser Find will scroll "
+                "this index to the matching Bank # and keep nearby questions visible."
+            )
+            # Keep the style and content in separate HTML elements. The app's
+            # global theme intentionally hides style-only Streamlit containers.
+            st.html("""
+                <style>
+                    .qbm-browser-index {
+                        max-height: 11rem;
+                        overflow: auto;
+                        border: 1px solid rgba(128, 128, 128, 0.28);
+                        border-radius: 0.5rem;
+                        background: rgba(128, 128, 128, 0.04);
+                        scroll-padding-block: 2.5rem;
+                    }
+                    .qbm-browser-index-row {
+                        padding: 0.38rem 0.65rem;
+                        border-bottom: 1px solid rgba(128, 128, 128, 0.16);
+                        font-size: 0.84rem;
+                        line-height: 1.3;
+                    }
+                    .qbm-browser-index-row:last-child { border-bottom: 0; }
+                </style>
+            """)
+            st.html(_browser_searchable_question_index(questions, course_titles))
+
             export_rows = []
             for q in questions:
                 export_rows.append({
@@ -397,6 +533,7 @@ with tab_browse:
                     ]
                 }
             }
+            previously_selected_ids = set(st.session_state["_qbm_selected_ids"])
             visible_signature = abs(hash(tuple(int(q["id"]) for q in questions)))
             grid_event = st.dataframe(
                 df_all.drop(columns=["ID"]),
@@ -415,11 +552,18 @@ with tab_browse:
             )
 
             # Sync native row selection to our selected question IDs.
-            st.session_state["_qbm_selected_ids"] = {
+            grid_selected_ids = {
                 int(df_all.iloc[i]["ID"])
                 for i in grid_event.selection.rows
                 if 0 <= i < len(df_all)
             }
+            st.session_state["_qbm_selected_ids"] = grid_selected_ids
+
+            # A row click also opens that question in the detail panel. Keep this
+            # separate from Select All so bulk actions do not unexpectedly move it.
+            newly_selected_ids = grid_selected_ids - previously_selected_ids
+            if len(newly_selected_ids) == 1:
+                st.session_state["qbm_detail_question_id"] = newly_selected_ids.pop()
 
             selected_ids = list(st.session_state["_qbm_selected_ids"])
             n_selected   = len(selected_ids)
@@ -479,18 +623,50 @@ with tab_browse:
             # ── Single-question detail & delete (existing feature preserved) ──
             st.divider()
             st.markdown("#### View Question Detail" + (" / Delete" if admin else ""))
-            q_ids    = [q["id"] for q in questions]
+            q_ids    = navigation_ids
             q_labels = {
                 q["id"]: f"#{q['id']} · {q.get('question_id','')} · "
                          f"{course_titles.get(q.get('course_id'), '')} · "
                          f"{str(q.get('stimulus',''))[:50]}"
-                for q in questions
+                for q in navigation_questions
             }
-            sel_qid = st.selectbox("Select question:", q_ids,
-                                    format_func=lambda x: q_labels.get(x, str(x)))
+
+            selected_index = q_ids.index(st.session_state["qbm_detail_question_id"])
+            prev_col, select_col, next_col = st.columns([1, 4, 1])
+            with prev_col:
+                st.button(
+                    "← Previous",
+                    disabled=selected_index == 0,
+                    use_container_width=True,
+                    key="qbm_previous_question",
+                    on_click=_select_detail_question,
+                    args=(q_ids[max(0, selected_index - 1)],),
+                )
+            with select_col:
+                sel_qid = st.selectbox(
+                    "Select question:",
+                    q_ids,
+                    format_func=lambda x: q_labels.get(x, str(x)),
+                    key="qbm_detail_question_id",
+                )
+            with next_col:
+                st.button(
+                    "Next →",
+                    disabled=selected_index == len(q_ids) - 1,
+                    use_container_width=True,
+                    key="qbm_next_question",
+                    on_click=_select_detail_question,
+                    args=(q_ids[min(len(q_ids) - 1, selected_index + 1)],),
+                )
+
+            selected_index = q_ids.index(sel_qid)
+            st.caption(
+                f"Question {selected_index + 1} of {len(q_ids)} in the current "
+                "course and filters. Previous/Next remains available while searching."
+            )
 
             if sel_qid:
-                q = next((x for x in questions if x["id"] == sel_qid), None)
+                q = next((x for x in navigation_questions if x["id"] == sel_qid), None)
                 if q:
                     with st.expander("📋 Full Question Details", expanded=True):
                         ref_label = question_reference_label(q)
@@ -564,7 +740,7 @@ if tab_reports is not None:
         admin_courses = get_all_courses()
         admin_course_ids = [c["id"] for c in admin_courses]
         admin_course_titles = {c["id"]: c["title"] for c in admin_courses}
-        metrics = get_question_issue_metrics(admin_course_ids)
+        metrics = get_question_issue_metrics([course_id])
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Total", metrics.get("total", 0))
         m2.metric("New", metrics.get("new_count", 0))
@@ -581,13 +757,8 @@ if tab_reports is not None:
                 key="qir_status_filter",
             )
         with f2:
-            report_course_ids = st.multiselect(
-                "Courses",
-                options=admin_course_ids,
-                default=admin_course_ids,
-                format_func=lambda cid: admin_course_titles.get(cid, str(cid)),
-                key="qir_course_filter",
-            )
+            report_course_ids = [course_id]
+
         with f3:
             report_search = st.text_input(
                 "Search",
@@ -693,13 +864,8 @@ if tab_archive is not None:
 
         af1, af2 = st.columns([2, 2])
         with af1:
-            selected_archive_course_ids = st.multiselect(
-                "Courses",
-                options=archive_course_ids,
-                default=archive_course_ids,
-                format_func=lambda cid: archive_course_titles.get(cid, str(cid)),
-                key="qbm_archive_course_filter",
-            )
+            selected_archive_course_ids = [course_id]
+
         with af2:
             archive_search = st.text_input(
                 "Search archived questions",
@@ -794,194 +960,3 @@ if tab_archive is not None:
                         archive_question(q["id"], q.get("archive_reason") or "Issue reported")
                         st.success("Question remains archived.")
                         st.rerun()
-
-
-if tab_upload is not None:
-    with tab_upload:
-        st.markdown("### Upload Questions to a Shared Course")
-        st.info(
-            "Questions you upload become immediately available to **all users "
-            "enrolled in the selected course**. You only need to upload once.  \n"
-            "**Duplicates are detected automatically** — re-uploading the same "
-            "file will not create duplicate questions."
-        )
-
-        # Allow admin to choose any course, not just active one
-        all_courses = get_all_courses()
-        course_map  = {c["id"]: c["title"] for c in all_courses}
-        target_id = st.selectbox(
-            "Upload to course:",
-            list(course_map.keys()),
-            format_func=lambda x: course_map[x],
-            index=list(course_map.keys()).index(course_id)
-                  if course_id in course_map else 0,
-            key="upload_course_sel",
-        )
-        target_title = course_map.get(target_id, "")
-
-        if "qbank_upload_nonce" not in st.session_state:
-            st.session_state["qbank_upload_nonce"] = 0
-
-        last_upload = st.session_state.get("qbank_last_upload")
-        if last_upload:
-            totals = last_upload["totals"]
-            st.success(
-                f"✅ Import complete: **{totals['inserted']}** new question(s) "
-                f"added to **{last_upload['course_title']}** from "
-                f"**{last_upload['file_count']}** file(s)."
-            )
-
-            with st.expander("Last upload summary", expanded=True):
-                mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-                mc1.metric("Rows in files", totals["rows_read"])
-                mc2.metric("✅ Inserted", totals["inserted"])
-                mc3.metric("⏭ Skipped (ID conflict)", totals["skipped_id"])
-                mc4.metric("⏭ Skipped (same content)", totals["skipped_content"])
-                mc5.metric("❌ Invalid rows", totals["invalid"])
-
-                if last_upload["results"]:
-                    st.markdown("**Per-file results**")
-                    for file_name, result in last_upload["results"]:
-                        st.caption(
-                            f"**{file_name}**: "
-                            f"{result['rows_read']} row(s), "
-                            f"{result['inserted']} inserted, "
-                            f"{result['skipped_content']} duplicate content, "
-                            f"{result['invalid']} invalid"
-                        )
-
-                if totals["errors"]:
-                    st.markdown("**Validation errors**")
-                    for e in totals["errors"][:30]:
-                        st.caption(f"• {e}")
-                    if len(totals["errors"]) > 30:
-                        st.caption(
-                            f"… and {len(totals['errors']) - 30} more. "
-                            "Fix these in your files and re-upload."
-                        )
-
-        uploaded_files = st.file_uploader(
-            "Choose CSV or Excel files",
-            type=["csv", "xlsx", "xlsm", "xls"],
-            accept_multiple_files=True,
-            help="Select one file, or hold Ctrl/Shift to select a batch.",
-            key=f"qbank_upload_{st.session_state['qbank_upload_nonce']}",
-        )
-
-        if uploaded_files:
-            total_size = sum(file.size for file in uploaded_files)
-            st.markdown(
-                f"**Selected:** {len(uploaded_files)} file(s) "
-                f"({total_size:,} bytes total)"
-            )
-            with st.expander("Selected files", expanded=len(uploaded_files) <= 5):
-                for file in uploaded_files:
-                    st.caption(f"• {file.name} ({file.size:,} bytes)")
-
-            if st.button("✅ Import Questions", type="primary"):
-                results = []
-                totals = {
-                    "rows_read": 0,
-                    "valid_rows": 0,
-                    "inserted": 0,
-                    "skipped_id": 0,
-                    "skipped_content": 0,
-                    "invalid": 0,
-                    "errors": [],
-                }
-
-                with st.spinner("Processing selected files…"):
-                    for file in uploaded_files:
-                        result = process_upload(file, course_id=target_id)
-                        results.append((file.name, result))
-                        for key in [
-                            "rows_read",
-                            "valid_rows",
-                            "inserted",
-                            "skipped_id",
-                            "skipped_content",
-                            "invalid",
-                        ]:
-                            totals[key] += result[key]
-                        totals["errors"].extend(
-                            f"{file.name}: {error}" for error in result["errors"]
-                        )
-
-                st.session_state["qbank_last_upload"] = {
-                    "course_title": target_title,
-                    "file_count": len(uploaded_files),
-                    "totals": totals,
-                    "results": results,
-                }
-                st.session_state["qbank_upload_nonce"] += 1
-                st.rerun()
-
-        st.divider()
-        st.metric(
-            "Questions currently in " + target_title,
-            get_course_question_count(target_id),
-        )
-
-        # Quick duplicate-detection explainer
-        with st.expander("ℹ️ How duplicate detection works", expanded=False):
-            st.markdown("""
-**Two layers of duplicate detection:**
-
-1. **Generated master ID** — uploaded `question_id` values are ignored. The app
-   assigns a new ID using the selected course abbreviation plus a number, such as
-   `BIO-0001`. That ID is unique inside the course.
-
-2. **Same content** — a fingerprint (hash) is computed from the question's
-   *stimulus + all five choices + correct answer*.  If an identical fingerprint
-   already exists in the **same course**, the row is skipped — even if it has a
-   different uploaded ID.  This catches re-uploaded batches.
-
-**Re-uploading the same CSV** will always result in 0 inserted and all rows
-being skipped by one of the two checks above — no duplicates are created.
-            """)
-
-
-# ── Tab: Template ─────────────────────────────────────────────────────────────
-with tab_template:
-    st.markdown("### Question Bank Template")
-    st.markdown("""
-Download this template, fill in your questions, and upload via the **Upload CSV** tab.
-
-**Required columns:**  
-`stimulus`, `question_type`
-
-**Optional but useful:**  
-`question_id` (ignored on import), `section_type`, `question_type`, `difficulty` (1–5), `passage`, `explanation`,  
-`wrong_answer_a–e`, `source`, `tags`
-
-`section_type` — any text: `Logical Reasoning`, `Python Basics`, `Chapter 3`, etc.  
-`question_type` — any text: `Weaken`, `Multiple Choice`, `True/False`, etc.  
-`correct_answer` — must be `A`, `B`, `C`, `D`, or `E`  
-`difficulty` — 1 Intuition & Estimation, 2 Beginner Calculations, 3 Intermediate Calculations, 4 Advanced Calculations, 5 Stretch Problems; default 3
-    """)
-
-    csv_str = make_template_csv()
-    st.info(
-        "For open-ended questions, set question_type to Open-Ended. "
-        "Choices can be blank, and correct_answer can hold a sample answer or rubric."
-    )
-    st.download_button(
-        "Download Excel template with dropdowns",
-        data=make_template_xlsx(),
-        file_name="question_bank_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-    st.download_button(
-        "⬇️ Download question_bank_template.csv",
-        data=csv_str,
-        file_name="question_bank_template.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
-    st.divider()
-    st.markdown("**Preview (2 example rows):**")
-    st.dataframe(
-        pd.read_csv(io.StringIO(csv_str)),
-        use_container_width=True, hide_index=True,
-    )
