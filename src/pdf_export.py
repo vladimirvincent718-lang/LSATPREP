@@ -8,11 +8,11 @@ from io import BytesIO
 import re
 
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import (
     Flowable,
+    KeepTogether,
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
@@ -23,6 +23,16 @@ from reportlab.platypus import (
 
 
 CHOICE_LETTERS = ("A", "B", "C", "D", "E")
+MOBILE_PAGE_SIZE = (5.5 * inch, 8.5 * inch)
+
+
+def display_exam_number(serial: str) -> str:
+    """Return a short, readable label while preserving the stored identity."""
+    serial = str(serial or "").strip().upper()
+    token = re.sub(r"[^A-Z0-9]", "", serial[3:] if serial.startswith("EX-") else serial)
+    if len(token) >= 8:
+        return f"EX-{token[:4]}-{token[4:8]}"
+    return serial
 
 
 def make_pdf_filename(label: str) -> str:
@@ -39,20 +49,25 @@ def generate_exam_pdf(
     subtitle: str = "",
     distribution: list[dict] | None = None,
     include_answer_key: bool = True,
+    exam_serial: str | None = None,
+    live_score: bool = False,
 ) -> bytes:
     """Build a workbook-style PDF with fillable answer and issue fields."""
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
-        pagesize=letter,
-        rightMargin=0.72 * inch,
-        leftMargin=0.72 * inch,
-        topMargin=0.65 * inch,
-        bottomMargin=0.65 * inch,
+        pagesize=MOBILE_PAGE_SIZE,
+        rightMargin=0.38 * inch,
+        leftMargin=0.38 * inch,
+        topMargin=0.38 * inch,
+        bottomMargin=0.48 * inch,
         title=title,
     )
 
     styles = _styles()
+    visible_exam_number = display_exam_number(exam_serial) if exam_serial else ""
+    for name in ("QuestionMeta", "Question", "Choice"):
+        styles[name].keepWithNext = True
     story: list = []
 
     story.append(Paragraph(escape(title), styles["Title"]))
@@ -65,6 +80,15 @@ def generate_exam_pdf(
         )
     )
     story.append(Spacer(1, 0.18 * inch))
+    if exam_serial:
+        story.append(Paragraph(f"Exam number: {escape(visible_exam_number)}", styles["Meta"]))
+        story.append(Paragraph(
+            "Offline use: fill in your answers and save a copy with your changes. "
+            "Return to Practice Mode &gt; Offline exams to upload the saved PDF. "
+            "Do not print to PDF or flatten the form. Keep this exam number intact.",
+            styles["Meta"],
+        ))
+        story.append(Spacer(1, 0.12 * inch))
 
     if distribution:
         story.append(Paragraph("Exam Composition", styles["Section"]))
@@ -77,12 +101,15 @@ def generate_exam_pdf(
         story.append(_composition_table(rows))
         story.append(Spacer(1, 0.12 * inch))
 
-    current_section = None
+    if questions:
+        story.append(PageBreak())
+
     for index, question in enumerate(questions, start=1):
+        if index > 1:
+            story.append(PageBreak())
+        question_page = []
         section = str(question.get("section_type") or "Questions").strip() or "Questions"
-        if section != current_section:
-            current_section = section
-            story.append(Paragraph(escape(section), styles["Section"]))
+        question_page.append(Paragraph(escape(section), styles["Section"]))
 
         meta_bits = [
             bit
@@ -95,49 +122,115 @@ def generate_exam_pdf(
         meta = f"Q{index}"
         if meta_bits:
             meta += " | " + " | ".join(meta_bits)
-        story.append(Paragraph(escape(meta), styles["QuestionMeta"]))
+        question_page.append(Paragraph(escape(meta), styles["QuestionMeta"]))
 
         passage = _clean_text(question.get("passage"))
         if passage:
-            story.append(Paragraph("<b>Passage</b>", styles["SmallHeading"]))
-            story.append(Paragraph(escape(passage), styles["Body"]))
+            question_page.append(Paragraph("<b>Passage</b>", styles["SmallHeading"]))
+            question_page.append(Paragraph(escape(passage), styles["Body"]))
 
         stimulus = _clean_text(question.get("stimulus"))
         if stimulus:
-            story.append(Paragraph(escape(stimulus), styles["Question"]))
+            question_page.append(Paragraph(escape(stimulus), styles["Question"]))
 
         choices = _choices(question)
         for choice_letter, text in choices:
-            story.append(Paragraph(f"<b>{choice_letter}.</b> {escape(text)}", styles["Choice"]))
+            question_page.append(_SelectableChoice(index, choice_letter, text, styles["Choice"]))
 
-        story.append(_QuestionResponseFields(index, choices))
-        story.append(Spacer(1, 0.08 * inch))
+        question_page.append(_QuestionResponseFields(index, choices))
+        question_page.append(Spacer(1, 0.08 * inch))
+        story.append(KeepTogether(question_page))
 
     if include_answer_key:
         story.append(PageBreak())
         story.append(Paragraph("Answer Key", styles["Section"]))
         story.append(
             Paragraph(
-                "Each answer appears on its own line for clean review and printing.",
+                "Each row shows the correct answer and its rationale.",
                 styles["Meta"],
             )
         )
         story.append(Spacer(1, 0.08 * inch))
         story.append(_answer_key_table(questions, styles))
+        written_references = _written_answer_references(questions, styles)
+        if written_references:
+            story.append(Spacer(1, 0.1 * inch))
+            story.extend(written_references)
 
-    doc.build(story)
+    def identity(canvas, document):
+        if exam_serial:
+            canvas.saveState()
+            canvas.setFont("Helvetica", 7)
+            canvas.drawRightString(document.pagesize[0] - document.rightMargin, 16, f"Page {document.page}")
+            canvas.drawString(document.leftMargin, 16, visible_exam_number)
+            if document.page == 1:
+                if live_score:
+                    canvas.acroForm.textfield(name="offline_live_score",
+                        value="Offline score: requires PDF JavaScript", x=document.leftMargin,
+                        y=29, width=300, height=12, fontSize=8, fieldFlags="readOnly", borderWidth=0)
+                canvas.acroForm.textfield(name="exam_serial", value=exam_serial,
+                    x=document.leftMargin, y=14, width=265, height=11,
+                    fontSize=7, fieldFlags="readOnly", annotationFlags="hidden",
+                    borderWidth=0, fillColor=colors.white)
+            canvas.restoreState()
+
+    doc.build(story, onFirstPage=identity, onLaterPages=identity)
     return buffer.getvalue()
 
 
+class _SelectableChoice(Flowable):
+    """A large, readable answer row with its selection control beside the text."""
+
+    def __init__(self, question_number: int, letter_value: str, text: str, style):
+        super().__init__()
+        self.question_number = question_number
+        self.letter_value = letter_value
+        self.paragraph = Paragraph(f"<b>{letter_value}.</b> {escape(text)}", style)
+        self.width = 0
+        self.height = 0
+        self._paragraph_height = 0
+
+    def wrap(self, availWidth, availHeight):
+        self.width = availWidth
+        _, self._paragraph_height = self.paragraph.wrap(max(1, availWidth - 50), availHeight)
+        self.height = max(48, self._paragraph_height + 18)
+        return self.width, self.height
+
+    def draw(self):
+        canvas = self.canv
+        canvas.setFillColor(colors.HexColor("#f8fafc"))
+        canvas.setStrokeColor(colors.HexColor("#cbd5e1"))
+        canvas.roundRect(0, 0, self.width, self.height, 7, stroke=1, fill=1)
+        size = 24
+        y = (self.height - size) / 2
+        canvas.acroForm.radioRelative(
+            name=f"q_{self.question_number:03d}_answer",
+            value=self.letter_value,
+            selected=False,
+            x=10,
+            y=y,
+            size=size,
+            buttonStyle="check",
+            shape="square",
+            borderColor=colors.HexColor("#475569"),
+            fillColor=colors.white,
+            textColor=colors.HexColor("#0f172a"),
+            borderWidth=1,
+            fieldFlags="radio",
+            tooltip=f"Question {self.question_number}: select {self.letter_value}. {self.paragraph.getPlainText()}",
+        )
+        self.paragraph.drawOn(canvas, 45, (self.height - self._paragraph_height) / 2)
+
+
 class _QuestionResponseFields(Flowable):
-    """Small AcroForm block for answer selection and issue reporting."""
+    """Issue reporting plus a large written-response field when needed."""
 
     def __init__(self, question_number: int, choices: list[tuple[str, str]]):
         super().__init__()
         self.question_number = question_number
         self.choice_letters = [letter for letter, _ in choices]
-        self.width = 6.45 * inch
-        self.height = 0.88 * inch if self.choice_letters else 1.08 * inch
+        self.width = 4.74 * inch
+        self.height = 0.74 * inch if self.choice_letters else 1.72 * inch
 
     def wrap(self, availWidth, availHeight):
         return min(self.width, availWidth), self.height
@@ -157,38 +250,14 @@ class _QuestionResponseFields(Flowable):
 
         canvas.setFillColor(ink)
         canvas.setFont("Helvetica-Bold", 8.5)
-        canvas.drawString(8, self.height - 15, "Your answer:")
-
-        if self.choice_letters:
-            radio_name = f"{field_prefix}_answer"
-            x = 78
-            y = self.height - 19
-            for letter in self.choice_letters:
-                form.radioRelative(
-                    name=radio_name,
-                    value=letter,
-                    selected=False,
-                    x=x,
-                    y=y,
-                    size=10,
-                    buttonStyle="circle",
-                    borderColor=border,
-                    fillColor=fill,
-                    textColor=ink,
-                    fieldFlags="radio",
-                    tooltip=f"Question {q_num} answer {letter}",
-                )
-                canvas.setFillColor(ink)
-                canvas.setFont("Helvetica", 8.5)
-                canvas.drawString(x + 14, y + 1, letter)
-                x += 38
-        else:
+        if not self.choice_letters:
+            canvas.drawString(10, self.height - 18, "Your written answer")
             form.textfieldRelative(
                 name=f"{field_prefix}_written_answer",
-                x=78,
-                y=self.height - 42,
-                width=self.width - 92,
-                height=22,
+                x=10,
+                y=48,
+                width=self.width - 20,
+                height=self.height - 72,
                 borderColor=border,
                 fillColor=fill,
                 textColor=ink,
@@ -196,12 +265,12 @@ class _QuestionResponseFields(Flowable):
                 tooltip=f"Question {q_num} written answer",
             )
 
-        issue_y = 30
+        issue_y = 15
         form.checkboxRelative(
             name=f"{field_prefix}_report_issue",
-            x=8,
+            x=10,
             y=issue_y,
-            size=10,
+            size=18,
             buttonStyle="check",
             borderColor=border,
             fillColor=fill,
@@ -209,15 +278,15 @@ class _QuestionResponseFields(Flowable):
             tooltip=f"Question {q_num} report issue",
         )
         canvas.setFillColor(muted)
-        canvas.setFont("Helvetica", 8)
-        canvas.drawString(24, issue_y + 1, "Report issue")
-        canvas.drawString(102, issue_y + 1, "Issue note:")
+        canvas.setFont("Helvetica", 9)
+        canvas.drawString(34, issue_y + 4, "Report issue")
+        canvas.drawString(107, issue_y + 4, "Note")
         form.textfieldRelative(
             name=f"{field_prefix}_issue_note",
-            x=154,
-            y=issue_y - 4,
-            width=self.width - 164,
-            height=18,
+            x=136,
+            y=issue_y - 3,
+            width=self.width - 146,
+            height=24,
             borderColor=border,
             fillColor=fill,
             textColor=ink,
@@ -228,6 +297,13 @@ class _QuestionResponseFields(Flowable):
 def _styles():
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(
+        "Body",
+        parent=styles["Normal"],
+        fontSize=10.5,
+        leading=14,
+        spaceAfter=5,
+    ))
+    styles.add(ParagraphStyle(
         "Meta",
         parent=styles["Normal"],
         fontSize=9,
@@ -237,17 +313,17 @@ def _styles():
     styles.add(ParagraphStyle(
         "Section",
         parent=styles["Heading2"],
-        fontSize=13,
-        leading=16,
-        spaceBefore=12,
-        spaceAfter=7,
+        fontSize=12,
+        leading=15,
+        spaceBefore=0,
+        spaceAfter=5,
         textColor=colors.HexColor("#111827"),
     ))
     styles.add(ParagraphStyle(
         "QuestionMeta",
         parent=styles["Normal"],
         fontName="Helvetica-Bold",
-        fontSize=9,
+        fontSize=9.5,
         leading=12,
         textColor=colors.HexColor("#374151"),
         spaceBefore=4,
@@ -264,17 +340,18 @@ def _styles():
     styles.add(ParagraphStyle(
         "Question",
         parent=styles["Normal"],
-        fontSize=10,
-        leading=14,
-        spaceAfter=5,
+        fontSize=11,
+        leading=15,
+        spaceAfter=8,
     ))
     styles.add(ParagraphStyle(
         "Choice",
         parent=styles["Normal"],
-        fontSize=9.5,
-        leading=13,
-        leftIndent=12,
-        spaceAfter=2,
+        fontSize=11,
+        leading=14,
+        leftIndent=0,
+        rightIndent=0,
+        spaceAfter=0,
     ))
     styles.add(ParagraphStyle(
         "Answer",
@@ -282,11 +359,17 @@ def _styles():
         fontSize=9.3,
         leading=12.5,
     ))
+    styles.add(ParagraphStyle(
+        "KeyCell",
+        parent=styles["Normal"],
+        fontSize=7.2,
+        leading=8.6,
+    ))
     return styles
 
 
 def _composition_table(rows: list[list[str]]) -> Table:
-    table = Table(rows, colWidths=[4.9 * inch, 1.2 * inch], hAlign="LEFT")
+    table = Table(rows, colWidths=[3.75 * inch, 0.8 * inch], hAlign="LEFT")
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
@@ -302,31 +385,74 @@ def _composition_table(rows: list[list[str]]) -> Table:
 
 
 def _answer_key_table(questions: list[dict], styles) -> Table:
-    rows = [[Paragraph("<b>Question</b>", styles["Answer"]), Paragraph("<b>Answer</b>", styles["Answer"])]]
+    key_style = styles["KeyCell"]
+    rows = [[
+        Paragraph("<b>Question</b>", key_style),
+        Paragraph("<b>Answer</b>", key_style),
+        Paragraph("<b>Rationale</b>", key_style),
+    ]]
     for index, question in enumerate(questions, start=1):
-        section = str(question.get("section_type") or "").strip()
-        label = f"{section} Q{index}" if section else f"Q{index}"
+        rationale = _rationale_text(question) or "No rationale provided."
         rows.append([
-            Paragraph(escape(label), styles["Answer"]),
-            Paragraph(escape(_answer_text(question)), styles["Answer"]),
+            Paragraph(f"<b>Q{index}</b>", key_style),
+            Paragraph(escape(_compact_answer_value(question)), key_style),
+            Paragraph(escape(rationale), key_style),
         ])
 
-    table = Table(rows, colWidths=[1.65 * inch, 4.8 * inch], hAlign="LEFT", repeatRows=1)
+    table = Table(
+        rows,
+        colWidths=[0.52 * inch, 0.62 * inch, 3.60 * inch],
+        hAlign="LEFT",
+        repeatRows=1,
+        splitByRow=1,
+    )
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fafafa")]),
         ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#d1d5db")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 7),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("ALIGN", (0, 0), (1, -1), "CENTER"),
+        ("ALIGN", (2, 0), (2, -1), "LEFT"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]))
     return table
 
 
+def _compact_answer_value(question: dict) -> str:
+    answer = _clean_text(question.get("correct_answer"))
+    if not answer:
+        return "-"
+    if answer.upper() in CHOICE_LETTERS and _choices(question):
+        return answer.upper()
+    return "Written*"
+
+
+def _rationale_text(question: dict) -> str:
+    rationale = _clean_text(question.get("explanation"))
+    return rationale.replace("*", "").replace("__", "")
+
+
+def _written_answer_references(questions: list[dict], styles) -> list:
+    references = []
+    for index, question in enumerate(questions, start=1):
+        if _compact_answer_value(question) != "Written*":
+            continue
+        references.append(Paragraph(
+            f"<b>Q{index} written response:</b> {escape(_answer_text(question))}",
+            styles["Answer"],
+        ))
+    if not references:
+        return []
+    return [Paragraph("Written response references", styles["SmallHeading"]), *references]
+
+
 def _choices(question: dict) -> list[tuple[str, str]]:
+    if question.get("_force_open_ended"):
+        return []
     choices = []
     for letter in CHOICE_LETTERS:
         text = _clean_text(question.get(f"choice_{letter.lower()}"))

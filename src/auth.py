@@ -26,6 +26,9 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import streamlit as st
+from src.auth_cookies import (
+    CookieController, sync_cookies, LOADED_KEY, ERROR_KEY,
+)
 
 from src.database import (
     create_user, get_user_by_id, get_user_by_username,
@@ -44,9 +47,9 @@ SESSION_DAYS  = SESSION_TOKEN_DAYS  # kept in sync with the DB-level expiry
 COOKIE_STATE_KEY = "_sf_cookies"
 COOKIE_LOAD_WAIT_KEY = "_sf_waited_for_cookie_load"
 COOKIE_LOAD_ATTEMPTS_KEY = "_sf_cookie_load_attempts"
-COOKIE_LOAD_MAX_ATTEMPTS = 5
 AUTH_COOKIE_VERSION = 1
 AUTH_SECRET_ENV = "STUDYFORGE_AUTH_SECRET"
+SIGNED_OUT_KEY = "_sf_explicitly_signed_out"
 
 SECURITY_QUESTIONS = [
     "What was the name of your first pet?",
@@ -78,19 +81,8 @@ def _user_value(user, key: str, default=None):
 
 
 def _get_cookie_controller():
-    """
-    Return a CookieController instance.
-
-    CookieController caches values in st.session_state["_sf_cookies"].  After a
-    hard refresh that cache may start as an empty dict before the browser has
-    answered, so restore_session_from_cookie() can explicitly refresh it while
-    the cookie-load grace window is open.
-    """
-    from streamlit_cookies_controller import CookieController
-    # CookieController stores cookie values at st.session_state[key].
-    # Creating it with the same key on every call is safe: on the first call it
-    # fires the JS component; on subsequent calls it reads from session_state.
-    return CookieController(key=COOKIE_STATE_KEY)
+    """Read cached cookies and queue writes for browser acknowledgement."""
+    return CookieController()
 
 
 def _cookie_expires() -> datetime:
@@ -262,23 +254,23 @@ def is_logged_in() -> bool:
 
 def restore_session_from_cookie() -> bool:
     """
-    Called at the top of every page entry point.  If session_state already
-    has a user_id this is a cheap no-op.  Otherwise the browser cookie is
+    Called at the top of every page entry point. If session_state already
+    has a user_id, only pending cookie writes are flushed. Otherwise the cookie is
     read and, if the token is valid, session_state is repopulated so the user
     does not have to log in again after a browser refresh.
 
     Returns True if the session is (now) authenticated, False otherwise.
 
-    Note on Streamlit's async component model
-    ──────────────────────────────────────────
-    On the very first render after a browser refresh, CookieController fires a
-    JS component to read cookies from the browser.  Streamlit reruns the script
-    once the component responds.  During that initial render the cookie dict may
-    be empty (default ``{}``) and this function will return False — but the
-    automatic rerun that follows immediately will have the real cookie data and
-    will restore the session transparently.  Users will not notice the
-    sub-second delay.
+    Wait for an explicit browser response before interpreting missing cookies
+    as signed out. Pending writes survive reruns until acknowledged.
     """
+    if sync_cookies():
+        st.caption("Saving your sign-in preference...")
+        st.stop()
+    if st.session_state.get(ERROR_KEY):
+        st.warning(st.session_state[ERROR_KEY])
+    if st.session_state.get(SIGNED_OUT_KEY):
+        return False
     if is_logged_in():
         st.session_state.pop(COOKIE_LOAD_ATTEMPTS_KEY, None)
         return True
@@ -288,13 +280,6 @@ def restore_session_from_cookie() -> bool:
         token = cc.get(COOKIE_NAME)
         signed_cookie = cc.get(SIGNED_COOKIE_NAME)
         if not token and not signed_cookie:
-            attempts = int(st.session_state.get(COOKIE_LOAD_ATTEMPTS_KEY, 0))
-            cookie_cache = st.session_state.get(COOKIE_STATE_KEY)
-            if attempts < COOKIE_LOAD_MAX_ATTEMPTS and not cookie_cache:
-                try:
-                    cc.refresh()
-                except Exception:
-                    pass
             return False
 
         user = validate_session_token(token) if token else None
@@ -312,6 +297,7 @@ def restore_session_from_cookie() -> bool:
                         _refresh_auth_cookies(cc, user, new_token)
                     except Exception:
                         pass
+                    st.rerun()
                     return True
             # Token expired or revoked — remove the stale cookie
             try:
@@ -331,6 +317,9 @@ def restore_session_from_cookie() -> bool:
             _refresh_auth_cookies(cc, user, token)
         except Exception:
             pass
+        # Flush renewed cookies before presenting controls, so the subsequent
+        # acknowledgement cannot interrupt the user's first action on the page.
+        st.rerun()
         return True
 
     except Exception:
@@ -339,27 +328,13 @@ def restore_session_from_cookie() -> bool:
 
 
 def cookie_load_is_pending() -> bool:
-    """
-    True while the browser cookie component is still likely resolving.
-
-    CookieController may put an empty dict in session state before the browser
-    has returned the actual cookie values, so "key exists" is not enough to
-    prove there is no auth cookie after a hard refresh.
-    """
-    if is_logged_in():
-        return False
-
-    attempts = int(st.session_state.get(COOKIE_LOAD_ATTEMPTS_KEY, 0))
-    if attempts >= COOKIE_LOAD_MAX_ATTEMPTS:
-        return False
-
-    cookie_cache = st.session_state.get(COOKIE_STATE_KEY)
-    return COOKIE_STATE_KEY not in st.session_state or not cookie_cache
+    """Empty and not-yet-loaded are distinct, even on a slow connection."""
+    return not is_logged_in() and not st.session_state.get(LOADED_KEY, False)
 
 
 def wait_for_cookie_load() -> None:
     """
-    Give the browser cookie component a few reruns to hydrate cookies.
+    Wait for the browser cookie component's explicit read acknowledgement.
     Callers should use this before rendering the login UI after a refresh.
     """
     if not cookie_load_is_pending():
@@ -385,7 +360,28 @@ def require_login() -> int:
         st.stop()
     st.session_state.pop(COOKIE_LOAD_WAIT_KEY, None)
     st.session_state.pop(COOKIE_LOAD_ATTEMPTS_KEY, None)
-    return st.session_state["user_id"]
+    user_id = st.session_state["user_id"]
+    run_practice_daily_rollover(user_id)
+    return user_id
+
+
+def run_practice_daily_rollover(user_id: int) -> list[dict]:
+    """Finalize yesterday's practice once a signed-in user returns."""
+    from src.exam_engine import (
+        _st,
+        clear_quiz,
+        finalize_stale_practice_drafts,
+    )
+
+    finalized = finalize_stale_practice_drafts(user_id)
+    if not finalized:
+        return []
+    finalized_ids = {row["attempt_id"] for row in finalized}
+    if _st("attempt_id") in finalized_ids:
+        clear_quiz(delete_draft=False)
+    existing = st.session_state.get("_practice_daily_rollover", [])
+    st.session_state["_practice_daily_rollover"] = [*existing, *finalized]
+    return finalized
 
 
 # ── Login / logout ────────────────────────────────────────────────────────────
@@ -408,6 +404,7 @@ def login_user(
         return False, "Incorrect password."
 
     # ── Populate session state ────────────────────────────────────────────────
+    st.session_state.pop(SIGNED_OUT_KEY, None)
     st.session_state["user_id"]  = user["id"]
     st.session_state["username"] = user["username"]
     _remember_last_username(user["username"])
@@ -439,6 +436,7 @@ def logout() -> None:
     Explicitly log out: delete the DB token, remove the browser cookie, and
     clear session state.  Only called when the user clicks the Logout button.
     """
+    st.session_state[SIGNED_OUT_KEY] = True
     try:
         cc    = _get_cookie_controller()
         token = cc.get(COOKIE_NAME)

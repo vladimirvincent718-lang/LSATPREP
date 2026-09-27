@@ -5,8 +5,10 @@ utils.py — Shared UI helpers, course selector, and small utilities.
 from __future__ import annotations
 from html import escape
 import json
+import re
 import streamlit as st
 import streamlit.components.v1 as _components
+from src.import_math_text import normalize_math_row, readable_question_text
 
 DIFFICULTY_LABELS = {
     1: "Intuition & Estimation",
@@ -24,6 +26,30 @@ QUESTION_TYPES = [
     "Principle", "Role of Statement", "Method of Reasoning",
     "Point of Disagreement", "Evaluate", "Explain",
 ]
+
+
+_MODULE_NUMBER_RE = re.compile(r"\b(module\s*#?\s*)(\d+)\b", re.IGNORECASE)
+
+
+def format_module_label(value: str, minimum_width: int = 2) -> str:
+    """Zero-pad module numbers for stable, scan-friendly display labels."""
+    label = str(value or "")
+
+    def pad_number(match: re.Match) -> str:
+        number = match.group(2)
+        return f"{match.group(1)}{number.zfill(max(minimum_width, len(number)))}"
+
+    return _MODULE_NUMBER_RE.sub(pad_number, label)
+
+
+def module_sort_key(value: str) -> list[tuple[int, object]]:
+    """Sort numbered module labels naturally while keeping text deterministic."""
+    parts = re.split(r"(\d+)", str(value or "").casefold())
+    return [
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in parts
+        if part
+    ]
 
 
 def question_reference_label(q: dict, *, include_prefix: bool = True) -> str:
@@ -49,14 +75,27 @@ def question_reference_label(q: dict, *, include_prefix: bool = True) -> str:
     return f"Question {label}" if include_prefix else label
 
 
+def question_course_title(q: dict) -> str:
+    """Return the course title, including for questions restored from older drafts."""
+    title = str(q.get("course_title") or "").strip()
+    if title or q.get("course_id") in (None, ""):
+        return title
+
+    from src.database import get_course
+
+    course = get_course(q.get("course_id"))
+    return str((course or {}).get("title") or "").strip()
+
+
 # --- Sidebar page labels ----------------------------------------------------
-def _sidebar_page_label_js(review_badge_count: int = 0) -> str:
+def _sidebar_page_label_js(review_badge_count: int = 0, ccrn_badge_count: int = 0) -> str:
     template = """
 <script>
 (function () {
     'use strict';
 
     var reviewBadgeCount = __REVIEW_BADGE_COUNT__;
+    var ccrnBadgeCount = __CCRN_BADGE_COUNT__;
     var P = window.parent;
     if (!P || !P.document) { return; }
     var doc = P.document;
@@ -80,9 +119,9 @@ def _sidebar_page_label_js(review_badge_count: int = 0) -> str:
             link.setAttribute('title', 'Sign In');
 
             var labelNode = link.querySelector('span, p, div');
-            if (labelNode) {
+            if (labelNode && labelNode.textContent !== 'Sign In') {
                 labelNode.textContent = 'Sign In';
-            } else {
+            } else if (!labelNode && link.textContent !== 'Sign In') {
                 link.textContent = 'Sign In';
             }
         });
@@ -98,28 +137,34 @@ def _sidebar_page_label_js(review_badge_count: int = 0) -> str:
             var rawText = (link.textContent || '').replace(/\\s+/g, ' ').trim();
             var isReviewLink = rawText.indexOf('Review Mistakes') !== -1
                 || href.indexOf('Review_Mistakes') !== -1;
-            if (!isReviewLink) { return; }
+            var isMaterialsLink = href.indexOf('Course_Materials') !== -1;
+            var isCcrnLink = href.indexOf('Question_Bank_Manager') !== -1 || isMaterialsLink;
+            if (!isReviewLink && !isCcrnLink) { return; }
+            var count = isCcrnLink ? ccrnBadgeCount : reviewBadgeCount;
+            var name = isMaterialsLink ? 'Course Materials' : (isCcrnLink ? 'Question Bank Manager' : 'Review Mistakes');
 
             link.classList.add('sf-review-nav-link');
-            if (link.getAttribute('data-sf-review-count') === String(reviewBadgeCount)) { return; }
-
-            var labelNode = link.querySelector('span, p, div') || link;
             var existingBadge = link.querySelector('.sf-review-nav-badge');
-            if (reviewBadgeCount > 0) {
+            if (link.getAttribute('data-sf-review-count') === String(count)
+                && ((count === 0 && !existingBadge) || (count > 0 && existingBadge
+                    && existingBadge.parentNode === link
+                    && existingBadge.classList.contains('sf-ccrn-nav-badge') === isCcrnLink))) { return; }
+            if (count > 0) {
                 if (!existingBadge) {
                     existingBadge = doc.createElement('span');
                     existingBadge.className = 'sf-review-nav-badge';
-                    labelNode.appendChild(existingBadge);
                 }
-                existingBadge.textContent = reviewBadgeCount > 99 ? '99+' : String(reviewBadgeCount);
-                link.setAttribute('aria-label', 'Review Mistakes, ' + reviewBadgeCount + ' outstanding');
-                link.setAttribute('title', reviewBadgeCount + ' outstanding mistakes to review');
+                if (existingBadge.parentNode !== link) { link.appendChild(existingBadge); }
+                existingBadge.classList.toggle('sf-ccrn-nav-badge', isCcrnLink);
+                existingBadge.textContent = isCcrnLink ? String(count) : (count > 99 ? '99+' : String(count));
+                link.setAttribute('aria-label', name + ', ' + count + (isCcrnLink ? ' pending import' : ' outstanding'));
+                link.setAttribute('title', count + (isCcrnLink ? ' questions pending import' : ' outstanding mistakes to review'));
             } else if (existingBadge) {
                 existingBadge.remove();
-                link.setAttribute('aria-label', 'Review Mistakes');
-                link.setAttribute('title', 'Review Mistakes');
+                link.setAttribute('aria-label', name);
+                link.setAttribute('title', name);
             }
-            link.setAttribute('data-sf-review-count', String(reviewBadgeCount));
+            link.setAttribute('data-sf-review-count', String(count));
         });
     }
 
@@ -139,10 +184,24 @@ def _sidebar_page_label_js(review_badge_count: int = 0) -> str:
 })()
 </script>
 """
-    return template.replace("__REVIEW_BADGE_COUNT__", str(int(review_badge_count)))
+    return template.replace("__REVIEW_BADGE_COUNT__", str(int(review_badge_count))).replace("__CCRN_BADGE_COUNT__", str(int(ccrn_badge_count)))
 
 _SIDEBAR_PAGE_LABEL_CSS = """
 <style>
+/* Keep existing routes accessible through the Course Materials workspace. */
+[data-testid="stSidebarNav"] li:has(a[href$="/a_Flashcards"]),
+[data-testid="stSidebarNav"] li:has(a[href$="/b_Notebook"]),
+[data-testid="stSidebarNav"] li:has(a[href$="/c_Audio_Study"]),
+[data-testid="stSidebarNav"] li:has(a[href$="/Question_Bank_Manager"]) {
+    display: none !important;
+}
+[data-testid="stSidebarNav"]:has(a[aria-current="page"]:is(
+    [href$="/a_Flashcards"], [href$="/b_Notebook"], [href$="/c_Audio_Study"], [href$="/Question_Bank_Manager"]
+)) a[href$="/Course_Materials"] {
+    background: #334155 !important;
+    color: #ffffff !important;
+    font-weight: 700 !important;
+}
 [data-testid="stSidebarNav"] a[href="./"] span,
 [data-testid="stSidebarNavItems"] a[href="./"] span {
     font-size: 0 !important;
@@ -156,11 +215,15 @@ _SIDEBAR_PAGE_LABEL_CSS = """
 
 [data-testid="stSidebarNav"] a.sf-review-nav-link,
 [data-testid="stSidebarNavItems"] a.sf-review-nav-link {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
     align-items: center !important;
     gap: 0.5rem !important;
 }
 
 .sf-review-nav-badge {
+    flex: 0 0 auto !important;
     align-items: center !important;
     background: #dc2626 !important;
     border-radius: 999px !important;
@@ -173,6 +236,13 @@ _SIDEBAR_PAGE_LABEL_CSS = """
     margin-left: auto !important;
     min-width: 1.35rem !important;
     padding: 0.22rem 0.42rem !important;
+}
+.sf-review-nav-badge.sf-ccrn-nav-badge {
+    background: #92400e !important;
+    color: #ffffff !important;
+    font-size: 0.72rem !important;
+    font-weight: 900 !important;
+    text-shadow: 0 1px 1px rgba(0, 0, 0, 0.28) !important;
 }
 </style>
 """
@@ -217,259 +287,69 @@ def _review_mistakes_outstanding_count(user_id: int | None) -> int:
         return 0
 
 
-def inject_sidebar_page_labels(review_badge_count: int = 0) -> None:
+def inject_sidebar_page_labels(review_badge_count: int = 0, ccrn_badge_count: int = 0) -> None:
     """Rename Streamlit's default app.py sidebar label to the user-facing page name."""
     st.markdown(_SIDEBAR_PAGE_LABEL_CSS, unsafe_allow_html=True)
-    _components.html(_sidebar_page_label_js(review_badge_count), height=0, scrolling=False)
+    _components.html(_sidebar_page_label_js(review_badge_count, ccrn_badge_count), height=0, scrolling=False)
 
 
-# ── Collapsible sidebar ───────────────────────────────────────────────────────
-#
-# WHY TWO SEPARATE INJECTIONS
-# ──────────────────────────────────────────────────────────────────────────────
-# st.markdown(unsafe_allow_html=True) works via React's dangerouslySetInnerHTML
-# which calls element.innerHTML under the hood.  Browsers deliberately do NOT
-# execute <script> tags added via innerHTML — it's a longstanding browser
-# security rule.  CSS <style> tags DO apply from innerHTML, so CSS stays in
-# st.markdown.
-#
-# st.components.v1.html() renders a genuine <iframe> with its own document.
-# Scripts inside it execute normally.  The iframe runs on the same origin
-# (localhost:8501), so window.parent gives full access to the Streamlit page.
-# This is exactly how streamlit-autorefresh works.
-#
-# LAYOUT (Streamlit 1.32 – 1.57+)
-# ──────────────────────────────────────────────────────────────────────────────
-# stAppViewContainer → display:flex; flex-direction:row
-#   section[stSidebar] → position:relative; min-width/max-width own the flex space
-#   div (main)         → width:100%; min-width:0  — fills remaining space
-#
-# Collapse = min-width:0; max-width:0; translateX(-600px).
-# Main expands automatically because it is flex: width 100%.
+def _ccrn_pending_count() -> int:
+    from src.database import get_connection
+    from src.ccrn_import_queue import pending_question_counts
+    conn = get_connection()
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ccrn_import_queue'").fetchone():
+            return 0
+        drafts = [dict(row) for row in conn.execute("SELECT * FROM ccrn_import_queue WHERE imported_batch_id IS NULL")]
+        return sum(pending_question_counts(drafts).values())
+    finally:
+        conn.close()
 
 
-# ── Part 1: CSS — safe to inject via st.markdown ─────────────────────────────
+@st.fragment(run_every="10s")
+def _live_sidebar_badges(user_id):
+    inject_sidebar_page_labels(_review_mistakes_outstanding_count(user_id), _ccrn_pending_count() if user_id else 0)
+
+
+# ── Native sidebar controls and legacy cleanup ──────────────────────────────
+# Use Streamlit's native sidebar state on desktop and mobile. The former
+# body-class toggle could not reopen a sidebar hidden by Streamlit itself.
 _SIDEBAR_CSS = """
 <style>
-/* StudyForge — Collapsible Sidebar */
-
-/* Smooth transitions always active */
-section[data-testid="stSidebar"] {
-    transition:
-        min-width  0.28s cubic-bezier(0.4,0,0.2,1),
-        max-width  0.28s cubic-bezier(0.4,0,0.2,1),
-        transform  0.28s cubic-bezier(0.4,0,0.2,1),
-        visibility 0.28s,
-        opacity    0.22s !important;
-    will-change: min-width, max-width, transform;
-    overflow: hidden !important;
-}
-
-/* Collapsed state */
-body.sf-sb-collapsed section[data-testid="stSidebar"] {
-    min-width:  0         !important;
-    max-width:  0         !important;
-    transform:  translateX(-600px) !important;
-    visibility: hidden    !important;
-    opacity:    0         !important;
-    overflow:   hidden    !important;
-}
-
-/* Hide Streamlit's own toggle buttons — we supply ours */
-[data-testid="stSidebarCollapseButton"],
-[data-testid="stExpandSidebarButton"] {
-    display: none !important;
-}
-
-/* Toggle button (created via JS, appended to parent body) */
-#sf-sb-btn {
-    position:        fixed;
-    top:             10px;
-    left:            var(--sf-btn-left, 290px);
-    z-index:         9999999;
-    width:           32px;
-    height:          32px;
-    border:          1px solid rgba(49,51,63,.20);
-    border-radius:   8px;
-    background:      var(--background-color, #ffffff);
-    cursor:          pointer;
-    display:         flex;
-    align-items:     center;
-    justify-content: center;
-    padding:         0;
-    box-shadow:      0 1px 4px rgba(0,0,0,.10);
-    transition:      left .28s cubic-bezier(.4,0,.2,1),
-                     background .15s, box-shadow .15s;
-    color:           rgb(49,51,63);
-    outline:         none;
-    font-family:     inherit;
-}
-body.sf-sb-collapsed #sf-sb-btn { left: 10px; }
-#sf-sb-btn:hover         { background: rgba(49,51,63,.08); box-shadow: 0 2px 8px rgba(0,0,0,.14); }
-#sf-sb-btn:focus-visible { outline: 2px solid #4A90D9; outline-offset: 2px; }
-#sf-sb-btn svg           {
-    width:16px; height:16px; stroke:currentColor; fill:none;
-    stroke-width:2.2; stroke-linecap:round; stroke-linejoin:round;
-    pointer-events:none; flex-shrink:0;
-}
-
-/* Mobile overlay */
-#sf-sb-overlay {
-    display:    none;
-    position:   fixed;
-    inset:      0;
-    background: rgba(0,0,0,.45);
-    z-index:    9999990;
-    cursor:     pointer;
-}
 @media (max-width: 768px) {
-    body:not(.sf-sb-collapsed) #sf-sb-overlay { display: block; }
-    body:not(.sf-sb-collapsed) #sf-sb-btn     { left: 10px; }
-    section[data-testid="stSidebar"]           { z-index: 9999995 !important; }
+    section[data-testid="stSidebar"][aria-expanded="true"] {
+        min-width: min(280px, 85vw) !important;
+        max-width: min(320px, 85vw) !important;
+        width: 85vw !important;
+        transform: none !important;
+        visibility: visible !important;
+    }
 }
-
-/* Dark theme */
-[data-theme="dark"] #sf-sb-btn,
-.stApp[data-theme="dark"] #sf-sb-btn        { background: rgba(255,255,255,.06);
-                                               border-color: rgba(255,255,255,.22);
-                                               color: rgb(250,250,250); }
-[data-theme="dark"] #sf-sb-btn:hover,
-.stApp[data-theme="dark"] #sf-sb-btn:hover  { background: rgba(255,255,255,.13); }
-@media (prefers-color-scheme: dark) {
-    #sf-sb-btn       { background: rgba(255,255,255,.06);
-                       border-color: rgba(255,255,255,.22); color: rgb(250,250,250); }
-    #sf-sb-btn:hover { background: rgba(255,255,255,.13); }
+[data-testid="stSidebarCollapseButton"] button,
+[data-testid="stExpandSidebarButton"] button {
+    min-width: 44px;
+    min-height: 44px;
 }
 </style>
 """
 
-# ── Part 2: JS — must run via components.html (same-origin iframe) ────────────
-# All DOM queries use window.parent.document so we reach the real Streamlit page.
+# Clean up controls left in an existing browser tab by the previous version.
 _SIDEBAR_JS = """
 <script>
 (function () {
-    'use strict';
-
-    /* Reach the parent Streamlit page from inside the iframe */
-    var P = window.parent;
-    if (!P || !P.document) { return; }
-    var doc  = P.document;
-    var body = doc.body;
-
-    var KEY = 'sf_sidebar_collapsed';
-    var BTN = 'sf-sb-btn';
-    var OVL = 'sf-sb-overlay';
-    var CLS = 'sf-sb-collapsed';
-
-    /* localStorage — same origin so parent's storage is accessible */
-    function getLS()  { try { return P.localStorage.getItem(KEY) === '1'; } catch(e) { return false; } }
-    function setLS(v) { try { P.localStorage.setItem(KEY, v ? '1' : '0'); } catch(e) {} }
-    function isColl() { return body.classList.contains(CLS); }
-
-    /* Measure sidebar width to position the button at its right edge */
-    var _left = 290;
-    function measure() {
-        if (isColl()) { return; }
-        var sb = doc.querySelector('section[data-testid="stSidebar"]');
-        if (!sb) { return; }
-        var w = sb.getBoundingClientRect().width;
-        if (w > 60) {
-            _left = Math.round(w - 44);
-            doc.documentElement.style.setProperty('--sf-btn-left', _left + 'px');
-        }
-    }
-
-    /* SVG icons */
-    var CHEVRON = '<svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>';
-    var BURGER  = '<svg viewBox="0 0 24 24">'
-                + '<line x1="3" y1="6"  x2="21" y2="6"/>'
-                + '<line x1="3" y1="12" x2="21" y2="12"/>'
-                + '<line x1="3" y1="18" x2="21" y2="18"/>'
-                + '</svg>';
-
-    /* Apply collapse/expand to the parent document */
-    function applyState(c) {
-        if (c) { body.classList.add(CLS); } else { body.classList.remove(CLS); }
-        var btn = doc.getElementById(BTN);
-        if (btn) {
-            btn.innerHTML = c ? BURGER : CHEVRON;
-            var lbl = c ? 'Expand sidebar' : 'Collapse sidebar';
-            btn.title = lbl;
-            btn.setAttribute('aria-label',   lbl);
-            btn.setAttribute('aria-expanded', c ? 'false' : 'true');
-            if (!c) { btn.style.left = _left + 'px'; }
-        }
-        if (!c) { setTimeout(measure, 320); }
-    }
-
-    function toggle() {
-        var next = !isColl();
-        setLS(next);
-        applyState(next);
-    }
-
-    /* Ensure button exists in parent document */
-    function ensureButton() {
-        if (doc.getElementById(BTN)) { return; }
-        var btn = doc.createElement('button');
-        btn.id   = BTN;
-        btn.type = 'button';
-        btn.setAttribute('tabindex',    '0');
-        btn.setAttribute('aria-label',  'Toggle sidebar');
-        btn.setAttribute('aria-expanded', 'true');
-        btn.addEventListener('click', toggle);
-        btn.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
-        });
-        body.appendChild(btn);
-    }
-
-    /* Ensure mobile overlay exists in parent document */
-    function ensureOverlay() {
-        if (doc.getElementById(OVL)) { return; }
-        var o = doc.createElement('div');
-        o.id  = OVL;
-        o.setAttribute('aria-hidden', 'true');
-        o.addEventListener('click', function () { setLS(true); applyState(true); });
-        body.appendChild(o);
-    }
-
-    /* MutationObserver — recreate button/overlay if React removes them.
-       Store on parent window so each new iframe run replaces the old one.  */
-    if (P._sfSbObs) { P._sfSbObs.disconnect(); }
-    P._sfSbObs = new MutationObserver(function () {
-        if (!doc.getElementById(BTN) || !doc.getElementById(OVL)) {
-            ensureButton();
-            ensureOverlay();
-            applyState(getLS());
-        }
+    var P = window.parent, doc = P.document;
+    if (P._sfSbObs) { P._sfSbObs.disconnect(); P._sfSbObs = null; }
+    if (P._sfSbTimer) { P.clearInterval(P._sfSbTimer); P._sfSbTimer = null; }
+    doc.body.classList.remove('sf-sb-collapsed');
+    ['sf-sb-btn', 'sf-sb-overlay'].forEach(function(id) {
+        var el = doc.getElementById(id); if (el) el.remove();
     });
-    P._sfSbObs.observe(body, { childList: true, subtree: false });
-
-    /* Periodic guard — re-sync if a Streamlit Python rerun clears body class  */
-    if (P._sfSbTimer) { clearInterval(P._sfSbTimer); }
-    P._sfSbTimer = setInterval(function () {
-        if (getLS() !== isColl()) { applyState(getLS()); }
-    }, 800);
-
-    /* Run immediately */
-    ensureButton();
-    ensureOverlay();
-    measure();
-    applyState(getLS());
 })();
 </script>
 """
 
 
 def _inject_sidebar_toggle() -> None:
-    """
-    Inject the collapsible-sidebar system.  Called once per page from sidebar_nav().
-
-    CSS  → st.markdown (style tags apply even from innerHTML; no execution needed)
-    JS   → st.components.v1.html height=0 (real iframe, script executes, uses
-           window.parent.document to reach the Streamlit page DOM)
-    """
     st.markdown(_SIDEBAR_CSS, unsafe_allow_html=True)
     _components.html(_SIDEBAR_JS, height=0, scrolling=False)
 
@@ -778,12 +658,12 @@ def page_header(title: str, subtitle: str = "") -> None:
 
 def sidebar_nav(username: str) -> None:
     from src.ui_theme import inject_modern_theme
+    from src.app_status import deployment_caption
 
     uid = st.session_state.get("user_id")
-    review_badge_count = _review_mistakes_outstanding_count(uid)
 
     inject_modern_theme()
-    inject_sidebar_page_labels(review_badge_count)
+    _live_sidebar_badges(uid)
     # Inject collapsible-sidebar (CSS via markdown, JS via iframe component)
     _inject_sidebar_toggle()
     # Inject responsive layout CSS from admin-managed config
@@ -831,15 +711,19 @@ def sidebar_nav(username: str) -> None:
                 )
 
         st.divider()
+        st.caption(deployment_caption())
 
     # Inject floating feedback FAB
     _inject_feedback_button()
+    # Install the collapsible BA II Plus-style calculator on every signed-in page.
+    from src.financial_calculator import inject_financial_calculator
+    inject_financial_calculator()
 
 
 # ── Course selector (enrollment-based) ───────────────────────────────────────
-def course_selector(user_id: int, label: str = "📚 Active Course") -> int | None:
+def course_selector(user_id: int, label: str = "📚 Active Course", *, main: bool = False) -> int | None:
     """
-    Render the active-course picker in the sidebar.
+    Render synchronized sidebar and optional main-screen course pickers.
     Shows only courses the user is enrolled in.
     Returns the selected course_id, or None if user has no active enrollments.
     """
@@ -852,6 +736,8 @@ def course_selector(user_id: int, label: str = "📚 Active Course") -> int | No
             st.caption("No active courses are available for your account yet.")
         return None
 
+    from src.study_progress import load_progress, status, label as progress_label
+    progress = load_progress(user_id)
     options    = {c["id"]: c["title"] for c in enrolled}
     option_ids = list(options.keys())
 
@@ -860,28 +746,42 @@ def course_selector(user_id: int, label: str = "📚 Active Course") -> int | No
         st.session_state["active_course_id"] = option_ids[0]
         stored = option_ids[0]
 
+    def changed(key):
+        st.session_state['active_course_id'] = st.session_state[key]
+
+    # Synchronize before rendering either widget, including after page navigation.
+    st.session_state['sidebar_course_selector'] = stored
+    if main:
+        st.session_state['main_course_selector'] = stored
+
     with st.sidebar:
         st.markdown(f"**{label}**")
         selected_id = st.selectbox(
             "course_select",
             options=option_ids,
-            format_func=lambda x: options[x],
+            format_func=lambda x: progress_label(options[x], status(progress, [x]), progress["window"]),
             index=option_ids.index(stored),
             key="sidebar_course_selector",
+            on_change=changed, args=('sidebar_course_selector',),
             label_visibility="collapsed",
         )
-        st.session_state["active_course_id"] = selected_id
         st.divider()
+
+    if main:
+        selected_id = st.selectbox('Course',option_ids,
+            format_func=lambda x: options[x],key='main_course_selector',
+            on_change=changed,args=('main_course_selector',),
+            help='Switch the course shown in Material Library and Audio Study.')
 
     return selected_id
 
 
-def require_course(user_id: int) -> int:
+def require_course(user_id: int, *, main: bool = False) -> int:
     """
     Show course selector and stop execution if user has no enrollments.
     Returns course_id.
     """
-    cid = course_selector(user_id)
+    cid = course_selector(user_id, main=main)
     if cid is None:
         st.warning(
             "You are not enrolled in any courses yet. "
@@ -892,15 +792,23 @@ def require_course(user_id: int) -> int:
 
 
 # ── Question rendering ────────────────────────────────────────────────────────
-def _question_text_card_html(question_text: str, dom_id: str) -> str:
+def _question_text_card_html(
+    question_text: str,
+    dom_id: str,
+    compact_tools: bool = False,
+) -> str:
+    question_text = readable_question_text(question_text)
+    tools = f"""
+      <button type="button" class="sf-question-tool" data-sf-copy-question="{escape(dom_id, quote=True)}">Copy Text</button>
+      <button type="button" class="sf-question-tool" data-sf-copy-screenshot="{escape(dom_id, quote=True)}">Copy Screenshot</button>
+      <button type="button" class="sf-question-tool" data-sf-play-question="{escape(dom_id, quote=True)}">&#9654; Play</button>
+"""
+    actions = f'<span class="sf-question-actions">{tools}</span>'
     return f"""
 <div class="sf-question-text-card" id="{escape(dom_id, quote=True)}">
   <div class="sf-question-actionbar">
     <span class="sf-question-action-label">Question text</span>
-    <span class="sf-question-actions">
-      <button type="button" class="sf-question-tool" data-sf-copy-question="{escape(dom_id, quote=True)}">Copy</button>
-      <button type="button" class="sf-question-tool" data-sf-play-question="{escape(dom_id, quote=True)}">&#9654; Play</button>
-    </span>
+    {actions}
   </div>
   <textarea class="sf-question-copy-block sf-question-copy-area" aria-label="Question text for copying" readonly>{escape(question_text)}</textarea>
 </div>
@@ -908,7 +816,7 @@ def _question_text_card_html(question_text: str, dom_id: str) -> str:
 
 
 def _inject_question_text_tools(question_text: str, dom_id: str) -> None:
-    text_json = json.dumps(question_text)
+    text_json = json.dumps(readable_question_text(question_text))
     dom_id_json = json.dumps(dom_id)
     script = f"""
 <script>
@@ -921,9 +829,9 @@ def _inject_question_text_tools(question_text: str, dom_id: str) -> None:
   var text = {text_json};
 
   function ensureStyles() {{
-    if (doc.getElementById('sf-question-text-tools-style')) return;
+    if (doc.getElementById('sf-question-text-tools-style-v2')) return;
     var style = doc.createElement('style');
-    style.id = 'sf-question-text-tools-style';
+    style.id = 'sf-question-text-tools-style-v2';
     style.textContent = `
       .sf-question-text-card {{
         background:#fff;
@@ -966,6 +874,7 @@ def _inject_question_text_tools(question_text: str, dom_id: str) -> None:
         line-height:1;
         min-height:32px;
         padding:.42rem .62rem;
+        white-space:nowrap;
       }}
       .sf-question-tool:hover {{ background:#f1f5f9; }}
       .sf-question-tool:active {{ transform:scale(.97); }}
@@ -987,7 +896,44 @@ def _inject_question_text_tools(question_text: str, dom_id: str) -> None:
         word-break:normal;
         overflow-wrap:anywhere;
         color:#0f172a;
-        font:600 1rem/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+        font:600 1.2rem/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+        background:#fff;
+      }}
+      [class*="st-key-q_radio_"] [role="radiogroup"] {{ gap:14px; }}
+      [class*="st-key-q_radio_"] label[data-baseweb="radio"] {{
+        width:100%;
+        box-sizing:border-box;
+        min-height:68px;
+        margin:0;
+        padding:16px 20px;
+        border:1px solid #cbd5e1;
+        border-radius:10px;
+        background:#fff;
+        align-items:center;
+        cursor:pointer;
+      }}
+      [class*="st-key-q_radio_"] label[data-baseweb="radio"]:hover {{
+        background:#eff6ff;
+        border-color:#60a5fa;
+      }}
+      [class*="st-key-q_radio_"] label[data-baseweb="radio"]:focus-within {{
+        outline:3px solid #2563eb;
+        outline-offset:2px;
+      }}
+      [class*="st-key-q_radio_"] label[data-baseweb="radio"]:has(input:checked) {{
+        background:#eff6ff;
+        border-color:#2563eb;
+      }}
+      [class*="st-key-q_radio_"] label p,
+      [class*="st-key-sf_answer_review_"] p {{
+        font-size:1.2rem !important;
+        line-height:1.65 !important;
+      }}
+      [class*="st-key-sf_answer_review_"] {{
+        min-height:68px;
+        padding:12px 20px;
+        border:1px solid #dbe3ef;
+        border-radius:10px;
         background:#fff;
       }}
       .sf-question-copy-block:focus {{ box-shadow:inset 0 0 0 2px rgba(37,99,235,.18); }}
@@ -1023,8 +969,21 @@ def _inject_question_text_tools(question_text: str, dom_id: str) -> None:
     area.remove();
   }}
 
-  function selectQuestionText() {{
-    var card = doc.getElementById(id);
+  function currentCard() {{
+    var cards = doc.querySelectorAll('.sf-question-text-card');
+    var fallback = null;
+    for (var i = cards.length - 1; i >= 0; i -= 1) {{
+      if (cards[i].id !== id) continue;
+      fallback = fallback || cards[i];
+      if (cards[i].getClientRects().length && cards[i].offsetParent !== null) {{
+        return cards[i];
+      }}
+    }}
+    return fallback;
+  }}
+
+  function selectQuestionText(button) {{
+    var card = (button && button.closest('.sf-question-text-card')) || currentCard();
     var area = card && card.querySelector('.sf-question-copy-area');
     if (area) {{
       area.focus({{ preventScroll: true }});
@@ -1041,7 +1000,7 @@ def _inject_question_text_tools(question_text: str, dom_id: str) -> None:
   }}
 
   function copyText(button) {{
-    selectQuestionText();
+    selectQuestionText(button);
     var clipboard = (window.navigator && window.navigator.clipboard)
       || (P.navigator && P.navigator.clipboard);
     if (clipboard && clipboard.writeText) {{
@@ -1055,6 +1014,187 @@ def _inject_question_text_tools(question_text: str, dom_id: str) -> None:
       fallbackCopy(text);
       flash(button, 'Copied');
     }}
+  }}
+
+  function roundedRect(ctx, x, y, width, height, radius) {{
+    var r = Math.min(radius, width / 2, height / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + width, y, x + width, y + height, r);
+    ctx.arcTo(x + width, y + height, x, y + height, r);
+    ctx.arcTo(x, y + height, x, y, r);
+    ctx.arcTo(x, y, x + width, y, r);
+    ctx.closePath();
+  }}
+
+  function wrapCanvasText(ctx, value, maxWidth) {{
+    var lines = [];
+    String(value || '').split(/\\r?\\n/).forEach(function(paragraph) {{
+      if (!paragraph) {{ lines.push(''); return; }}
+      var words = paragraph.split(/\\s+/);
+      var line = '';
+      words.forEach(function(word) {{
+        var candidate = line ? line + ' ' + word : word;
+        if (line && ctx.measureText(candidate).width > maxWidth) {{
+          lines.push(line);
+          line = word;
+        }} else {{
+          line = candidate;
+        }}
+      }});
+      lines.push(line);
+    }});
+    return lines.length ? lines : [''];
+  }}
+
+  function drawScreenshotButton(ctx, label, right, top) {{
+    ctx.font = '650 13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+    var width = Math.ceil(ctx.measureText(label).width) + 20;
+    var left = right - width;
+    roundedRect(ctx, left, top, width, 32, 7);
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+    ctx.strokeStyle = '#cbd5e1';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = '#0f172a';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, left + width / 2, top + 16);
+    return left - 6;
+  }}
+
+  function makeQuestionScreenshot(card) {{
+    var rect = card.getBoundingClientRect();
+    var cardWidth = Math.max(320, Math.round(rect.width || 900));
+    var outerPad = 14;
+    var bodyPadX = 16;
+    var mobile = cardWidth <= 640;
+    var headerHeight = mobile ? 86 : 56;
+    var lineHeight = 23;
+    var measuring = doc.createElement('canvas').getContext('2d');
+    measuring.font = '600 16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+    var lines = wrapCanvasText(measuring, text, cardWidth - bodyPadX * 2);
+    var bodyHeight = Math.max(76, lines.length * lineHeight + 34);
+    var cardHeight = headerHeight + bodyHeight;
+    var scale = Math.min(2, Math.max(1, P.devicePixelRatio || 1));
+    var canvas = doc.createElement('canvas');
+    canvas.width = Math.ceil((cardWidth + outerPad * 2) * scale);
+    canvas.height = Math.ceil((cardHeight + outerPad * 2) * scale);
+    var ctx = canvas.getContext('2d');
+    ctx.scale(scale, scale);
+
+    ctx.fillStyle = '#f1f5f9';
+    ctx.fillRect(0, 0, cardWidth + outerPad * 2, cardHeight + outerPad * 2);
+    ctx.save();
+    ctx.shadowColor = 'rgba(15,23,42,.08)';
+    ctx.shadowBlur = 12;
+    ctx.shadowOffsetY = 5;
+    roundedRect(ctx, outerPad, outerPad, cardWidth, cardHeight, 8);
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+    ctx.restore();
+
+    ctx.save();
+    roundedRect(ctx, outerPad, outerPad, cardWidth, cardHeight, 8);
+    ctx.clip();
+    ctx.fillStyle = '#f8fafc';
+    ctx.fillRect(outerPad, outerPad, cardWidth, headerHeight);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(outerPad, outerPad + headerHeight, cardWidth, bodyHeight);
+    ctx.strokeStyle = '#e5e7eb';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(outerPad, outerPad + headerHeight + .5);
+    ctx.lineTo(outerPad + cardWidth, outerPad + headerHeight + .5);
+    ctx.stroke();
+    ctx.restore();
+
+    roundedRect(ctx, outerPad + .5, outerPad + .5, cardWidth - 1, cardHeight - 1, 8);
+    ctx.strokeStyle = '#e5e7eb';
+    ctx.stroke();
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#475569';
+    ctx.font = '700 12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+    ctx.fillText('QUESTION TEXT', outerPad + 13, outerPad + 24);
+
+    var buttonTop = outerPad + (mobile ? 42 : 12);
+    var buttonRight = outerPad + cardWidth - 12;
+    buttonRight = drawScreenshotButton(ctx, '\u25b6 Play', buttonRight, buttonTop);
+    buttonRight = drawScreenshotButton(ctx, 'Copy Screenshot', buttonRight, buttonTop);
+    drawScreenshotButton(ctx, 'Copy Text', buttonRight, buttonTop);
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = '#0f172a';
+    ctx.font = '600 16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif';
+    var textY = outerPad + headerHeight + 27;
+    lines.forEach(function(line, index) {{
+      ctx.fillText(line, outerPad + bodyPadX, textY + index * lineHeight);
+    }});
+    return canvas;
+  }}
+
+  function canvasPng(canvas) {{
+    return new Promise(function(resolve, reject) {{
+      canvas.toBlob(function(blob) {{
+        if (blob) resolve(blob);
+        else reject(new Error('Could not create screenshot'));
+      }}, 'image/png');
+    }});
+  }}
+
+  function saveScreenshot(blob) {{
+    var url = P.URL.createObjectURL(blob);
+    var link = doc.createElement('a');
+    link.href = url;
+    link.download = 'studyforge-question.png';
+    doc.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(function() {{ P.URL.revokeObjectURL(url); }}, 1000);
+  }}
+
+  function copyScreenshot(button) {{
+    var card = (button && button.closest('.sf-question-text-card')) || currentCard();
+    if (!card || button.dataset.sfScreenshotBusy === '1') return;
+    var originalLabel = button.getAttribute('data-sf-original-label') || button.textContent;
+    button.setAttribute('data-sf-original-label', originalLabel);
+    button.dataset.sfScreenshotBusy = '1';
+    button.disabled = true;
+    button.textContent = 'Copying…';
+
+    function finish(label) {{
+      button.dataset.sfScreenshotBusy = '';
+      button.disabled = false;
+      flash(button, label);
+    }}
+
+    var canvas = makeQuestionScreenshot(card);
+    var png = canvasPng(canvas);
+    var clipboard = (P.navigator && P.navigator.clipboard)
+      || (window.navigator && window.navigator.clipboard);
+    var ClipboardItemCtor = P.ClipboardItem || window.ClipboardItem;
+
+    if (clipboard && clipboard.write && ClipboardItemCtor) {{
+      try {{
+        clipboard.write([new ClipboardItemCtor({{ 'image/png': png }})]).then(function() {{
+          finish('Screenshot Copied');
+        }}).catch(function() {{
+          png.then(function(blob) {{
+            saveScreenshot(blob);
+            finish('Image Saved');
+          }}).catch(function() {{ finish('Copy failed'); }});
+        }});
+        return;
+      }} catch (e) {{}}
+    }}
+    png.then(function(blob) {{
+      saveScreenshot(blob);
+      finish('Image Saved');
+    }}).catch(function() {{ finish('Copy failed'); }});
   }}
 
   function fallbackSpeak(value, button) {{
@@ -1103,7 +1243,7 @@ def _inject_question_text_tools(question_text: str, dom_id: str) -> None:
   }}
 
   function installQuestionTools() {{
-    var card = doc.getElementById(id);
+    var card = currentCard();
     if (!card) return false;
     card.setAttribute('data-sf-question-text', text);
     var area = card.querySelector('.sf-question-copy-area');
@@ -1111,18 +1251,47 @@ def _inject_question_text_tools(question_text: str, dom_id: str) -> None:
       area.value = text;
       area.style.height = 'auto';
       area.style.height = Math.max(52, area.scrollHeight) + 'px';
+      // Browser zoom and narrower viewports change wrapping after initial load.
+      // Observe width only so updating height does not create a resize loop.
+      if (area._sfResizeObserver) area._sfResizeObserver.disconnect();
+      var lastWidth = area.getBoundingClientRect().width;
+      var resizeObserver = new P.ResizeObserver(function() {{
+        var width = area.getBoundingClientRect().width;
+        if (!width || width === lastWidth) return;
+        lastWidth = width;
+        area.style.height = 'auto';
+        area.style.height = Math.max(52, area.scrollHeight) + 'px';
+      }});
+      resizeObserver.observe(area);
+      area._sfResizeObserver = resizeObserver;
+      window.addEventListener('pagehide', function() {{ resizeObserver.disconnect(); }}, {{once:true}});
     }}
 
     var copyButton = card.querySelector('[data-sf-copy-question="' + id + '"]');
-    if (copyButton && !copyButton.dataset.sfQuestionBound) {{
+    if (copyButton) {{
       copyButton.dataset.sfQuestionBound = '1';
-      copyButton.addEventListener('click', function() {{ copyText(copyButton); }});
+      copyButton.onclick = function(event) {{
+        event.preventDefault();
+        copyText(copyButton);
+      }};
+    }}
+
+    var screenshotButton = card.querySelector('[data-sf-copy-screenshot="' + id + '"]');
+    if (screenshotButton) {{
+      screenshotButton.dataset.sfQuestionBound = '1';
+      screenshotButton.onclick = function(event) {{
+        event.preventDefault();
+        copyScreenshot(screenshotButton);
+      }};
     }}
 
     var playButton = card.querySelector('[data-sf-play-question="' + id + '"]');
-    if (playButton && !playButton.dataset.sfQuestionBound) {{
+    if (playButton) {{
       playButton.dataset.sfQuestionBound = '1';
-      playButton.addEventListener('click', function() {{ playText(playButton); }});
+      playButton.onclick = function(event) {{
+        event.preventDefault();
+        playText(playButton);
+      }};
     }}
     return true;
   }}
@@ -1153,9 +1322,14 @@ def render_question(
     show_answer: bool = False,
     is_flagged: bool = False,
     auto_expand_answer: bool = False,
+    show_explanation: bool = True,
+    compact_actions: bool = False,
+    compact_text_tools: bool = False,
+    stacked_header: bool = False,
 ) -> str | None:
     from src.question_loader import is_open_ended_question
 
+    q = normalize_math_row(q)
     review_state = q.get("_smart_review_state") or {}
     correct = (q.get("correct_answer") or "").upper()
     choices = {
@@ -1164,12 +1338,15 @@ def render_question(
     }
     choices = {k: v for k, v in choices.items() if v}
 
-    col_l, col_r = st.columns([5, 1])
+    # A narrow card (or browser zoom) cannot spare one sixth of its width for
+    # the action label. Give each header section a full row in that layout.
+    col_l, col_r = (st.container(), st.container()) if stacked_header else st.columns([5, 1])
     with col_l:
         diff = q.get("difficulty", 3)
         meta_parts = [
             f"Question {idx + 1} of {total}",
             question_reference_label(q),
+            question_course_title(q),
             q.get("section_type", ""),
             q.get("question_type", ""),
             f"Difficulty: {DIFFICULTY_LABELS.get(diff, diff)}",
@@ -1192,10 +1369,12 @@ def render_question(
             )
     with col_r:
         flag_label = "🚩 Flagged" if is_flagged else "🏳️ Flag"
-        st.button(flag_label, key=f"flag_btn_{idx}", on_click=_flag_cb, args=(idx,))
         report_key = f"question_report_open_{q.get('id', idx)}_{idx}"
-        if st.button("Report Issue", key=f"report_issue_btn_{idx}"):
-            st.session_state[report_key] = True
+        action_context = st.popover("Question actions") if compact_actions else st.container()
+        with action_context:
+            st.button(flag_label, key=f"flag_btn_{idx}", on_click=_flag_cb, args=(idx,))
+            if st.button("Report Issue", key=f"report_issue_btn_{idx}"):
+                st.session_state[report_key] = True
 
     if st.session_state.get(report_key):
         issue_types = [
@@ -1246,13 +1425,17 @@ def render_question(
             st.rerun()
 
     if q.get("passage"):
-        with st.expander("📖 Read Passage", expanded=True):
+        tags = str(q.get("tags") or "").lower()
+        supporting_material_label = (
+            "📊 Question Exhibit" if "exhibit" in tags else "📖 Read Passage"
+        )
+        with st.expander(supporting_material_label, expanded=True):
             st.markdown(q["passage"])
 
     stimulus = str(q.get("stimulus", "")).strip()
     question_dom_id = f"sf-question-text-{q.get('id', idx)}-{idx}"
     st.markdown(
-        _question_text_card_html(stimulus, question_dom_id),
+        _question_text_card_html(stimulus, question_dom_id, compact_tools=compact_text_tools),
         unsafe_allow_html=True,
     )
     _inject_question_text_tools(stimulus, question_dom_id)
@@ -1270,7 +1453,7 @@ def render_question(
             if sample_answer:
                 with st.expander("Sample answer / rubric", expanded=auto_expand_answer):
                     st.success(sample_answer)
-            if q.get("explanation"):
+            if show_explanation and q.get("explanation"):
                 with st.expander("Explanation", expanded=auto_expand_answer):
                     st.info(q["explanation"])
             return selected
@@ -1286,15 +1469,16 @@ def render_question(
 
     if show_answer:
         for letter, text in choices.items():
-            if letter == correct and letter == selected:
-                st.success(f"✅ **{letter}.** {text}  ← Correct")
-            elif letter == correct:
-                st.success(f"✅ **{letter}.** {text}  ← Correct answer")
-            elif letter == selected:
-                st.error(f"❌ **{letter}.** {text}  ← Your answer")
-            else:
-                st.write(f"**{letter}.** {text}")
-        if q.get("explanation"):
+            with st.container(key=f"sf_answer_review_{idx}_{letter}"):
+                if letter == correct and letter == selected:
+                    st.success(f"✅ **{letter}.** {text}  ← Correct")
+                elif letter == correct:
+                    st.success(f"✅ **{letter}.** {text}  ← Correct answer")
+                elif letter == selected:
+                    st.error(f"❌ **{letter}.** {text}  ← Your answer")
+                else:
+                    st.write(f"**{letter}.** {text}")
+        if show_explanation and q.get("explanation"):
             with st.expander("💡 Explanation", expanded=auto_expand_answer):
                 st.info(q["explanation"])
                 for letter in ["A", "B", "C", "D", "E"]:

@@ -1,0 +1,25 @@
+.allocation-editor {font-family:var(--st-font, sans-serif); color:var(--st-text-color, #16324f); font-size:14px;}
+.allocation-editor * {box-sizing:border-box;}
+.allocation-editor details {border:1px solid #cbd5e1; border-radius:8px; margin:12px 0; padding:14px;}
+.allocation-editor summary {cursor:pointer; font-weight:600; padding:2px 0 10px;}
+.allocation-editor .weight-row {display:grid; grid-template-columns:minmax(0,1fr) 170px 100px; align-items:center; gap:16px; padding:10px 0;}
+.allocation-editor label {line-height:1.5;}
+.allocation-editor .number-field {display:flex; align-items:center; border:1px solid #cbd5e1; background:var(--st-background-color, white); border-radius:6px; overflow:hidden;}
+.allocation-editor input {width:100%; min-width:0; border:0; padding:9px; color:inherit; background:transparent; font:inherit; appearance:textfield; -moz-appearance:textfield;}
+.allocation-editor input::-webkit-inner-spin-button {appearance:none;}
+.allocation-editor input:focus {outline:0;}
+.allocation-editor .number-field:focus-within {outline:2px solid #2563eb; outline-offset:1px;}
+.allocation-editor button {border:0; background:transparent; color:inherit; padding:9px; cursor:pointer; font-size:16px;}
+.allocation-editor button:hover {background:#e2e8f0; color:#16324f;}
+.allocation-editor .count {text-align:right; color:var(--st-text-color, #475569); font-size:12px;}
+.allocation-editor .total {display:flex; flex-wrap:wrap; align-items:baseline; justify-content:space-between; gap:8px; margin-top:10px; padding:12px 14px; border-radius:6px; background:#eff6ff; color:#1e3a8a;}
+.allocation-editor .total strong {font-size:18px;}
+.allocation-editor .total[data-status="over"], .allocation-editor .total[data-status="invalid"] {background:#fef2f2; color:#991b1b;}
+.allocation-editor .total[data-status="under"] {background:#fffbeb; color:#92400e;}
+.allocation-editor .total[data-status="balanced"] {background:#ecfdf5; color:#065f46;}
+.allocation-editor .course-weight {border-top:1px solid #cbd5e1; margin-top:14px; padding-top:12px;}
+.allocation-editor .hint {color:var(--st-text-color, #475569); font-size:12px; margin:6px 0;}
+@media(max-width:600px) {
+ .allocation-editor .weight-row {grid-template-columns:minmax(0,1fr) 145px; gap:8px;}
+ .allocation-editor .count {grid-column:2;}
+}

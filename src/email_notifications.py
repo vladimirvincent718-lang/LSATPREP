@@ -87,6 +87,11 @@ def notify_exam_started(
     if not recipient:
         return NotificationResult(False, test_count, "Add an email address in Settings to receive exam notifications.")
 
+    if pdf_bytes:
+        numbered = _send_numbered_exam(user_id, pdf_bytes, recipient, test_count)
+        if numbered is not None:
+            return numbered
+
     smtp = _load_smtp_settings()
     missing_message = _missing_smtp_message(smtp)
     if missing_message:
@@ -139,6 +144,11 @@ def send_take_home_exam_pdf(
     recipient = get_setting(user_id, USER_EMAIL_KEY).strip()
     if not recipient:
         return NotificationResult(False, test_count, "Add an email address in Settings to receive take-home exams.")
+
+    if pdf_bytes:
+        numbered = _send_numbered_exam(user_id, pdf_bytes, recipient, test_count)
+        if numbered is not None:
+            return numbered
 
     smtp = _load_smtp_settings()
     missing_message = _missing_smtp_message(smtp)
@@ -257,8 +267,10 @@ def _missing_smtp_message(smtp: dict) -> str:
 def _send_message(msg: EmailMessage, smtp: dict) -> None:
     port = int(smtp["port"])
     context = create_default_context()
-    with smtplib.SMTP(smtp["host"], port, timeout=20) as server:
-        if smtp.get("use_tls", True):
+    server_connection = (smtplib.SMTP_SSL(smtp["host"], port, timeout=20, context=context)
+                         if port == 465 else smtplib.SMTP(smtp["host"], port, timeout=20))
+    with server_connection as server:
+        if port != 465 and smtp.get("use_tls", True):
             server.starttls(context=context)
         if smtp.get("username") or smtp.get("password"):
             server.login(smtp.get("username", ""), smtp.get("password", ""))
@@ -268,3 +280,21 @@ def _send_message(msg: EmailMessage, smtp: dict) -> None:
 def _clean_label(value: str | None, fallback: str) -> str:
     text = " ".join(str(value or "").split())
     return text or fallback
+
+
+def _send_numbered_exam(user_id, pdf_bytes, recipient, test_count):
+    from io import BytesIO
+    from pypdf import PdfReader
+    from src.offline_email import send_exam
+    try:
+        fields = PdfReader(BytesIO(pdf_bytes)).get_fields() or {}
+        serial = str(fields.get('exam_serial', {}).get('/V', ''))
+    except Exception:
+        return None
+    if not serial:
+        return None
+    try:
+        send_exam(user_id, serial, recipient)
+    except Exception:
+        return NotificationResult(False, test_count, 'Exam email could not be sent. Check Email Delivery settings. Your PDF is available in Offline exams.')
+    return NotificationResult(True, test_count, f'Exam PDF sent to {recipient}.')
