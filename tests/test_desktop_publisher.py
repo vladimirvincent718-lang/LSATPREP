@@ -61,6 +61,7 @@ def test_publish_copies_only_source_and_preserves_remote_database(tmp_path, monk
     config = (result / ".streamlit" / "config.toml").read_text(encoding="utf-8")
     assert "primaryColor" in config
     assert "[server]" not in config
+    assert publisher.publish_update(root=local, repository_url=str(remote)) == ("", 0)
 
 
 def test_invalid_python_blocks_publish(tmp_path):
