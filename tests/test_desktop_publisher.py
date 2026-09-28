@@ -69,3 +69,12 @@ def test_invalid_python_blocks_publish(tmp_path):
     (tmp_path / "requirements.txt").write_text("streamlit\n", encoding="utf-8")
     with pytest.raises(publisher.PublishError, match="Fix Python syntax"):
         publisher._safe_source_files(tmp_path)
+
+
+def test_second_publish_is_rejected_while_first_runs():
+    publisher._PUBLISH_LOCK.acquire()
+    try:
+        with pytest.raises(publisher.PublishError, match="already publishing"):
+            publisher.publish_update()
+    finally:
+        publisher._PUBLISH_LOCK.release()
