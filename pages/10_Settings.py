@@ -69,6 +69,14 @@ with tab_general:
         st.caption("Alternative link (if your network supports computer names):")
         st.code(hostname_link, language=None)
         st.caption("On your phone, use Safari's Share → Add to Home Screen or Chrome's menu → Add to Home screen.")
+    if real_admin and admin:
+        from src.desktop_publisher import is_local_publish_session, render_publish_controls
+
+        if is_local_publish_session(st.context.headers):
+            with st.expander("Publish updates to phone link", expanded=False):
+                render_publish_controls()
+        else:
+            st.caption("To publish code updates, open Settings in the desktop StudyForge app on this computer.")
     from src.study_progress import METHODS, preferences
     progress_prefs = preferences(settings)
     with st.expander("Progress colors"):
