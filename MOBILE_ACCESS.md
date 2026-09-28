@@ -12,6 +12,12 @@ To save it on your phone: in Safari, use Share → Add to Home Screen; in Chrome
 
 The hosted app and local desktop app are separate deployments. Local code changes and database updates are not automatically synced to Streamlit Cloud.
 
+## Publish future code changes without chat
+
+Open **StudyForge on this computer** with `Start StudyForge.cmd` and sign in as an admin. Go to **Settings → General → Publish updates to phone link**. The first time, click **Connect GitHub** and finish the browser sign-in. After that, click **Publish update** whenever you want the latest desktop code uploaded to the same online link above. Publishing uses GitHub and Streamlit Cloud; it does not use AI tokens. Allow a minute or two for Streamlit to rebuild, then refresh the phone page.
+
+The button is available only from the local desktop app. The online app cannot read unpublished files on this computer. Publishing uploads app source and styling. It does not upload the local database, uploaded materials, or saved credentials, so study progress and account data are still separate between the desktop and online deployments.
+
 ## Local app on home Wi-Fi
 
 1. Connect your phone to the same home Wi-Fi as this computer.
