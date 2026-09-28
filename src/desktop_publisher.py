@@ -150,7 +150,10 @@ def _copy_source(root: Path, checkout: Path) -> list[str]:
             content = source.read_text(encoding="utf-8").replace("\r\n", "\n")
         except UnicodeError as exc:
             raise PublishError(f"Source file is not UTF-8 text: {relative}") from exc
-        destination.write_text(content, encoding="utf-8", newline="\n")
+        normalized = content.encode("utf-8")
+        if destination.is_file() and destination.read_bytes().replace(b"\r\n", b"\n") == normalized:
+            continue
+        destination.write_bytes(normalized)
 
     # Desktop networking options would break Streamlit Cloud. Publish the
     # visual/client settings while omitting the desktop-only server section.
