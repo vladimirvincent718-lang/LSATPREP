@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Mapping
 
 import toml
@@ -27,6 +28,7 @@ SOURCE_FOLDERS = ("src", "pages", "scripts", "assets")
 SOURCE_SUFFIXES = frozenset({".py", ".js", ".css", ".html"})
 MAX_SOURCE_FILES = 500
 MAX_SOURCE_BYTES = 2_000_000
+_PUBLISH_LOCK = threading.Lock()
 
 
 class PublishError(RuntimeError):
@@ -64,6 +66,8 @@ def _command(args: list[str], *, cwd: Path = ROOT, timeout: int = 60) -> str:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PublishError("Git could not finish. Check your connection and try again.") from exc
     if result.returncode:
+        if "non-fast-forward" in result.stderr or "fetch first" in result.stderr:
+            raise PublishError("The online repository changed while publishing. Click Publish update again.")
         raise PublishError("GitHub did not accept this update. Reconnect GitHub, then try again.")
     return result.stdout.strip()
 
@@ -165,6 +169,15 @@ def _copy_source(root: Path, checkout: Path) -> list[str]:
 
 def publish_update(*, root: Path = ROOT, repository_url: str = REPOSITORY_URL) -> tuple[str, int]:
     """Upload current desktop code to main; Streamlit Cloud deploys that push."""
+    if not _PUBLISH_LOCK.acquire(blocking=False):
+        raise PublishError("An update is already publishing. Wait for it to finish.")
+    try:
+        return _publish_update_locked(root=root, repository_url=repository_url)
+    finally:
+        _PUBLISH_LOCK.release()
+
+
+def _publish_update_locked(*, root: Path, repository_url: str) -> tuple[str, int]:
     root = root.resolve()
     if not github_connected():
         raise PublishError("Connect GitHub on this computer before publishing.")
