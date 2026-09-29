@@ -110,6 +110,16 @@ with tab_general:
         st.caption("Alternative link (if your network supports computer names):")
         st.code(hostname_link, language=None)
         st.caption("On your phone, use Safari's Share → Add to Home Screen or Chrome's menu → Add to Home screen.")
+        if real_admin and admin and is_local_publish_session(st.context.headers) and ngrok_is_configured():
+            with st.expander("Replace ngrok account token"):
+                replacement = st.text_input("New ngrok authtoken", type="password", key="ngrok_replacement_token")
+                if st.button("Save new ngrok token", key="save_ngrok_replacement"):
+                    try:
+                        connect_ngrok(replacement)
+                        del st.session_state["ngrok_replacement_token"]
+                        st.success("New ngrok token saved. Restart live phone access to use it.")
+                    except PhoneAccessError as exc:
+                        st.error(str(exc))
     if real_admin and admin:
         from src.desktop_publisher import is_local_publish_session, render_publish_controls
 
