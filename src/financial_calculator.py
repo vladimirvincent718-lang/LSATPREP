@@ -74,7 +74,7 @@ body.sf-calc-page-open [data-testid="stMain"],body.sf-calc-page-open .stMain,bod
 .sf-calc-key.sf-spacer{visibility:hidden}
 .sf-calc-key .alt{position:absolute;left:-2px;right:-2px;top:-12px;color:#f2d346;font-size:7.5px;
  font-weight:900;line-height:9px;letter-spacing:.01em;white-space:nowrap;pointer-events:none;text-shadow:0 1px 1px #000}
-@media(max-width:650px){#sf-calc-drawer,#sf-calc-drawer.sf-large{right:0;top:8px;width:min(340px,48vw)}
+@media(max-width:650px){#sf-calc-drawer,#sf-calc-drawer.sf-large{right:8px;top:8px;width:min(340px,calc(100vw - 16px))}
  .sf-calc-head{margin-left:10px;margin-right:10px}.sf-calc-scroll{padding:0 10px 10px}.sf-calc-machine{padding:14px 10px}.sf-calc-key{height:42px}}
 """
 
@@ -238,9 +238,10 @@ _LOGIC = r"""
   function restorePageSpace(){var saved=P._sfCalcMainLayout;if(!saved||!saved.element)return;Object.keys(saved.properties).forEach(function(name){var prior=saved.properties[name];if(prior.value)saved.element.style.setProperty(name,prior.value,prior.priority||'');else saved.element.style.removeProperty(name);});P._sfCalcMainLayout=null;}
   function syncPageSpace(){
     var open=root.classList.contains('sf-open'),reserve=Math.ceil(root.getBoundingClientRect().width||root.offsetWidth||(root.classList.contains('sf-large')?430:340))+28;
-    doc.body.classList.toggle('sf-calc-page-open',open);doc.body.style.setProperty('--sf-calc-reserved',reserve+'px');
+    var reserveSpace=open&&P.innerWidth>650;
+    doc.body.classList.toggle('sf-calc-page-open',reserveSpace);doc.body.style.setProperty('--sf-calc-reserved',reserve+'px');
     var main=pageMain();
-    if(!open){restorePageSpace();return;}
+    if(!reserveSpace){restorePageSpace();return;}
     if(!main)return;
     if(P._sfCalcMainLayout&&P._sfCalcMainLayout.element!==main)restorePageSpace();
     if(!P._sfCalcMainLayout){var names=['box-sizing','width','max-width','margin-right','flex-basis'];var properties={};names.forEach(function(name){properties[name]={value:main.style.getPropertyValue(name),priority:main.style.getPropertyPriority(name)};});P._sfCalcMainLayout={element:main,properties:properties};}
@@ -281,26 +282,32 @@ def inject_financial_calculator() -> None:
 (function () {
   'use strict';
   var P=window.parent;if(!P||!P.document)return;var doc=P.document;
+  __CORE_SOURCE__
+  __KEYMAP_SOURCE__
+  P.SFCalculatorMath=window.SFCalculatorMath;
+  P.SFCalculatorKeyMap=window.SFCalculatorKeyMap;
   if(P._sfCalcRestorePageSpace)P._sfCalcRestorePageSpace();var old=doc.getElementById('sf-calc-drawer');if(old)old.remove();doc.body.classList.remove('sf-calc-page-open');
   var oldFab=doc.getElementById('sf-calc-fab');if(oldFab)oldFab.remove();
   var style=doc.getElementById('sf-calc-style');if(!style){style=doc.createElement('style');style.id='sf-calc-style';doc.head.appendChild(style);}style.textContent=__CSS__;
-  var oldCore=doc.getElementById('sf-calc-core');if(oldCore)oldCore.remove();P.SFCalculatorMath=undefined;var coreScript=doc.createElement('script');coreScript.id='sf-calc-core';coreScript.textContent=__CORE__;doc.head.appendChild(coreScript);
-  var oldMap=doc.getElementById('sf-calc-keymap');if(oldMap)oldMap.remove();P.SFCalculatorKeyMap=undefined;var mapScript=doc.createElement('script');mapScript.id='sf-calc-keymap';mapScript.textContent=__KEYMAP__;doc.head.appendChild(mapScript);
+  var oldCore=doc.getElementById('sf-calc-core');if(oldCore)oldCore.remove();
+  var oldMap=doc.getElementById('sf-calc-keymap');if(oldMap)oldMap.remove();
   var fab=doc.createElement('button');fab.id='sf-calc-fab';fab.type='button';fab.innerHTML='&#129518;';fab.title='Open financial calculator';fab.setAttribute('aria-label','Open financial calculator');doc.body.appendChild(fab);
   var drawer=doc.createElement('aside');drawer.id='sf-calc-drawer';drawer.setAttribute('aria-label','Financial calculator');drawer.innerHTML=__HTML__;doc.body.appendChild(drawer);
   function stored(key){try{return P.localStorage.getItem(key)==='1';}catch(e){return false;}}
   if(stored('sf_calc_large'))drawer.classList.add('sf-large');if(stored('sf_calc_dark'))drawer.classList.add('sf-dark');
   function open(){drawer.classList.add('sf-open');doc.body.classList.add('sf-calc-page-open');fab.hidden=true;if(P._sfCalcSyncPageSpace)P._sfCalcSyncPageSpace();try{P.localStorage.setItem('sf_calc_open','1');}catch(e){}}
   fab.onclick=open;if(stored('sf_calc_open'))open();
-  var logic=doc.createElement('script');logic.textContent=__LOGIC__;doc.head.appendChild(logic);logic.remove();
+  __LOGIC_SOURCE__
 }());
 </script>
 """
+    if any("</script" in source.lower() for source in (core, keymap, _LOGIC)):
+        raise ValueError("Calculator JavaScript cannot contain a closing script tag")
     bundle = (
         bundle.replace("__CSS__", json.dumps(_CSS))
-        .replace("__CORE__", json.dumps(core))
-        .replace("__KEYMAP__", json.dumps(keymap))
+        .replace("__CORE_SOURCE__", core)
+        .replace("__KEYMAP_SOURCE__", keymap)
         .replace("__HTML__", json.dumps(_HTML))
-        .replace("__LOGIC__", json.dumps(_LOGIC))
+        .replace("__LOGIC_SOURCE__", _LOGIC)
     )
     components.html(bundle, height=0, scrolling=False)
