@@ -216,9 +216,9 @@ def render_publish_controls() -> None:
     """Render the local-only admin controls within the Settings page."""
     import streamlit as st
 
-    st.markdown("#### Publish app updates")
-    st.caption("Upload the latest app code from this computer to your existing phone link. This uses no AI tokens. Your study database, uploads, and passwords stay on this computer.")
-    st.warning("The phone link has a separate study database. Publishing code does not copy your mock dates, scores, courses, or mistake history.")
+    st.markdown("#### Publish code to Streamlit Cloud")
+    st.caption("Upload the latest app code to the separate Streamlit Cloud copy. This uses no AI tokens. Your study database, uploads, and passwords stay on this computer.")
+    st.warning("The Streamlit Cloud copy has its own study database. Publishing code does not copy your mock dates, scores, courses, or mistake history. Use live phone access above for the same records as this computer.")
     connected = github_connected()
     if not connected:
         st.info("Connect GitHub once on this computer, then publish updates whenever you change the app.")
@@ -248,9 +248,9 @@ def render_publish_controls() -> None:
             with st.spinner("Checking and uploading the latest app code..."):
                 commit, changed = publish_update()
             if changed:
-                st.success(f"Uploaded {changed} changed source files (version {commit[:7]}). Streamlit is rebuilding the same link; refresh it in a minute or two. Study data was not synced.")
+                st.success(f"Uploaded {changed} changed source files (version {commit[:7]}). Streamlit is rebuilding its link; refresh it in a minute or two. Study data was not synced.")
             else:
                 st.info("The online app already has the same source files.")
         except PublishError as exc:
             st.error(str(exc))
-    st.link_button("Open the live app", PUBLIC_APP_URL)
+    st.link_button("Open the separate Streamlit Cloud app", PUBLIC_APP_URL)

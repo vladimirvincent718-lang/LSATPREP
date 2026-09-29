@@ -10,6 +10,9 @@ import webbrowser
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from src.mobile_access import PORT, phone_links
+from src.remote_phone_access import (
+    PhoneAccessError, should_start_with_studyforge, start_live_phone_access,
+)
 
 
 def is_running():
@@ -41,6 +44,13 @@ def main():
             time.sleep(1)
         else:
             raise RuntimeError("StudyForge did not start. See output/mobile_server.log.")
+    if should_start_with_studyforge():
+        try:
+            start_live_phone_access()
+        except PhoneAccessError as exc:
+            (ROOT / "output").mkdir(exist_ok=True)
+            with (ROOT / "output" / "mobile_server.log").open("a", encoding="utf-8") as log:
+                log.write(f"Live phone access could not start: {exc}\n")
     if not args.no_browser:
         webbrowser.open(f"http://localhost:{PORT}")
     if sys.stdout:

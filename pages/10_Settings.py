@@ -57,10 +57,51 @@ with tab_general:
     st.markdown("### General Settings")
     with st.expander("Phone access"):
         from src.mobile_access import PUBLIC_APP_URL, phone_links
+        from src.desktop_publisher import is_local_publish_session
+        from src.remote_phone_access import (
+            PhoneAccessError, connect_ngrok, live_phone_url, ngrok_is_configured,
+            phone_access_password, start_live_phone_access, stop_live_phone_access,
+        )
         phone_link, hostname_link = phone_links()
-        st.link_button("Open StudyForge from anywhere", PUBLIC_APP_URL)
+        live_url = live_phone_url() if is_local_publish_session(st.context.headers) else ""
+        if live_url:
+            st.success("Live phone access is on. This link uses the same app and study records as this computer, even away from home Wi-Fi.")
+            st.link_button("Open the live desktop app on your phone", live_url)
+            st.code(live_url, language=None)
+            st.caption("Keep this computer on, awake, and connected to the internet.")
+            if st.button("Show phone access password", key="show_phone_access_password"):
+                st.write("Username: `studyforge`")
+                st.code(phone_access_password(), language=None)
+            if real_admin and admin and st.button("Turn off live phone access", key="stop_live_phone_access"):
+                try:
+                    stop_live_phone_access()
+                    st.rerun()
+                except PhoneAccessError as exc:
+                    st.error(str(exc))
+        else:
+            st.info("The Streamlit Cloud link has its own saved data. For the same mocks, courses, scores, and mistakes anywhere, turn on live phone access to this computer.")
+            if real_admin and admin and is_local_publish_session(st.context.headers):
+                if not ngrok_is_configured():
+                    st.link_button("Open ngrok account setup", "https://dashboard.ngrok.com/get-started/your-authtoken")
+                    token = st.text_input("ngrok authtoken", type="password", key="ngrok_authtoken")
+                    if st.button("Connect ngrok", key="connect_ngrok"):
+                        try:
+                            connect_ngrok(token)
+                            del st.session_state["ngrok_authtoken"]
+                            st.rerun()
+                        except PhoneAccessError as exc:
+                            st.error(str(exc))
+                elif st.button("Start live phone access", key="start_live_phone_access", type="primary"):
+                    try:
+                        with st.spinner("Starting a secure phone link..."):
+                            start_live_phone_access()
+                        st.rerun()
+                    except PhoneAccessError as exc:
+                        st.error(str(exc))
+        st.markdown("**Separate Streamlit Cloud copy**")
+        st.link_button("Open the separate online app", PUBLIC_APP_URL)
         st.code(PUBLIC_APP_URL, language=None)
-        st.caption("This opens the existing Streamlit Cloud deployment. If it is asleep, tap the wake-up button. Local edits and progress are not automatically synced to the hosted app.")
+        st.caption("Publish code update changes this Streamlit Cloud copy's program, but does not copy the desktop study database or uploads.")
         st.markdown("**Home Wi-Fi link to this computer**")
         st.caption("Connect your phone to this computer's home Wi-Fi. Keep the computer on and awake.")
         if phone_link:
@@ -73,7 +114,7 @@ with tab_general:
         from src.desktop_publisher import is_local_publish_session, render_publish_controls
 
         if is_local_publish_session(st.context.headers):
-            with st.expander("Publish updates to phone link", expanded=False):
+            with st.expander("Publish code to separate Streamlit Cloud app", expanded=False):
                 render_publish_controls()
         else:
             st.caption("To publish code updates, open Settings in the desktop StudyForge app on this computer.")
