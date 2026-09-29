@@ -138,10 +138,7 @@ def deployment_caption(status: DeploymentStatus | None = None) -> str:
         when = format_local_timestamp(status.local_source_modified_at)
         return f"Desktop source last edited {when} · Git baseline {status.short_commit}"
     when = format_local_timestamp(status.committed_at)
-    caption = f"Online code published {when} · version {status.short_commit}"
-    if status.has_local_changes:
-        caption += " · local changes pending"
-    return caption
+    return f"Online code published {when} · version {status.short_commit}"
 
 
 def _latest_database_activity(connection: sqlite3.Connection) -> datetime | None:
