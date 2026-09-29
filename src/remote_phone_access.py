@@ -28,6 +28,7 @@ LOG_PATH = PRIVATE_DIR / "ngrok.log"
 AUTOSTART_PATH = PRIVATE_DIR / "start-with-studyforge"
 PID_PATH = PRIVATE_DIR / "ngrok.pid"
 AGENT_API_PORTS = range(4040, 4051)
+TUNNEL_NAME = "studyforge-live-phone"
 
 
 class PhoneAccessError(RuntimeError):
@@ -90,7 +91,8 @@ def live_phone_url() -> str:
     for tunnel in _agent_tunnels():
         target = str((tunnel.get("config") or {}).get("addr", ""))
         url = str(tunnel.get("public_url", ""))
-        if url.startswith("https://") and target.rstrip("/").endswith(f":{PORT}"):
+        if (tunnel.get("name") == TUNNEL_NAME and url.startswith("https://")
+                and target.rstrip("/").endswith(f":{PORT}")):
             return url
     return ""
 
@@ -143,7 +145,7 @@ def start_live_phone_access() -> str:
     with LOG_PATH.open("ab") as log:
         process = subprocess.Popen(
             [_ngrok(), "http", str(PORT), "--traffic-policy-file", str(POLICY_PATH),
-             "--inspect=false"],
+             "--inspect=false", "--name", TUNNEL_NAME],
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
@@ -167,7 +169,7 @@ def stop_live_phone_access() -> None:
     for tunnel in _agent_tunnels():
         target = str((tunnel.get("config") or {}).get("addr", ""))
         name = str(tunnel.get("name", ""))
-        if not name or not target.rstrip("/").endswith(f":{PORT}"):
+        if name != TUNNEL_NAME or not target.rstrip("/").endswith(f":{PORT}"):
             continue
         request = urllib.request.Request(f"{tunnel['_agent_api']}/{name}", method="DELETE")
         try:
