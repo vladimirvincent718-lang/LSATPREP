@@ -1,18 +1,13 @@
-"""Durable, bounded tutor tickets. Only human activity creates work."""
+"""Manual tutor profiles and saved responses; automatic API tutoring is disabled."""
 import json
-import math
 import re
-import subprocess
-import sys
+import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 from src import audio_study as store, database
 
 PROFILES = {'gemini': 'AI Tutor · Gemini', 'openai': 'AI Tutor · ChatGPT'}
-DEFAULTS = dict(enabled=False, primary='gemini', reviewer='openai', reply_minutes=0,
-                review_hours=24, call_limit=20, gemini_model='gemini-2.5-flash',
-                openai_model='gpt-4.1-mini')
+DEFAULTS = {'enabled': False}
 
 
 def now():
@@ -22,6 +17,8 @@ def now():
 def init_schema(c):
     c.executescript('''
     CREATE TABLE IF NOT EXISTS audio_tutor_settings(user_id INTEGER PRIMARY KEY, settings TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS audio_tutor_profiles(user_id INTEGER NOT NULL, provider TEXT NOT NULL,
+      label TEXT NOT NULL, PRIMARY KEY(user_id,provider));
     CREATE TABLE IF NOT EXISTS audio_tutor_worker_state(id INTEGER PRIMARY KEY, heartbeat REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS audio_tutor_threads(
       root_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, course_id INTEGER NOT NULL,
@@ -43,6 +40,72 @@ def init_schema(c):
         if name not in fields:
             c.execute(f'ALTER TABLE audio_marks ADD COLUMN {name} {definition}')
     c.execute('CREATE UNIQUE INDEX IF NOT EXISTS audio_tutor_reply_once ON audio_marks(tutor_job_id)')
+    disable_automation(c)
+
+
+def disable_automation(c):
+    """Persist the shutdown, including jobs left over from earlier versions."""
+    for row in c.execute('SELECT user_id,settings FROM audio_tutor_settings').fetchall():
+        values=json.loads(row['settings'])
+        if values.get('enabled'):
+            values['enabled']=False
+            c.execute('UPDATE audio_tutor_settings SET settings=? WHERE user_id=?',(json.dumps(values),row['user_id']))
+    c.execute("UPDATE audio_tutor_jobs SET status='cancelled',error='Automatic API tutoring is disabled.' WHERE status IN ('queued','blocked','running')")
+
+
+def profiles(user_id,c=None):
+    if c is None:
+        with store.connection() as conn:return profiles(user_id,conn)
+    return {**PROFILES, **{r['provider']:r['label'] for r in c.execute('SELECT provider,label FROM audio_tutor_profiles WHERE user_id=? ORDER BY label',(user_id,))}}
+
+
+def add_profile(user_id,label):
+    label=' '.join(label.split()).strip()
+    if not label or len(label)>80:
+        raise ValueError('Enter a tutor name of up to 80 characters.')
+    if not label.startswith('AI Tutor · '):label='AI Tutor · '+label
+    with store.connection() as c:
+        if label.casefold() in {p.casefold() for p in profiles(user_id,c).values()}:
+            raise ValueError('This tutor profile already exists.')
+        provider='custom_'+uuid.uuid4().hex
+        c.execute('INSERT INTO audio_tutor_profiles VALUES (?,?,?)',(user_id,provider,label))
+        return provider
+
+
+def save_manual_reply(user_id,course_id,audio_id,parent_id,provider,text,submission_id):
+    if not isinstance(text,str) or not text.strip() or len(text)>100000:
+        raise ValueError('Paste a response of up to 100,000 characters.')
+    if not isinstance(submission_id,str) or not 1<=len(submission_id)<=100:
+        raise ValueError('Invalid response submission.')
+    with store.connection() as c:
+        store._accessible(c,user_id,course_id,audio_id)
+        if provider not in profiles(user_id,c):
+            raise ValueError('Choose one of your saved tutor profiles.')
+        parent=c.execute('SELECT * FROM audio_marks WHERE id=? AND audio_id=? AND is_deleted=0',(parent_id,audio_id)).fetchone()
+        if not parent:raise ValueError('Choose an available comment to attach this response to.')
+        existing=c.execute('SELECT * FROM audio_note_submissions WHERE id=?',(submission_id,)).fetchone()
+        if existing:
+            mark=c.execute('SELECT * FROM audio_marks WHERE id=?',(existing['mark_id'],)).fetchone()
+            if not mark or existing['audio_id']!=audio_id or mark['user_id']!=user_id or mark['tutor_kind']!='manual':
+                raise ValueError('This submission belongs to another comment.')
+            return existing['mark_id']
+        mark=c.execute('''INSERT INTO audio_marks(audio_id,start,end,note,status,parent_id,user_id,quote,created_at,tutor_provider,tutor_kind)
+          VALUES (?,?,?,?,'Neutral',?,?,'',CURRENT_TIMESTAMP,?,'manual')''',
+          (audio_id,parent['start'],parent['end'],text,parent_id,user_id,provider)).lastrowid
+        c.execute('INSERT INTO audio_note_submissions VALUES (?,?,?)',(submission_id,audio_id,mark))
+        return mark
+
+
+def saved_responses(user_id,course_id,provider=None):
+    with store.connection() as c:
+        rows=c.execute('''SELECT m.*,a.title,p.note AS question,p.quote AS question_quote
+          FROM audio_marks m JOIN study_audio a ON a.id=m.audio_id
+          LEFT JOIN audio_marks p ON p.id=m.parent_id
+          WHERE m.user_id=? AND m.tutor_provider!='' AND m.is_deleted=0
+          AND (a.user_id=? OR EXISTS(SELECT 1 FROM audio_listeners l WHERE l.audio_id=a.id AND l.user_id=?))
+          AND (a.course_id=? OR EXISTS(SELECT 1 FROM audio_targets t WHERE t.audio_id=a.id AND t.course_id=?))
+          ORDER BY m.created_at DESC,m.id DESC''',(user_id,user_id,user_id,course_id,course_id)).fetchall()
+        return [dict(r,author=profiles(r['user_id'],c).get(r['tutor_provider'],'AI Tutor')) for r in rows if not provider or r['tutor_provider']==provider]
 
 
 def settings(user_id, c=None):
@@ -50,28 +113,14 @@ def settings(user_id, c=None):
         with store.connection() as conn:
             return settings(user_id, conn)
     row = c.execute('SELECT settings FROM audio_tutor_settings WHERE user_id=?', (user_id,)).fetchone()
-    return {**DEFAULTS, **(json.loads(row['settings']) if row else {})}
+    return {**DEFAULTS, **(json.loads(row['settings']) if row else {}),'enabled':False}
 
 
 def save_settings(user_id, values):
-    values = {**DEFAULTS, **values}
-    if (type(values['enabled']) is not bool or values['primary'] not in PROFILES or
-            values['reviewer'] not in (*PROFILES, 'none') or values['reviewer'] == values['primary']):
-        raise ValueError('Choose a primary tutor and a different reviewer, or no reviewer.')
-    for name, low, high in [('reply_minutes', 0, 1440), ('review_hours', .25, 168), ('call_limit', 1, 100)]:
-        value = values[name]
-        if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not low <= value <= high:
-            raise ValueError('Choose valid reply delays and usage limits.')
-    if int(values['call_limit']) != values['call_limit']:
-        raise ValueError('The call limit must be a whole number.')
-    for field in ('gemini_model', 'openai_model'):
-        if not re.fullmatch(r'[A-Za-z0-9._-]{1,100}', values[field]):
-            raise ValueError('Enter a valid model ID.')
+    if values.get('enabled'):
+        raise ValueError('Automatic API tutoring is disabled. Save tutor responses manually.')
     with store.connection() as c:
-        c.execute('INSERT OR REPLACE INTO audio_tutor_settings VALUES (?,?)', (user_id, json.dumps(values)))
-        # Change only unstarted jobs. Already completed reviews never run again.
-        for thread in c.execute("SELECT * FROM audio_tutor_threads WHERE user_id=? AND state='open'", (user_id,)).fetchall():
-            _queue(c, dict(thread), values)
+        c.execute('INSERT OR REPLACE INTO audio_tutor_settings VALUES (?,?)', (user_id, json.dumps({**values, 'enabled': False})))
 
 
 def root_for(c, mark_id, audio_id):
@@ -88,16 +137,7 @@ def root_for(c, mark_id, audio_id):
 
 
 def _queue(c, thread, prefs):
-    for kind, provider, delay in [('reply', prefs['primary'], prefs['reply_minutes'] * 60),
-                                  ('review', prefs['reviewer'], prefs['review_hours'] * 3600)]:
-        if provider == 'none':
-            c.execute("UPDATE audio_tutor_jobs SET status='cancelled' WHERE root_id=? AND kind=? AND status IN ('queued','blocked')", (thread['root_id'], kind))
-            continue
-        c.execute('''INSERT INTO audio_tutor_jobs(root_id,revision,kind,provider,due_at)
-          VALUES (?,?,?,?,?) ON CONFLICT(root_id,revision,kind) DO UPDATE SET
-          provider=excluded.provider,due_at=excluded.due_at,status='queued',error=''
-          WHERE audio_tutor_jobs.status IN ('queued','blocked','cancelled') AND audio_tutor_jobs.started_at IS NULL''',
-          (thread['root_id'], thread['revision'], kind, provider, thread['activity_at'] + delay))
+    return  # Manual-only mode never queues API work.
 
 
 def human_activity(c, user_id, course_id, audio_id, mark_id):
@@ -149,8 +189,9 @@ def decorate(c, marks, user_id, owner_id):
     unread = {r['mark_id'] for r in c.execute('SELECT mark_id FROM audio_tutor_notifications WHERE user_id=? AND is_read=0', (user_id,))}
     for mark in marks:
         if mark['tutor_provider']:
-            mark['author'] = PROFILES.get(mark['tutor_provider'], 'AI Tutor')
-            mark['can_edit'] = user_id == owner_id
+            mark['author'] = profiles(mark['user_id'],c).get(mark['tutor_provider'], 'AI Tutor')
+            mark['can_edit'] = user_id in (mark['user_id'],owner_id)
+        mark['can_save_tutor_reply'] = not mark['is_deleted']
         mark['unread'] = mark['id'] in unread
         if mark['parent_id'] is not None:
             continue
@@ -158,9 +199,7 @@ def decorate(c, marks, user_id, owner_id):
         mark['help_state'] = thread['state'] if thread else 'inactive'
         mark['can_manage_help'] = not mark['is_deleted'] and user_id in (mark['user_id'], owner_id)
         mark['can_request_help'] = not mark['is_deleted'] and user_id == mark['user_id']
-        jobs = [] if not thread else [dict(r) for r in c.execute(
-            'SELECT kind,status,due_at,error,provider FROM audio_tutor_jobs WHERE root_id=? AND revision=? ORDER BY kind', (mark['id'], thread['revision']))]
-        mark['tutor_jobs'] = jobs
+        mark['tutor_jobs'] = []
     return marks
 
 
@@ -172,27 +211,11 @@ def read_replies(user_id, course_id, audio_id, root_id):
 
 
 def launch_worker():
-    root = Path(__file__).resolve().parent.parent
-    python = root / '.venv' / 'Scripts' / 'python.exe'
-    subprocess.Popen([str(python) if python.exists() else sys.executable, '-m', 'src.audio_tutor_worker', str(database.DB_PATH.resolve())],
-                     cwd=root, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return  # Automatic tutoring has been retired.
 
 
 def ensure_worker():
-    """Do not spawn anything until a user has explicitly enabled API tutoring."""
-    with store.connection() as c:
-        heartbeat = c.execute('SELECT heartbeat FROM audio_tutor_worker_state WHERE id=1').fetchone()
-        if heartbeat and heartbeat['heartbeat'] > now() - 120:
-            return True
-        active = any(settings(row['user_id'], c)['enabled'] for row in c.execute(
-            "SELECT DISTINCT t.user_id FROM audio_tutor_threads t JOIN audio_tutor_jobs j ON j.root_id=t.root_id WHERE t.state='open' AND j.status IN ('queued','blocked')"))
-    if active:
-        try:
-            launch_worker()
-        except OSError:
-            return False
-    return True
+    return True  # Nothing to start in manual-only mode.
 
 
 def timestamp(seconds):
@@ -269,74 +292,14 @@ def build_context(c, job):
 
 
 def claim_job(clock=None):
-    clock = now() if clock is None else clock
-    with store.connection() as c:
-        c.execute('BEGIN IMMEDIATE')
-        candidates = c.execute('''SELECT j.*,t.user_id,t.course_id,t.state,t.revision AS current_revision
-          FROM audio_tutor_jobs j JOIN audio_tutor_threads t ON t.root_id=j.root_id
-          WHERE j.status IN ('queued','blocked') AND j.due_at<=? ORDER BY j.due_at,j.id LIMIT 100''', (clock,)).fetchall()
-        for row in candidates:
-            job = dict(row)
-            if job['state'] != 'open' or job['revision'] != job['current_revision']:
-                c.execute("UPDATE audio_tutor_jobs SET status='cancelled' WHERE id=?", (job['id'],));continue
-            prefs = settings(job['user_id'], c)
-            if not prefs['enabled']:
-                c.execute("UPDATE audio_tutor_jobs SET status='blocked',error='Enable API tutoring in Tutor settings.' WHERE id=?", (job['id'],));continue
-            from src.tutor_providers import has_key
-            if not has_key(job['user_id'], job['provider']):
-                c.execute("UPDATE audio_tutor_jobs SET status='blocked',error='Connect this tutor in Tutor settings.' WHERE id=?", (job['id'],));continue
-            if job['kind'] == 'review':
-                primary = c.execute("SELECT status FROM audio_tutor_jobs WHERE root_id=? AND revision=? AND kind='reply'", (job['root_id'], job['revision'])).fetchone()
-                if primary and primary['status'] in ('error','cancelled'):
-                    c.execute("UPDATE audio_tutor_jobs SET status='cancelled',error='The first reply did not finish. Reopen help to retry.' WHERE id=?", (job['id'],));continue
-                if not primary or primary['status'] not in ('done', 'quiet'):
-                    continue
-            usage = c.execute('''SELECT COUNT(*) AS count,MIN(started_at) AS first FROM audio_tutor_jobs j
-              JOIN audio_tutor_threads t ON t.root_id=j.root_id WHERE t.user_id=? AND started_at>?''', (job['user_id'], clock-86400)).fetchone()
-            if usage['count'] >= prefs['call_limit']:
-                c.execute("UPDATE audio_tutor_jobs SET due_at=?,error='Waiting for your 24-hour call limit.' WHERE id=?", (usage['first']+86401, job['id']));continue
-            try:
-                context = build_context(c, job)
-            except ValueError:
-                c.execute("UPDATE audio_tutor_jobs SET status='cancelled',error='Conversation no longer available.' WHERE id=?", (job['id'],));continue
-            c.execute("UPDATE audio_tutor_jobs SET status='running',started_at=?,error='' WHERE id=?", (clock, job['id']))
-            return {**job, 'context': context, 'model': prefs[job['provider']+'_model']}
     return None
 
 
 def finish_job(job, result):
-    with store.connection() as c:
-        c.execute('BEGIN IMMEDIATE')
-        current = c.execute('''SELECT j.status,t.state,t.revision,t.user_id,t.course_id
-          FROM audio_tutor_jobs j JOIN audio_tutor_threads t ON t.root_id=j.root_id WHERE j.id=?''', (job['id'],)).fetchone()
-        if not current or current['status'] != 'running' or current['state'] != 'open' or current['revision'] != job['revision']:
-            return
-        # Settings can be paused or changed during an API call. Never publish then.
-        prefs = settings(current['user_id'], c)
-        provider = prefs['primary'] if job['kind'] == 'reply' else prefs['reviewer']
-        from src.tutor_providers import has_key
-        if not prefs['enabled'] or provider != job['provider'] or not has_key(current['user_id'], job['provider']):
-            c.execute("UPDATE audio_tutor_jobs SET status='cancelled' WHERE id=?", (job['id'],));return
-        try:
-            build_context(c, job)  # Recheck access and root deletion before publishing.
-        except ValueError:
-            c.execute("UPDATE audio_tutor_jobs SET status='cancelled' WHERE id=?", (job['id'],));return
-        message = result['reply'].strip()
-        if job['kind'] == 'review' and not result['needs_followup']:
-            c.execute("UPDATE audio_tutor_jobs SET status='quiet' WHERE id=?", (job['id'],));return
-        if not message or len(message) > 8000:
-            raise ValueError('The tutor returned an invalid reply.')
-        root = c.execute('SELECT * FROM audio_marks WHERE id=?', (job['root_id'],)).fetchone()
-        mark_id = c.execute('''INSERT INTO audio_marks(audio_id,start,end,note,status,parent_id,user_id,quote,created_at,tutor_provider,tutor_kind,tutor_job_id)
-          VALUES (?,?,?,?,'Neutral',?,?,'',CURRENT_TIMESTAMP,?,?,?)''',
-          (root['audio_id'], root['start'], root['end'], message, root['id'], current['user_id'], job['provider'], job['kind'], job['id'])).lastrowid
-        c.execute('INSERT INTO audio_tutor_notifications(mark_id,user_id,root_id) VALUES (?,?,?)', (mark_id,current['user_id'],root['id']))
-        c.execute("UPDATE audio_tutor_jobs SET status='done' WHERE id=?", (job['id'],))
+    return  # Suppress results from any retired automatic job.
         # Intentionally no human_activity call: tutor output never creates work.
 
 
 def fail_job(job, message):
     with store.connection() as c:
-        c.execute("UPDATE audio_tutor_jobs SET status='error',error=? WHERE id=? AND status='running'", (message, job['id']))
-        if job['kind'] == 'reply':
-            c.execute("UPDATE audio_tutor_jobs SET status='cancelled',error='The first reply failed. Reopen help to retry.' WHERE root_id=? AND revision=? AND kind='review' AND status IN ('queued','blocked')", (job['root_id'],job['revision']))
+        c.execute("UPDATE audio_tutor_jobs SET status='cancelled',error='Automatic API tutoring is disabled.' WHERE id=?", (job['id'],))

@@ -10,11 +10,12 @@ from src.course_material_nav import course_material_nav
 from src import audio_study as audio
 from src.audio_player import render_player
 from src.audio_upload import render_audio_upload
+from src.audio_course_setup import render_course_setup
 from src.drive_audio_ui import render_drive_settings
 from src.audio_assignment import catalog,coverage_label,render_assignment_editor
 from src.audio_sharing import render_sharing
 from src.audio_transcript import render_transcript
-from src.audio_tutor_ui import render_tutor_settings, render_tutor_inbox
+from src.audio_tutor_ui import render_tutor_profiles, render_saved_responses
 from src.karaoke_ui import render_recall
 from src.study_progress import review_window
 
@@ -22,13 +23,15 @@ st.set_page_config(page_title='Audio Study · StudyForge',page_icon='🎧',layou
 user_id=require_login()
 sidebar_nav(st.session_state.get('username',''))
 page_header('Audio Study','Listen actively. Mark the hard parts. Recall what matters.')
+render_course_setup(user_id)
 course_id=require_course(user_id, main=True)
 audio.init_audio()
 course_material_nav('audio')
-library,recall,analytics=st.tabs(['Audio Library','Karaoke Recall','Listening Analytics'])
+library,recall,analytics,responses=st.tabs(['Audio Library','Karaoke Recall','Listening Analytics','Tutor responses'])
+with responses:
+    render_saved_responses(user_id,course_id)
 with library:
-    render_tutor_settings(user_id)
-    render_tutor_inbox(user_id,course_id)
+    render_tutor_profiles(user_id)
     render_drive_settings(user_id,course_id)
     render_audio_upload(user_id,course_id)
 recordings=audio.library(user_id,course_id)

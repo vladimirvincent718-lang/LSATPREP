@@ -33,6 +33,11 @@ def init_audio():
         CREATE TABLE IF NOT EXISTS audio_marks (
           id INTEGER PRIMARY KEY, audio_id INTEGER NOT NULL, start REAL NOT NULL,
           end REAL NOT NULL, note TEXT NOT NULL, status TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS audio_comment_attachments (
+          id TEXT PRIMARY KEY,mark_id INTEGER NOT NULL,user_id INTEGER NOT NULL,
+          name TEXT NOT NULL,mime TEXT NOT NULL,pages INTEGER NOT NULL DEFAULT 0,
+          content BLOB NOT NULL,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE INDEX IF NOT EXISTS audio_attachment_mark ON audio_comment_attachments(mark_id);
         CREATE TABLE IF NOT EXISTS audio_sessions (
           id TEXT PRIMARY KEY, audio_id INTEGER NOT NULL,
           opened_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -281,11 +286,15 @@ def marks(user_id, course_id, audio_id):
         names={}
         if c.execute("SELECT 1 FROM sqlite_master WHERE name='users'").fetchone():
             names={r['id']:r['username'] for r in c.execute('SELECT id,username FROM users WHERE id IN (SELECT user_id FROM audio_marks WHERE audio_id=?)',(audio_id,))}
+        by_mark={item['id']:item for item in items}
+        for item in items:item['attachments']=[]
+        for file in c.execute('SELECT f.id,f.mark_id,f.name,f.mime,f.pages,length(f.content) AS size FROM audio_comment_attachments f JOIN audio_marks m ON m.id=f.mark_id WHERE m.audio_id=? AND m.is_deleted=0 ORDER BY f.created_at,f.id',(audio_id,)):
+            by_mark[file['mark_id']]['attachments'].append(dict(file))
         from src.audio_tutors import decorate
         return decorate(c, [dict(m,author=names.get(m['user_id'],'Listener'),can_edit=user_id in (m['user_id'],row['user_id'])) for m in items], user_id, row['user_id'])
 
 
-def save_mark(user_id, course_id, audio_id, start, end, note, status, mark_id=None, submission_id=None,parent_id=None,quote=''):
+def save_mark(user_id, course_id, audio_id, start, end, note, status, mark_id=None, submission_id=None,parent_id=None,quote='',attachments=None):
     with connection() as c:
         row = _accessible(c, user_id, course_id, audio_id)
         if parent_id is not None:
@@ -296,13 +305,19 @@ def save_mark(user_id, course_id, audio_id, start, end, note, status, mark_id=No
         if submission_id:
             existing=c.execute('SELECT mark_id FROM audio_note_submissions WHERE id=? AND audio_id=?',(submission_id,audio_id)).fetchone()
             if existing:return existing['mark_id']
+        from src.audio_attachments import validate_attachments
+        files=validate_attachments(attachments or [])
+        if mark_id is not None and files:raise ValueError('Add attachments in a new comment or reply.')
         if not all(math.isfinite(v) for v in (start, end)) or not 0 <= start <= end <= row['duration']:
             raise ValueError('Choose a point or range within the audio duration.')
-        if status not in STATUSES or not note.strip():
-            raise ValueError('Add a note and choose a review status.')
+        if status not in STATUSES or (not note.strip() and not files):
+            raise ValueError('Add a note or attachment and choose a review status.')
         if mark_id is None:
             saved=c.execute('INSERT INTO audio_marks(audio_id,start,end,note,status,parent_id,user_id,quote,created_at) VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)',
                              (audio_id, start, end, note.strip(), status,parent_id,user_id,quote.strip())).lastrowid
+            for file in files:
+                c.execute('INSERT INTO audio_comment_attachments(id,mark_id,user_id,name,mime,pages,content) VALUES (?,?,?,?,?,?,?)',
+                          (uuid.uuid4().hex,saved,user_id,file['name'],file['mime'],file['pages'],file['content']))
             if submission_id:c.execute('INSERT INTO audio_note_submissions VALUES (?,?,?)',(submission_id,audio_id,saved))
             from src.audio_tutors import human_activity
             human_activity(c,user_id,course_id,audio_id,saved)
@@ -344,6 +359,7 @@ def delete_mark(user_id, course_id, audio_id, mark_id):
         from src.audio_tutors import root_for
         mark=c.execute('SELECT * FROM audio_marks WHERE id=? AND audio_id=?',(mark_id,audio_id)).fetchone()
         if mark and user_id in (mark['user_id'],row['user_id']):
+            c.execute('DELETE FROM audio_comment_attachments WHERE mark_id=?',(mark_id,))
             root=root_for(c,mark_id,audio_id)
             # Deleting source context invalidates pending requests; deletion never starts work.
             c.execute("UPDATE audio_tutor_threads SET state='resolved',revision=revision+1 WHERE root_id=?",(root['id'],))

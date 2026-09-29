@@ -61,6 +61,14 @@ export default function({parentElement, data, setStateValue}) {
       .audio-study .chat-list {height:400px;max-height:60vh;overflow-y:auto;padding:12px;overflow-wrap:anywhere;}
       .audio-study .chat-entry {padding:10px 0;border-bottom:1px solid #e1e5ef;white-space:pre-wrap;}
       .audio-study .chat-entry p {margin:6px 0;}
+      .audio-study .comment-attachments {display:grid;gap:10px;margin-top:10px;}
+      .audio-study .comment-attachment {border:1px solid #dfe3ef;border-radius:8px;padding:8px;background:white;overflow-wrap:anywhere;}
+      .audio-study .attachment-preview {display:block;max-width:100%;max-height:380px;object-fit:contain;margin:8px auto;}
+      .audio-study .attachment-controls {display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+      .audio-study .pending-attachment {display:flex;align-items:center;gap:8px;margin:5px 0;}
+      .audio-study .comment-time {padding:5px 9px;border:1px solid #cbd1e4;border-radius:6px;background:#f7f8ff;color:#243047;cursor:pointer;font:inherit;font-weight:600;}
+      .audio-study .comment-time:hover {background:#e0e7ff;border-color:#818cf8;}
+      .audio-study .comment-time:focus-visible {outline:2px solid #6366f1;outline-offset:2px;}
       .audio-study.chat-collapsed .chat-body,.audio-study.chat-collapsed .chat-header h3 {display:none;}
       .audio-study.chat-collapsed .chat-header {padding:0;}
       .audio-study .chat-toggle {min-width:44px;min-height:44px;}
@@ -153,9 +161,21 @@ export default function({parentElement, data, setStateValue}) {
         <h3 style="margin:0 0 8px">Write a comment</h3><p class="note-time"></p><blockquote class="note-quote" hidden></blockquote>
         <label style="display:block;font-weight:700">Your note or comment
         <textarea class="note-text" rows="4" placeholder="Type your comment about this part of the recording…" style="display:block;box-sizing:border-box;width:100%;margin:8px 0;padding:12px;border:2px solid #818cf8;border-radius:8px;background:white;color:#172033;font:inherit"></textarea></label>
+        <label style="display:block;margin:12px 0">Attach pictures or slides
+          <input class="note-files" type="file" multiple accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,.pptx" style="display:block;margin-top:6px">
+        </label><p style="font-size:12px">Up to 5 files · 10 MB each · 25 MB total. PDF slides preview here; PowerPoint files download to view.</p>
+        <div class="note-attachments"></div><p class="attachment-message" role="status" aria-live="polite"></p>
         <label>Review status <select class="note-status"><option>Neutral</option><option>Red</option><option>Yellow</option><option>Green</option></select></label>
         <p><button class="note-save">Save comment</button> <button class="note-cancel">Cancel</button></p>
         <p class="note-message" role="status" aria-live="polite"></p>
+      </section>
+      <section class="manual-tutor-composer" hidden style="margin:16px 0;padding:16px;border:1px solid #a5b4fc;border-radius:10px;background:#f5f7ff">
+        <h3>Paste a tutor response</h3><p class="manual-tutor-context"></p>
+        <p>This saves an answer you copied from another app. No AI request is sent.</p>
+        <label>Tutor profile <select class="manual-tutor-profile"></select></label>
+        <label style="display:block;margin-top:12px">Response from your AI chat<textarea class="manual-tutor-text" rows="7" style="display:block;box-sizing:border-box;width:100%;padding:10px;font:inherit" placeholder="Paste the response here…"></textarea></label>
+        <p><button class="manual-tutor-save" type="button">Save response</button> <button class="manual-tutor-cancel" type="button">Cancel</button></p>
+        <p class="manual-tutor-message" role="status" aria-live="polite"></p>
       </section>
       <p class="error" role="alert"></p><div class="notes"></div></div>
       <aside class="chat-panel" aria-label="Timestamped comment replay">
@@ -178,6 +198,58 @@ export default function({parentElement, data, setStateValue}) {
         root.send('delete_note',{id:root.deleteRequest,mark_id:mark.id});
       };
       return button;
+    };
+    root.noteAttachments=[];
+    root.paintPendingAttachments=()=>{
+      const list=root.querySelector('.note-attachments');list.replaceChildren();
+      root.noteAttachments.forEach((file,index)=>{
+        const item=document.createElement('div');item.className='pending-attachment';
+        const name=document.createElement('span');name.textContent=`${file.name} (${(file.size/1024/1024).toFixed(1)} MB)`;
+        const remove=document.createElement('button');remove.type='button';remove.textContent='×';remove.setAttribute('aria-label',`Remove ${file.name}`);
+        remove.disabled=Boolean(root.noteRequest);
+        remove.onclick=()=>{if(root.noteRequest)return;root.noteAttachments.splice(index,1);root.paintPendingAttachments();};
+        item.append(name,remove);list.append(item);
+      });
+    };
+    root.querySelector('.note-files').onchange=e=>{
+      if(root.noteRequest)return;
+      const files=[...root.noteAttachments,...e.target.files];
+      const message=root.querySelector('.attachment-message');e.target.value='';
+      if(files.length>5){message.textContent='Attach up to 5 files per comment.';return;}
+      if(files.some(file=>!file.size||file.size>10*1024*1024)){message.textContent='Each file must contain data and be 10 MB or smaller.';return;}
+      if(files.reduce((sum,file)=>sum+file.size,0)>25*1024*1024){message.textContent='Attachments must total 25 MB or less.';return;}
+      if(files.some(file=>! /\.(png|jpe?g|gif|webp|pdf|pptx)$/i.test(file.name))){message.textContent='Choose a picture, PDF, or PowerPoint (.pptx) file.';return;}
+      root.noteAttachments=files;message.textContent='';root.paintPendingAttachments();
+    };
+    root.attachmentPageRequests=new Map();
+    root.renderAttachments=(mark,container)=>{
+      if(!mark.attachments?.length)return;
+      const list=document.createElement('div');list.className='comment-attachments';
+      for(const file of mark.attachments){
+        const item=document.createElement('section');item.className='comment-attachment';
+        const title=document.createElement('strong');title.textContent=file.name;item.append(title);
+        if(file.preview_url){
+          const picture=document.createElement('img');picture.className='attachment-preview';picture.loading='lazy';picture.src=file.preview_url;
+          picture.alt=file.mime==='application/pdf'?`${file.name}, slide ${file.preview_page+1}`:file.name;
+          const fullSize=document.createElement('a');fullSize.href=file.preview_url;fullSize.target='_blank';fullSize.rel='noopener noreferrer';fullSize.title='Open full-size preview';fullSize.append(picture);item.append(fullSize);
+        }
+        if(file.mime==='application/pdf'&&file.pages>1){
+          const controls=document.createElement('div');controls.className='attachment-controls';
+          const current=file.preview_page||0;
+          if(root.attachmentPageRequests.get(file.id)===current)root.attachmentPageRequests.delete(file.id);
+          const busy=root.attachmentPageRequests.has(file.id);
+          const previous=document.createElement('button');previous.type='button';previous.textContent='← Previous';previous.disabled=current===0||busy;
+          const next=document.createElement('button');next.type='button';next.textContent='Next →';next.disabled=current>=file.pages-1||busy;
+          const label=document.createElement('span');label.textContent=`Slide ${current+1} of ${file.pages}`;
+          const change=page=>{root.attachmentPageRequests.set(file.id,page);previous.disabled=true;next.disabled=true;label.textContent='Loading slide…';root.send('attachment_page',{id:file.id,page});};
+          previous.onclick=()=>change(current-1);next.onclick=()=>change(current+1);
+          controls.append(previous,label,next);item.append(controls);
+        }
+        if(file.preview_error){const message=document.createElement('p');message.textContent=file.preview_error;item.append(message);}
+        const download=document.createElement('a');download.href=file.url;download.download=file.name;download.textContent=file.mime.endsWith('presentationml.presentation')?'Download PowerPoint':'Download file';item.append(download);
+        list.append(item);
+      }
+      container.append(list);
     };
     root.audio = root.querySelector('audio'); root.canvas = root.querySelector('canvas');
     const setChatCollapsed=collapsed=>{
@@ -208,12 +280,14 @@ export default function({parentElement, data, setStateValue}) {
       for(const mark of visible){
         const card=document.createElement('div');card.className='chat-entry';
         card.classList.toggle('in-range',mark.end>mark.start&&position<=mark.end);
-        const meta=document.createElement('strong');meta.textContent=`${root.rangeLabel(mark)} · ${mark.author||'You'}${mark.parent_id?' · Reply':''}`;
+        const meta=document.createElement('strong');
+        const timestamp=root.commentTimestamp(mark);
+        meta.append(timestamp,document.createTextNode(` · ${mark.author||'You'}${mark.parent_id?' · Reply':''}`));
         const text=document.createElement('p');text.textContent=mark.note;
         if(mark.can_edit)card.append(root.deleteButton(mark));
         card.append(meta);
         if(mark.quote){const quote=document.createElement('blockquote');quote.textContent=mark.quote;card.append(quote);}
-        card.append(text);list.append(card);
+        card.append(text);root.renderAttachments(mark,card);list.append(card);
       }
       if(follow)list.scrollTop=list.scrollHeight;
     };
@@ -232,6 +306,24 @@ export default function({parentElement, data, setStateValue}) {
     root.playId=null;root.observedPosition=root.resume;
     root.format=value=>`${Math.floor(value/60)}:${String(Math.floor(value%60)).padStart(2,'0')}`;
     root.rangeLabel=mark=>root.format(mark.start)+(mark.end>mark.start?` – ${root.format(mark.end)}`:'');
+    root.seekToComment=mark=>{
+      const audio=root.audio;
+      if(!Number.isFinite(audio.duration)||audio.duration<=0)return;
+      root.last=null;
+      audio.currentTime=Math.max(0,Math.min(audio.duration,mark.start));
+      root.processed=audio.currentTime;
+      root.selection=[audio.currentTime,Math.max(audio.currentTime,Math.min(audio.duration,mark.end))];
+      root.explicitSelection=true;root.wordSelection=null;root.selectedQuote=mark.quote||'';
+      root.querySelector('.selection').textContent=`Selection: ${root.rangeLabel({start:root.selection[0],end:root.selection[1]})}`;
+      root.retargetComposer();root.flush();
+    };
+    root.commentTimestamp=(mark,label=root.rangeLabel(mark))=>{
+      const button=document.createElement('button');button.type='button';button.className='comment-time';button.textContent=label;
+      button.title=`Jump to ${root.format(mark.start)}`;
+      button.setAttribute('aria-label',`Jump to comment at ${root.rangeLabel(mark)}`);
+      button.onclick=()=>root.seekToComment(mark);
+      return button;
+    };
     root.transcriptMode='navigate';root.wordSelection=null;root.highlights=[];
     const preference=(key,value)=>{try {window.localStorage.setItem('studyforge.audio.'+key,value);} catch {}};
     const setMode=mode=>{
@@ -366,14 +458,32 @@ export default function({parentElement, data, setStateValue}) {
       const input=root.querySelector('.note-text');input.focus();input.scrollIntoView?.({block:'nearest',behavior:'smooth'});
     };
     root.querySelector('.note-cancel').onclick=()=>{root.querySelector('.composer').hidden=true;};
-      root.querySelector('.note-save').onclick=()=>{
+    root.querySelector('.manual-tutor-cancel').onclick=()=>{if(!root.tutorReplyRequest)root.querySelector('.manual-tutor-composer').hidden=true;};
+    root.querySelector('.manual-tutor-save').onclick=()=>{
+      if(root.tutorReplyRequest)return;
+      const text=root.querySelector('.manual-tutor-text').value;
+      if(!text.trim()){root.querySelector('.manual-tutor-message').textContent='Paste a response before saving.';return;}
+      root.tutorReplyRequest=crypto.randomUUID();root.querySelector('.manual-tutor-save').disabled=true;
+      root.querySelector('.manual-tutor-message').textContent='Saving response…';
+      root.send('tutor_reply',{id:root.tutorReplyRequest,parent_id:root.tutorReplyTo,provider:root.querySelector('.manual-tutor-profile').value,text});
+    };
+    root.querySelector('.note-save').onclick=async()=>{
       if(root.noteRequest)return;
       const text=root.querySelector('.note-text').value.trim();
-      if(!text){root.querySelector('.note-message').textContent='Type your comment before saving.';root.querySelector('.note-text').focus();return;}
-      root.flush();
-      root.noteRequest=crypto.randomUUID();root.querySelector('.note-save').disabled=true;
+      if(!text&&!root.noteAttachments.length){root.querySelector('.note-message').textContent='Type a comment or attach a file before saving.';root.querySelector('.note-text').focus();return;}
+      root.noteRequest=crypto.randomUUID();root.querySelector('.note-save').disabled=true;root.querySelector('.note-files').disabled=true;root.paintPendingAttachments();
       root.querySelector('.note-message').textContent='Saving comment…';
-      root.send('note',{id:root.noteRequest,start:root.noteRange[0],end:root.noteRange[1],text,status:root.querySelector('.note-status').value,parent_id:root.replyTo,quote:root.noteQuote||''});
+      try {
+        const attachments=root.noteAttachments.length?await Promise.all(root.noteAttachments.map(file=>new Promise((resolve,reject)=>{
+          const reader=new window.FileReader();reader.onload=()=>resolve({name:file.name,data:String(reader.result).split(',')[1]});
+          reader.onerror=reader.onabort=()=>reject(new Error('The attachment could not be read. Choose it again.'));reader.readAsDataURL(file);
+        }))):[];
+        root.flush();
+        root.send('note',{id:root.noteRequest,start:root.noteRange[0],end:root.noteRange[1],text,status:root.querySelector('.note-status').value,parent_id:root.replyTo,quote:root.noteQuote||'',attachments});
+      } catch {
+        root.noteRequest=null;root.querySelector('.note-save').disabled=false;root.querySelector('.note-files').disabled=false;root.paintPendingAttachments();
+        root.querySelector('.note-message').textContent='An attachment could not be read. Choose the file again.';
+      }
     };
     const point=e=>Math.max(0,Math.min(audio.duration||0,(e.clientX-root.canvas.getBoundingClientRect().left)/root.canvas.getBoundingClientRect().width*(audio.duration||0)));
     root.canvas.onpointerdown=e=>{root.drag=point(e);root.canvas.setPointerCapture(e.pointerId);};
@@ -534,11 +644,13 @@ export default function({parentElement, data, setStateValue}) {
     root.handledNoteResult=data.note_result.id;
     root.querySelector('.note-save').disabled=false;
     root.querySelector('.note-message').textContent=data.note_result.error||'✓ Comment saved. It appears in the conversation below.';
-    root.noteRequest=null;
+    root.noteRequest=null;root.querySelector('.note-files').disabled=false;
     if(!data.note_result.error){
+      const hadAttachments=root.noteAttachments.length>0;root.noteAttachments=[];root.querySelector('.note-files').value='';root.querySelector('.attachment-message').textContent='';root.paintPendingAttachments();
+      if(hadAttachments)root.send('note',null);
       root.querySelector('.note-text').value='';root.explicitSelection=false;root.wordSelection=null;root.selectedQuote='';
       root.replyTo=null;root.noteQuote='';root.querySelector('.composer').hidden=true;
-    }
+    } else root.paintPendingAttachments();
   }
   if(data.delete_result && data.delete_result.id===root.deleteRequest){
     root.deleteRequest=null;
@@ -561,6 +673,11 @@ export default function({parentElement, data, setStateValue}) {
   root.transcriptionStatus=data.transcription?.status;root.transcriptionError=data.transcription?.error;
   root.transcriptText=data.transcript||'';
   root.transcriptExports=data.transcript_exports;
+  if(data.tutor_reply_result&&data.tutor_reply_result.id===root.tutorReplyRequest){
+    root.tutorReplyRequest=null;root.querySelector('.manual-tutor-save').disabled=false;
+    root.querySelector('.manual-tutor-message').textContent=data.tutor_reply_result.error||'✓ Response saved.';
+    if(!data.tutor_reply_result.error){root.querySelector('.manual-tutor-text').value='';root.querySelector('.manual-tutor-composer').hidden=true;}
+  }
   root.marks=data.marks;
   root.highlights=data.highlights||[];
   if(data.highlight_result&&data.highlight_result.id===root.highlightRequest){
@@ -592,12 +709,12 @@ export default function({parentElement, data, setStateValue}) {
     root.helpRequest=null;root.threadSignature=null;
     root.querySelector('.error').textContent=data.help_result.error||'';
   }
-  const signature=JSON.stringify([data.marks,data.tutors_enabled]);
+  const signature=JSON.stringify([data.marks,data.manual_tutors,data.tutor_profiles]);
   if(signature!==root.threadSignature){
     root.threadSignature=signature;
     const notes=root.querySelector('.notes');notes.replaceChildren();
     const heading=document.createElement('h3');heading.textContent='Comments';notes.append(heading);
-    if(data.tutors_enabled!==undefined){const hint=document.createElement('p');hint.textContent=data.tutors_enabled?'Your comments request tutor help. Resolve a thread to stop; a new comment from you reopens it.':'Your comments request help. Connect and enable a tutor in AI tutors to receive automatic replies.';notes.append(hint);}
+    if(data.manual_tutors){const hint=document.createElement('p');hint.textContent='Use Save tutor response to paste an answer from your AI chat. Find your collection in Tutor responses.';notes.append(hint);}
     const children=new Map();
     for(const mark of data.marks){const parent=mark.parent_id||0;if(!children.has(parent))children.set(parent,[]);children.get(parent).push(mark);}
     const renderThread=(mark,container,depth=0)=>{
@@ -606,9 +723,8 @@ export default function({parentElement, data, setStateValue}) {
       if(mark.tutor_provider)card.dataset.tutor=mark.tutor_provider;
       if(mark.can_edit && !mark.is_deleted)card.append(root.deleteButton(mark));
       const meta=document.createElement('div');meta.style.cssText='font-size:12px;color:#596579;margin-bottom:7px';
-      meta.textContent=`${mark.author||'You'}${mark.tutor_kind==='review'?' · Follow-up review':''}${mark.unread?' · New reply':''} · ${mark.created_at?mark.created_at+' UTC':'Earlier comment'}`;card.append(meta);
-      const jump=document.createElement('button');jump.textContent=root.rangeLabel(mark)+(mark.parent_id?'':` · ${mark.status}`);
-      jump.onclick=()=>{root.audio.currentTime=mark.start;root.processed=mark.start;root.selection=[mark.start,mark.end];root.explicitSelection=true;root.wordSelection=null;root.selectedQuote=mark.quote||'';root.retargetComposer();root.paint();};card.append(jump);
+      meta.textContent=`${mark.author||'You'}${mark.tutor_kind==='manual'?' · Pasted response':mark.tutor_kind==='review'?' · Follow-up review':''}${mark.unread?' · New reply':''} · ${mark.created_at?mark.created_at+' UTC':'Earlier comment'}`;card.append(meta);
+      const jump=root.commentTimestamp(mark,root.rangeLabel(mark)+(mark.parent_id?'':` · ${mark.status}`));card.append(jump);
       if(mark.quote&&!mark.is_deleted){const quote=document.createElement('blockquote');quote.textContent=mark.quote;card.append(quote);}
       const body=document.createElement('p');body.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;margin:10px 0';
       if(mark.tutor_provider){
@@ -620,8 +736,8 @@ export default function({parentElement, data, setStateValue}) {
           else body.append(document.createTextNode(match[0]));last=match.index+match[0].length;
         }body.append(document.createTextNode(mark.note.slice(last)));
       }else body.textContent=mark.note;
-      card.append(body);
-      if(!mark.parent_id&&mark.help_state){
+      card.append(body);root.renderAttachments(mark,card);
+      if(!mark.parent_id&&mark.help_state&&!data.manual_tutors){
         const status=document.createElement('p');status.className='help-status';status.textContent=mark.help_state==='open'?'⚑ Help requested':mark.help_state==='resolved'?'✓ Resolved · tutoring stopped':'Tutor help not requested';card.append(status);
         const sendHelp=payload=>{if(root.helpRequest)return;root.helpRequest=crypto.randomUUID();root.send('help_change',{id:root.helpRequest,root_id:mark.id,...payload});for(const b of root.querySelectorAll('.help-control'))b.disabled=true;};
         if(mark.can_manage_help&&(mark.help_state==='open'||mark.can_request_help)){
@@ -646,6 +762,19 @@ export default function({parentElement, data, setStateValue}) {
         root.querySelector('.note-status').parentElement.hidden=true;root.querySelector('.note-message').textContent='';
         root.querySelector('.note-text').focus();root.querySelector('.composer').scrollIntoView?.({block:'nearest',behavior:'smooth'});
       };card.append(reply);container.append(card);
+      if(data.manual_tutors&&mark.can_save_tutor_reply){
+        const paste=document.createElement('button');paste.type='button';paste.className='help-control save-tutor-response';paste.textContent='Save tutor response';
+        paste.onclick=()=>{
+          if(root.tutorReplyRequest)return;
+          root.tutorReplyTo=mark.id;
+          const select=root.querySelector('.manual-tutor-profile');const previous=select.value;select.replaceChildren();
+          for(const [provider,label] of Object.entries(data.tutor_profiles||{})){const option=document.createElement('option');option.value=provider;option.textContent=label;select.append(option);}
+          if(Object.hasOwn(data.tutor_profiles||{},previous))select.value=previous;
+          root.querySelector('.manual-tutor-context').textContent=`At ${root.format(mark.start)} · ${mark.note.slice(0,180)}`;
+          root.querySelector('.manual-tutor-message').textContent='';root.querySelector('.manual-tutor-composer').hidden=false;
+          root.querySelector('.manual-tutor-text').focus();root.querySelector('.manual-tutor-composer').scrollIntoView?.({block:'center',behavior:'smooth'});
+        };card.append(paste);
+      }
       for(const child of children.get(mark.id)||[])renderThread(child,depth<5?card:container,depth+1);
     };
     for(const mark of (children.get(0)||[]).sort((a,b)=>a.start-b.start||a.id-b.id))renderThread(mark,notes);

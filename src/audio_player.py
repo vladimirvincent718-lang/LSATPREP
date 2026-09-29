@@ -7,6 +7,7 @@ import streamlit.components.v2 as components
 from src import audio_study as store
 from src.audio_transcription import queue_transcription, transcription_state
 from src import audio_tutors as tutors
+from src.audio_attachments import media_for_marks
 
 _JS = Path(__file__).with_suffix('.js').read_text(encoding='utf-8')
 
@@ -38,13 +39,13 @@ def render_player(user_id, course_id, audio):
     src=runtime.get_instance().media_file_mgr.add(st.session_state[key+'_bytes'],audio['mime'],key)
     queue_transcription(user_id,course_id,audio['id'])
     transcription = transcription_state(user_id,course_id,audio['id'])
-    tutors.ensure_worker()
     text=store.transcript(user_id,course_id,audio['id'])
     completion = store.completion(user_id,course_id,audio['id'])
     previous_completion = st.session_state.get(key+'_completed')
     st.session_state[key+'_completed'] = completion['completed']
     if previous_completion is not None and previous_completion != completion['completed']:
         st.rerun(scope='app')
+    marks=media_for_marks(user_id,course_id,audio['id'],store.marks(user_id,course_id,audio['id']),st.session_state.get(key+'_attachment_pages',{}))
     result = player(key=key, data={'src':src,
                      'transcription':transcription,
                      'completion':completion,
@@ -52,20 +53,22 @@ def render_player(user_id, course_id, audio):
                      'transcript':text,
                      'transcript_exports':{'plain':tutors.transcript_export(text,transcription['words'],False),
                                            'timed':tutors.transcript_export(text,transcription['words'],True)},
-                     'tutors_enabled':tutors.settings(user_id)['enabled'],
+                     'manual_tutors':True,
+                     'tutor_profiles':tutors.profiles(user_id),
+                     'tutor_reply_result':st.session_state.get(key+'_tutor_reply_result'),
                      'help_result':st.session_state.get(key+'_help_result'),
                      'focus_root':st.session_state.get(f'tutor_focus_{user_id}_{course_id}'),
                      'play_count':store.play_count(user_id,course_id,audio['id']),
-                     'marks':store.marks(user_id,course_id,audio['id']),
+                     'marks':marks,
                      'highlights':store.highlights(user_id,course_id,audio['id']),
                      'highlight_result':st.session_state.get(key+'_highlight_result'),
                      'progress':store.progress(user_id,course_id,audio['id']),
                      'ack':st.session_state.get(key+'_ack'),
                      'delete_result':st.session_state.get(key+'_delete_result'),
                      'note_result':st.session_state.get(key+'_note_result')},
-                     default={'events':[], 'note':None, 'delete_note':None, 'completion_change':None, 'highlight_change':None, 'help_change':None}, on_events_change=lambda:None,
+                     default={'events':[], 'note':None, 'delete_note':None, 'completion_change':None, 'highlight_change':None, 'help_change':None, 'tutor_reply':None, 'attachment_page':None}, on_events_change=lambda:None,
                      on_note_change=lambda:None, on_delete_note_change=lambda:None, on_completion_change_change=lambda:None,
-                     on_highlight_change_change=lambda:None, on_help_change_change=lambda:None)
+                     on_highlight_change_change=lambda:None, on_help_change_change=lambda:None, on_tutor_reply_change=lambda:None, on_attachment_page_change=lambda:None)
     changed = False
     ack = st.session_state.get(key+'_ack') or {}
     for event in result.events or []:
@@ -80,7 +83,7 @@ def render_player(user_id, course_id, audio):
         response = {'id':note['id']}
         try:
             store.save_mark(user_id,course_id,audio['id'],float(note['start']),float(note['end']),
-                            note['text'],note['status'],submission_id=note['id'],parent_id=note.get('parent_id'),quote=note.get('quote',''))
+                            note['text'],note['status'],submission_id=note['id'],parent_id=note.get('parent_id'),quote=note.get('quote',''),attachments=note.get('attachments',[]))
         except ValueError as exc:
             response['error'] = str(exc)
         st.session_state[key+'_note_result'] = response
@@ -98,6 +101,15 @@ def render_player(user_id, course_id, audio):
         st.session_state[key+'_highlight_result'] = response
         changed = True
     help_change=result.help_change
+    tutor_reply=result.tutor_reply
+    if tutor_reply and tutor_reply['id'] != (st.session_state.get(key+'_tutor_reply_result') or {}).get('id'):
+        response={'id':tutor_reply['id']}
+        try:
+            tutors.save_manual_reply(user_id,course_id,audio['id'],int(tutor_reply['parent_id']),tutor_reply['provider'],tutor_reply['text'],tutor_reply['id'])
+        except (ValueError,TypeError,KeyError) as exc:
+            response['error']=str(exc)
+        st.session_state[key+'_tutor_reply_result']=response
+        changed=True
     if help_change and help_change['id'] != (st.session_state.get(key+'_help_result') or {}).get('id'):
         response={'id':help_change['id']}
         try:
@@ -128,6 +140,15 @@ def render_player(user_id, course_id, audio):
             response['error'] = str(exc)
         st.session_state[key+'_completion_result'] = response
         st.rerun(scope='app')
+    attachment_page=result.attachment_page
+    if attachment_page:
+        available={file['id']:file for mark in marks for file in mark.get('attachments',[]) if file['mime']=='application/pdf'}
+        file=available.get(attachment_page.get('id'))
+        page=attachment_page.get('page')
+        if file and isinstance(page,int) and 0<=page<file['pages']:
+            selected=st.session_state.setdefault(key+'_attachment_pages',{})
+            if selected.get(file['id'],0)!=page:
+                selected[file['id']]=page
+                changed=True
     if changed:
-        tutors.ensure_worker()
         rerun_player()
