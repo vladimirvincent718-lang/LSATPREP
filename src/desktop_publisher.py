@@ -218,6 +218,7 @@ def render_publish_controls() -> None:
 
     st.markdown("#### Publish app updates")
     st.caption("Upload the latest app code from this computer to your existing phone link. This uses no AI tokens. Your study database, uploads, and passwords stay on this computer.")
+    st.warning("The phone link has a separate study database. Publishing code does not copy your mock dates, scores, courses, or mistake history.")
     connected = github_connected()
     if not connected:
         st.info("Connect GitHub once on this computer, then publish updates whenever you change the app.")
@@ -233,7 +234,7 @@ def render_publish_controls() -> None:
         st.success(f"GitHub connected as {GITHUB_OWNER}.")
     publish_column, unpublish_column = st.columns(2)
     with publish_column:
-        publish_clicked = st.button("Publish update", key="studyforge_publish_update", type="primary", disabled=not connected)
+        publish_clicked = st.button("Publish code update", key="studyforge_publish_update", type="primary", disabled=not connected)
     with unpublish_column:
         with st.popover("Unpublish online app", width="stretch"):
             st.markdown("**Take the Streamlit app off the internet**")
@@ -247,7 +248,7 @@ def render_publish_controls() -> None:
             with st.spinner("Checking and uploading the latest app code..."):
                 commit, changed = publish_update()
             if changed:
-                st.success(f"Uploaded {changed} changed source files (version {commit[:7]}). Streamlit is rebuilding the same link; refresh it in a minute or two.")
+                st.success(f"Uploaded {changed} changed source files (version {commit[:7]}). Streamlit is rebuilding the same link; refresh it in a minute or two. Study data was not synced.")
             else:
                 st.info("The online app already has the same source files.")
         except PublishError as exc:
