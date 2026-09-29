@@ -1,3 +1,8 @@
+// Community Cloud serves the app behind /~/+; root media URLs hit its HTML shell.
+export function resolveAudioSource(src, pathname) {
+  return src.startsWith('/media/') && pathname.startsWith('/~/+/') ? '/~/+' + src : src;
+}
+
 // Timestamped passages are exact; individual words are interpolated within them.
 export function transcriptTimeline(text, duration) {
   if (!text?.trim() || !Number.isFinite(duration) || duration <= 0) return {words:[], timed:false};
@@ -366,7 +371,8 @@ export default function({parentElement, data, setStateValue}) {
     root.ownerDocument.addEventListener('pointerup',root.finishWordDrag);
     root.ownerDocument.addEventListener('pointercancel',root.finishWordDrag);
     const audio = root.audio;
-    audio.src = data.src;
+    const mediaSrc = resolveAudioSource(data.src, window.location.pathname);
+    audio.src = mediaSrc;
     root.retargetComposer=()=>{
       if(root.querySelector('.composer').hidden||root.noteRequest)return;
       root.replyTo=null;
@@ -628,7 +634,7 @@ export default function({parentElement, data, setStateValue}) {
       root.querySelector('.progress').textContent=`${saved?'✓ Saved':'Auto-saving'} · ${display}. Green follows your position in either direction.`;
     };
     const context = new (window.AudioContext || window.webkitAudioContext)();
-    fetch(data.src).then(r=>r.arrayBuffer()).then(b=>context.decodeAudioData(b)).then(buffer=>{
+    fetch(mediaSrc).then(r=>r.arrayBuffer()).then(b=>context.decodeAudioData(b)).then(buffer=>{
       const samples=buffer.getChannelData(0), count=700, size=Math.max(1,Math.ceil(samples.length/count));
       root.peaks=Array.from({length:count},(_,i)=>{let peak=0;for(let j=i*size;j<Math.min((i+1)*size,samples.length);j++)peak=Math.max(peak,Math.abs(samples[j]));return peak;});root.paint();
     }).catch(()=>{root.querySelector('.error').textContent='Waveform decoding is unavailable for this file. Playback and time-based notes are still available.';}).finally(()=>context.close());
