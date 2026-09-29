@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 import hashlib
 import os
 from pathlib import Path
@@ -20,11 +19,12 @@ DISPLAY_TIMEZONE = ZoneInfo("America/New_York")
 
 @dataclass(frozen=True)
 class DeploymentStatus:
-    """Identity of the code currently running the app."""
+    """Git identity and, on desktop, the latest local source edit."""
 
     commit: str
     committed_at: datetime | None
     has_local_changes: bool = False
+    local_source_modified_at: datetime | None = None
 
     @property
     def short_commit(self) -> str:
@@ -78,9 +78,22 @@ def _parse_timestamp(value: str | None, *, assume_utc: bool = False) -> datetime
     return parsed.astimezone(DISPLAY_TIMEZONE)
 
 
-@lru_cache(maxsize=1)
+def _latest_local_source_edit(root: Path = PROJECT_ROOT) -> datetime | None:
+    """Inspect the same source paths the desktop publish button considers."""
+    suffixes = {".py", ".js", ".css", ".html"}
+    candidates = [root / "app.py", root / "requirements.txt", root / ".streamlit" / "config.toml"]
+    for folder in ("src", "pages", "scripts", "assets"):
+        base = root / folder
+        if base.is_dir():
+            candidates.extend(path for path in base.rglob("*") if path.is_file() and path.suffix.lower() in suffixes)
+    modified = [path.stat().st_mtime for path in candidates if path.is_file() and not path.is_symlink()]
+    if not modified:
+        return None
+    return datetime.fromtimestamp(max(modified), tz=timezone.utc).astimezone(DISPLAY_TIMEZONE)
+
+
 def get_deployment_status() -> DeploymentStatus:
-    """Return the deployed Git revision and its immutable commit time."""
+    """Return Git revision, plus current source edit time on the desktop."""
     commit = (
         os.environ.get("STREAMLIT_GIT_COMMIT")
         or os.environ.get("GITHUB_SHA")
@@ -89,6 +102,7 @@ def get_deployment_status() -> DeploymentStatus:
     )
     committed_at = None
     has_local_changes = False
+    local_source_modified_at = _latest_local_source_edit() if os.name == "nt" else None
 
     try:
         if not commit:
@@ -106,6 +120,7 @@ def get_deployment_status() -> DeploymentStatus:
         commit=commit,
         committed_at=committed_at,
         has_local_changes=has_local_changes,
+        local_source_modified_at=local_source_modified_at,
     )
 
 
@@ -119,8 +134,11 @@ def format_local_timestamp(value: datetime | None, *, include_seconds: bool = Fa
 
 def deployment_caption(status: DeploymentStatus | None = None) -> str:
     status = status or get_deployment_status()
+    if status.local_source_modified_at is not None:
+        when = format_local_timestamp(status.local_source_modified_at)
+        return f"Desktop source last edited {when} · Git baseline {status.short_commit}"
     when = format_local_timestamp(status.committed_at)
-    caption = f"Code updated {when} · version {status.short_commit}"
+    caption = f"Online code published {when} · version {status.short_commit}"
     if status.has_local_changes:
         caption += " · local changes pending"
     return caption
