@@ -789,6 +789,22 @@ def _render_mat_card(mat: dict, status: str, user_id: int,
                     st.rerun()
 
 
+# Open the exact queued resource while retaining the normal material renderer.
+if st.session_state.get('review_task_material'):
+    queued_id = st.session_state['review_task_material']
+    queued = next((m for m in get_materials(course_id) if m['id'] == queued_id), None)
+    if st.button('← Back to my to-do plan'):
+        st.session_state.pop('review_task_material', None)
+        st.switch_page('pages/8a_Mock_Review.py')
+    if queued:
+        _render_mat_card(queued, get_material_progress(user_id, course_id).get(queued_id, 'Not Started'), user_id, course_id, admin)
+    else:
+        st.info('This material is no longer available in the active course.')
+    if st.button('Browse all materials'):
+        st.session_state.pop('review_task_material', None)
+        st.rerun()
+    st.stop()
+
 # ── Build tabs ────────────────────────────────────────────────────────────────
 if admin:
     tab_review, tab_view, tab_add, tab_discover = st.tabs(["Cheat sheets & spaced review", "Materials", "Add Material", "Discover Resources"], key='course_material_tabs', on_change='rerun')

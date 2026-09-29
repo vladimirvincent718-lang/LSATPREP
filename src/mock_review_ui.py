@@ -91,8 +91,16 @@ def course_review_groups(items):
     return list(groups.values())
 
 
-def review_queue_table(items, window_sessions):
+def review_queue_table(items, window_sessions, *, user_id=None, mock_schedule_id=None, progress_items=None,
+                       render_course_queue=None, task_rows=None):
     """A compact course outline with independently expandable detail tables."""
+    from src.mock_review import get_review_course_order, move_review_course
+
+    can_reorder = user_id is not None and mock_schedule_id is not None
+    if can_reorder:
+        order = get_review_course_order(user_id, mock_schedule_id)
+        ranks = {course_id: index for index, course_id in enumerate(order)}
+        items = sorted(items, key=lambda item: ranks.get(item.get("course_id"), len(ranks)))
     view_col, expand_col, collapse_col = st.columns([3, 1, 1], vertical_alignment="bottom")
     view = view_col.radio("Queue layout", ["By course", "All readings"],
                           horizontal=True, key="mock_review_queue_layout")
@@ -111,16 +119,74 @@ def review_queue_table(items, window_sessions):
                 st.session_state.get("mock_review_courses_generation", 0) + 1)
     generation = st.session_state.get("mock_review_courses_generation", 0)
     expanded = st.session_state.get("mock_review_courses_expanded", False)
-    groups = course_review_groups(items)
+    groups = course_review_groups(progress_items if render_course_queue and progress_items is not None else items)
+    if can_reorder:
+        groups.sort(key=lambda group: ranks.get(group['course_id'],len(ranks)))
+    progress_groups = {g['course_id']: g for g in course_review_groups(
+        progress_items if progress_items is not None else items)}
     st.caption(f"{len(groups)} courses · {len(items)} review items in the current filters. "
                "Open a course to see its topics/readings.")
-    for group in groups:
+    if can_reorder:
+        st.caption("Use ↑ and ↓ to put courses in priority order. Changes save automatically for this mock. "
+                   "Review deadlines stay the same.")
+    elif user_id is not None:
+        st.caption("Select one mock above to arrange its courses by priority.")
+    for index, group in enumerate(groups):
         count = len(group["items"])
+        progress_group = progress_groups[group['course_id']]
+        progress_total = len(progress_group['items'])
+        progress_complete = progress_group['complete']
+        course_tasks = [t for t in (task_rows or []) if t['course_id']==group['course_id']]
         label = (f"{group['course_title']} · {count} {'item' if count == 1 else 'items'}"
+                 f" · {progress_complete / progress_total:.0%} complete overall"
                  f" · {group['outstanding']} outstanding · {group['complete']} complete")
-        with st.expander(label, expanded=expanded,
-                         key=f"mock_review_course_{group['course_id']}_{generation}"):
-            linked_table(review_table_rows(group["items"], window_sessions), links)
+        if course_tasks:
+            progress_total = len(course_tasks)
+            progress_complete = sum(bool(t['completed']) for t in course_tasks)
+            label = (f"{group['course_title']} · {progress_total} tasks · {count} {'topic' if count == 1 else 'topics'}"
+                     f" · {progress_complete/progress_total:.0%} queue complete"
+                     f" · {progress_total-progress_complete} tasks left")
+        if can_reorder:
+            body, up, down = st.columns([14, 1, 1], vertical_alignment="top")
+            for column, direction, offset in ((up, "↑", -1), (down, "↓", 1)):
+                target = index + offset
+                disabled = (not 0 <= target < len(groups) or group['course_id'] is None
+                            or (0 <= target < len(groups) and groups[target]['course_id'] is None))
+                if column.button(direction,
+                                 key=f"review_move_{mock_schedule_id}_{group['course_id']}_{offset}",
+                                 help=f"Move {group['course_title']} {'up' if offset < 0 else 'down'}",
+                                 disabled=disabled, use_container_width=True):
+                    move_review_course(user_id, mock_schedule_id, group['course_id'],
+                                       groups[target]['course_id'])
+                    st.rerun()
+        else:
+            body = st
+        # The heading itself is the progress track, including when collapsed.
+        progress_key = f"review_heading_{mock_schedule_id}_{group['course_id']}"
+        percent = 100 * progress_complete / progress_total
+        st.markdown(f'''<style>
+            .st-key-{progress_key} [data-testid="stExpander"] details > summary {{
+                background: linear-gradient(to right, rgba(16,150,136,.30) 0%,
+                    rgba(16,150,136,.30) {percent:.3f}%,
+                    rgba(120,145,170,.09) {percent:.3f}%, rgba(120,145,170,.09) 100%);
+                border-radius: 6px;
+            }}
+            </style>''', unsafe_allow_html=True)
+        with body.container(key=progress_key):
+            section = st.expander(label, expanded=expanded,
+                                  key=f"mock_review_course_{mock_schedule_id}_{group['course_id']}_{generation}",
+                                  on_change='rerun' if render_course_queue else 'ignore')
+            with section:
+                if render_course_queue:
+                    if not section.open:
+                        continue
+                    render_course_queue(group['course_id'])
+                    st.markdown('**Topic review results**')
+                visible_items = [item for item in items if item['course_id']==group['course_id']]
+                if visible_items:
+                    linked_table(review_table_rows(visible_items, window_sessions), links)
+                else:
+                    st.caption('No topics match the current status filter. Your course queue is shown above.')
 
 
 def item_sessions(item, sessions):

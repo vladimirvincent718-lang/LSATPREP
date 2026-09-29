@@ -105,6 +105,15 @@ def ensure_mock_review_schema() -> None:
             FOREIGN KEY (course_id) REFERENCES courses(id)
         );
 
+        CREATE TABLE IF NOT EXISTS mock_review_course_priority (
+            user_id INTEGER NOT NULL,
+            mock_schedule_id INTEGER NOT NULL,
+            course_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            PRIMARY KEY (user_id, mock_schedule_id, course_id),
+            FOREIGN KEY (mock_schedule_id) REFERENCES mock_exam_schedule(id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_mock_schedule_user_date
             ON mock_exam_schedule(user_id, scheduled_date);
         CREATE INDEX IF NOT EXISTS idx_mock_review_user_status
@@ -137,6 +146,64 @@ def ensure_mock_review_schema() -> None:
     )
     conn.commit()
     conn.close()
+
+
+def _review_course_order(conn, user_id, mock_schedule_id):
+    rows = conn.execute(
+        """SELECT course_id FROM mock_review_items
+           WHERE user_id = ? AND mock_schedule_id = ?
+           ORDER BY review_deadline, topic_name, id""",
+        (user_id, mock_schedule_id),
+    ).fetchall()
+    baseline = list(dict.fromkeys(row["course_id"] for row in rows))
+    saved = conn.execute(
+        """SELECT course_id FROM mock_review_course_priority
+           WHERE user_id = ? AND mock_schedule_id = ? ORDER BY position""",
+        (user_id, mock_schedule_id),
+    ).fetchall()
+    ordered = [row["course_id"] for row in saved if row["course_id"] in baseline]
+    return ordered + [course_id for course_id in baseline if course_id not in ordered]
+
+
+def get_review_course_order(user_id: int, mock_schedule_id: int) -> list:
+    """Return saved course priorities, appending newly added courses."""
+    ensure_mock_review_schema()
+    conn = get_connection()
+    try:
+        return _review_course_order(conn, user_id, mock_schedule_id)
+    finally:
+        conn.close()
+
+
+def move_review_course(user_id: int, mock_schedule_id: int,
+                       course_id: int, neighbor_id: int) -> None:
+    """Swap visible neighbors while preserving courses hidden by status filters."""
+    ensure_mock_review_schema()
+    conn = get_connection()
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            owned = conn.execute(
+                "SELECT id FROM mock_exam_schedule WHERE id = ? AND user_id = ?",
+                (mock_schedule_id, user_id),
+            ).fetchone()
+            order = _review_course_order(conn, user_id, mock_schedule_id)
+            if (not owned or course_id is None or neighbor_id is None
+                    or course_id == neighbor_id
+                    or course_id not in order or neighbor_id not in order):
+                raise ValueError("Choose two courses from this mock's review queue.")
+            left, right = order.index(course_id), order.index(neighbor_id)
+            order[left], order[right] = order[right], order[left]
+            conn.executemany(
+                """INSERT INTO mock_review_course_priority
+                   (user_id, mock_schedule_id, course_id, position) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(user_id, mock_schedule_id, course_id)
+                   DO UPDATE SET position = excluded.position""",
+                [(user_id, mock_schedule_id, cid, position)
+                 for position, cid in enumerate(order) if cid is not None],
+            )
+    finally:
+        conn.close()
 
 
 def get_review_module_plan(user_id: int, mock_schedule_id: int) -> dict:

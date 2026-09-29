@@ -119,6 +119,19 @@ export default function({parentElement, data, setStateValue}) {
       .audio-study .help-status {font-weight:600;color:#425577;}
       .audio-study article[data-tutor="gemini"] {border-left-color:#4285f4 !important;}
       .audio-study article[data-tutor="openai"] {border-left-color:#10a37f !important;}
+      .audio-study.is-transcript-fullscreen {position:fixed !important;inset:0;z-index:2147483647;width:100vw;height:100vh;height:100dvh;box-sizing:border-box;overflow:hidden;padding:16px !important;border:0 !important;border-radius:0 !important;background:#fff !important;}
+      .audio-study.is-transcript-fullscreen .player-main {display:flex;flex-direction:column;height:100%;min-height:0;}
+      .audio-study.is-transcript-fullscreen .player-main > :not(.transport):not(canvas):not(.listening-panels) {display:none !important;}
+      .audio-study.is-transcript-fullscreen .transport {flex:none;}
+      .audio-study.is-transcript-fullscreen .player-main > canvas {display:block;flex:none;height:72px !important;margin:10px 0;}
+      .audio-study.is-transcript-fullscreen .listening-panels {display:flex;flex:1;min-height:0;margin:0;}
+      .audio-study.is-transcript-fullscreen .listening-panels .chat-panel {display:none !important;}
+      .audio-study.is-transcript-fullscreen .listening-panels .transcript {display:flex;flex:1;flex-direction:column;min-width:0;min-height:0;}
+      .audio-study.is-transcript-fullscreen .transcript-content {display:flex;flex:1;flex-direction:column;min-height:0;}
+      .audio-study.is-transcript-fullscreen .transcript-body {flex:1;min-height:0;max-height:none !important;width:100%;box-sizing:border-box;align-self:center;padding:12px clamp(8px,4vw,64px);font-size:17px;line-height:1.9 !important;}
+      .audio-study.is-transcript-fullscreen .transcript-body br {display:inline !important;}
+      .audio-study.is-transcript-fullscreen .transcript-collapse-toggle,.audio-study.is-transcript-fullscreen .selected-passage,.audio-study.is-transcript-fullscreen .transcript-actions,.audio-study.is-transcript-fullscreen .highlight-message,.audio-study.is-transcript-fullscreen .saved-highlights {display:none !important;}
+      .audio-study.is-transcript-fullscreen .transcript-help {margin:4px 0;}
       @media(max-width:700px) {
         .audio-study .listening-panels {grid-template-columns:minmax(0,1fr);}
         .audio-study.chat-collapsed .listening-panels {grid-template-columns:minmax(0,1fr) 44px;}
@@ -153,6 +166,7 @@ export default function({parentElement, data, setStateValue}) {
           <button class="transcript-mode" data-mode="comment" type="button" aria-pressed="false">Comment on passage</button>
           <button class="transcript-compact-toggle" type="button" aria-pressed="false">Flatten transcript</button>
           <button class="transcript-collapse-toggle" type="button" aria-expanded="true">Collapse transcript</button>
+          <button class="transcript-fullscreen-toggle" type="button" aria-pressed="false">Full screen transcript</button>
         </div>
         <div class="transcript-content"><p class="transcript-help"></p><div class="transcript-body"></div>
           <p class="selected-passage" role="status"></p>
@@ -346,6 +360,49 @@ export default function({parentElement, data, setStateValue}) {
       root.classList.toggle('transcript-collapsed',collapsed);
       root.querySelector('.transcript-collapse-toggle').setAttribute('aria-expanded',String(!collapsed));
       root.querySelector('.transcript-collapse-toggle').textContent=collapsed?'Show transcript':'Collapse transcript';
+    };
+    const fullscreenButton=root.querySelector('.transcript-fullscreen-toggle');
+    const fullscreenDocument=root.ownerDocument;
+    const setTranscriptFocus=active=>{
+      if(root.classList.contains('is-transcript-fullscreen')===active)return;
+      if(active){root.focusWasCollapsed=root.classList.contains('transcript-collapsed');setTranscriptCollapsed(false);}
+      else if(root.focusWasCollapsed)setTranscriptCollapsed(true);
+      root.classList.toggle('is-transcript-fullscreen',active);
+      fullscreenButton.setAttribute('aria-pressed',String(active));
+      fullscreenButton.textContent=active?'Exit full screen':'Full screen transcript';
+      if(!active&&root.focusFallback){fullscreenDocument.body.style.overflow=root.focusPreviousBodyOverflow;root.focusFallback=false;}
+      root.paint?.();
+    };
+    const startFullscreenFallback=()=>{
+      if(!root.classList.contains('is-transcript-fullscreen')||root.focusFallback)return;
+      root.focusPreviousBodyOverflow=fullscreenDocument.body.style.overflow;
+      fullscreenDocument.body.style.overflow='hidden';
+      root.focusFallback=true;
+    };
+    root.clearTranscriptFocus=()=>setTranscriptFocus(false);
+    root.exitTranscriptFocus=()=>{
+      if(root.focusNative&&fullscreenDocument.fullscreenElement===root){
+        try {Promise.resolve(fullscreenDocument.exitFullscreen()).catch(()=>setTranscriptFocus(false));}
+        catch {setTranscriptFocus(false);}
+      } else setTranscriptFocus(false);
+    };
+    root.onTranscriptFullscreenChange=()=>{
+      if(fullscreenDocument.fullscreenElement===root)root.focusNative=true;
+      else if(root.focusNative){root.focusNative=false;setTranscriptFocus(false);}
+      root.paint?.();
+    };
+    root.onTranscriptEscape=event=>{if(event.key==='Escape'&&root.focusFallback)root.exitTranscriptFocus();};
+    fullscreenDocument.addEventListener('fullscreenchange',root.onTranscriptFullscreenChange);
+    fullscreenDocument.addEventListener('keydown',root.onTranscriptEscape);
+    fullscreenButton.onclick=()=>{
+      if(root.classList.contains('is-transcript-fullscreen')){root.exitTranscriptFocus();return;}
+      setTranscriptFocus(true);
+      if(typeof root.requestFullscreen!=='function'){startFullscreenFallback();return;}
+      try {Promise.resolve(root.requestFullscreen()).then(()=>{
+        if(!root.classList.contains('is-transcript-fullscreen'))fullscreenDocument.exitFullscreen?.();
+        else root.focusNative=fullscreenDocument.fullscreenElement===root;
+      }).catch(startFullscreenFallback);}
+      catch {startFullscreenFallback();}
     };
     try {setCompact(window.localStorage.getItem('studyforge.audio.transcriptCompact')==='1');setTranscriptCollapsed(window.localStorage.getItem('studyforge.audio.transcriptCollapsed')==='1');} catch {}
     root.querySelector('.transcript-compact-toggle').onclick=()=>{const next=!root.classList.contains('transcript-compact');setCompact(next);preference('transcriptCompact',next?'1':'0');};
@@ -791,5 +848,149 @@ export default function({parentElement, data, setStateValue}) {
     if(card){card.scrollIntoView?.({block:'center',behavior:'smooth'});root.focusedThread=data.focus_root;}
   }
   root.paint();
-  return ()=>{clearInterval(root.timer);queueMicrotask(()=>{if(!root.isConnected){root.ownerDocument.removeEventListener('pointerup',root.finishWordDrag);root.ownerDocument.removeEventListener('pointercancel',root.finishWordDrag);root.send=()=>{};root.audio.pause();}});};
+  if(!root.mixer)root.mixer=mountMusicMixer(root, data.music_scope||'default');
+  root.mixer.update(data.music_tracks||[]);
+  return ()=>{clearInterval(root.timer);queueMicrotask(()=>{if(!root.isConnected){root.exitTranscriptFocus?.();root.clearTranscriptFocus?.();root.ownerDocument.removeEventListener('fullscreenchange',root.onTranscriptFullscreenChange);root.ownerDocument.removeEventListener('keydown',root.onTranscriptEscape);root.ownerDocument.removeEventListener('pointerup',root.finishWordDrag);root.ownerDocument.removeEventListener('pointercancel',root.finishWordDrag);root.send=()=>{};root.audio.pause();root.mixer.dispose();}});};
+}
+
+// A second media element keeps music time, speed and events out of study telemetry.
+export function mountMusicMixer(root, scope) {
+  const content=root.audio, panel=document.createElement('section');
+  panel.className='music-mixer';panel.setAttribute('aria-label','Background music track');
+  const heading=document.createElement('h3');heading.textContent='01 · Content';
+  root.querySelector('.transport').before(heading);
+  panel.innerHTML=`<style>
+    .audio-study .music-mixer {margin:12px 0;padding:16px;border:1px solid #a5b4fc;border-left:5px solid #6366f1;border-radius:12px;background:#f5f7ff;}
+    .audio-study .music-mixer h3 {margin:0 0 12px;}
+    .audio-study .mixer-row {display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:10px 0;}
+    .audio-study .music-mixer select {max-width:100%;padding:6px;}
+    .audio-study .music-mixer button {padding:9px 14px;border:1px solid #a5b4fc;border-radius:8px;background:white;color:#243047;cursor:pointer;}
+    .audio-study .music-mixer button:disabled {opacity:.5;cursor:default;}
+    .audio-study .music-track {width:min(100%,420px);}
+    .audio-study .music-position {flex:1;min-width:120px;}
+    @media(max-width:600px) {
+      .audio-study .music-mixer {padding:12px;}
+      .audio-study .transport button,.audio-study .music-mixer button,.audio-study select {min-height:44px;}
+      .audio-study .music-mixer input[type=range] {min-height:36px;max-width:100%;}
+      .audio-study .music-track {width:100%;min-width:0;}
+      .audio-study .music-mixer select {font-size:16px;}
+      .audio-study .music-keep {width:20px;height:20px;vertical-align:middle;}
+    }
+  </style><h3>02 · Background music</h3><audio class="music-audio" preload="metadata" hidden></audio>
+  <div class="mixer-row"><label class="music-track">Track <select class="music-select" aria-label="Music track" style="width:100%"></select></label>
+    <label>Loop <select class="music-loop" aria-label="Music loop mode"><option value="one">One beat</option><option value="playlist">Entire playlist</option></select></label></div>
+  <div class="mixer-row"><button type="button" class="music-play">▶ Play music</button><button type="button" class="music-next">Next beat →</button>
+    <label>Volume <input class="music-volume" aria-label="Music volume" type="range" min="0" max="1" step="0.05" value="0.3"><output class="music-volume-value">30%</output></label>
+    <label>Speed <select class="music-speed" aria-label="Music speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="1.75">1.75×</option><option value="2">2×</option></select></label></div>
+  <div class="mixer-row"><input class="music-position" aria-label="Music position" type="range" min="0" max="100" step="0.1" value="0"><span class="music-time">0:00</span></div>
+  <label><input class="music-keep" type="checkbox" checked> Keep music playing when content pauses or ends</label>
+  <div class="mixer-row"><button type="button" class="mix-play">▶ Play both</button><button type="button" class="mix-pause">Ⅱ Pause both</button></div>
+  <p class="music-message" role="status" aria-live="polite"></p>`;
+  (root.querySelector('.progress')||root.querySelector('.transport')).after(panel);
+  root.querySelector('.volume').setAttribute('aria-label','Content volume');
+  root.querySelector('.playback-speed').setAttribute('aria-label','Content speed');
+  const $=selector=>panel.querySelector(selector), music=$('.music-audio');
+  let tracks=[],index=0,signature='',disposed=false,follow=false;
+  let context=null,contentGain=null,musicGain=null;
+  // Gain nodes support independent faders on phones that ignore media.volume.
+  const volumes=()=>{
+    const cv=Number(root.querySelector('.volume').value),mv=Number($('.music-volume').value);
+    content.volume=contentGain?1:cv;music.volume=musicGain?1:mv;
+    if(contentGain)contentGain.gain.value=cv;
+    if(musicGain)musicGain.gain.value=mv;
+  };
+  const unlock=()=>{
+    const Context=window.AudioContext||window.webkitAudioContext;
+    if(!context&&Context?.prototype?.createMediaElementSource){
+      context=new Context();
+      contentGain=context.createGain();musicGain=context.createGain();
+      context.createMediaElementSource(content).connect(contentGain).connect(context.destination);
+      context.createMediaElementSource(music).connect(musicGain).connect(context.destination);
+      volumes();
+    }
+    if(context&&context.state!=='running')context.resume().catch(()=>{
+      $('.music-message').textContent='Tap Play again to enable audio on this device.';
+    });
+  };
+  root.addEventListener('click',unlock,true);
+  root.querySelector('.volume').oninput=volumes;
+  const key=`study-music-mixer:${scope}`;
+  try {
+    const saved=JSON.parse(window.localStorage.getItem(key)||'{}');
+    if(['one','playlist'].includes(saved.loop))$('.music-loop').value=saved.loop;
+    if(typeof saved.keep==='boolean')$('.music-keep').checked=saved.keep;
+    if(Number.isFinite(saved.volume)&&saved.volume>=0&&saved.volume<=1)$('.music-volume').value=saved.volume;
+    if([...$('.music-speed').options].some(option=>Number(option.value)===saved.speed))$('.music-speed').value=saved.speed;
+  }catch{}
+  const settings=()=>{
+    volumes();
+    music.playbackRate=Number($('.music-speed').value);
+    music.preservesPitch=true;
+    music.loop=$('.music-loop').value==='one'||tracks.length===1;
+    $('.music-volume-value').textContent=`${Math.round(Number($('.music-volume').value)*100)}%`;
+    try{window.localStorage.setItem(key,JSON.stringify({volume:Number($('.music-volume').value),speed:music.playbackRate,loop:$('.music-loop').value,keep:$('.music-keep').checked}));}catch{}
+  };
+  const paint=()=>{
+    $('.music-play').textContent=music.paused?'▶ Play music':'Ⅱ Pause music';
+    const duration=Number.isFinite(music.duration)?music.duration:0;
+    $('.music-position').max=duration||100;
+    $('.music-position').value=music.currentTime||0;
+    $('.music-position').disabled=!duration;
+    const format=seconds=>`${Math.floor(seconds/60)}:${String(Math.floor(seconds%60)).padStart(2,'0')}`;
+    $('.music-time').textContent=`${format(music.currentTime||0)} / ${format(duration)}`;
+  };
+  const start=async()=>{
+    if(!tracks.length||disposed)return;
+    $('.music-message').textContent='';
+    try{await music.play();if(disposed)music.pause();}
+    catch{if(!disposed)$('.music-message').textContent='Music could not play. Try Play music again, or select another file.';}
+    paint();
+  };
+  const select=(next,resume=false)=>{
+    music.pause();index=next;
+    $('.music-message').textContent='';
+    $('.music-select').value=String(index);
+    music.src=resolveAudioSource(tracks[index].src,window.location.pathname);
+    music.currentTime=0;settings();paint();
+    if(resume)void start();
+  };
+  $('.music-play').onclick=()=>{if(music.paused){follow=true;void start();}else{follow=false;music.pause();paint();}};
+  $('.music-next').onclick=()=>select((index+1)%tracks.length,!music.paused);
+  $('.music-select').onchange=e=>select(Number(e.target.value),!music.paused);
+  $('.music-volume').oninput=settings;
+  $('.music-speed').onchange=settings;
+  $('.music-loop').onchange=settings;
+  $('.music-keep').onchange=()=>{settings();if(!$('.music-keep').checked&&content.paused){music.pause();paint();}};
+  $('.music-position').oninput=e=>{music.currentTime=Number(e.target.value);paint();};
+  $('.mix-play').onclick=()=>{
+    follow=true;void start();
+    // Start both directly from the click to retain browser user activation.
+    content.play().catch(()=>{root.querySelector('.error').textContent='Content could not start. Try Play again.';});
+  };
+  $('.mix-pause').onclick=()=>{follow=false;content.pause();music.pause();paint();};
+  music.addEventListener('ended',()=>{
+    if(!tracks.length||disposed)return;
+    select($('.music-loop').value==='playlist'?(index+1)%tracks.length:index,true);
+  });
+  music.addEventListener('error',()=>{$('.music-message').textContent='This music file could not be loaded or decoded. Select another track or upload a supported file.';paint();});
+  for(const event of ['play','pause','timeupdate','loadedmetadata'])music.addEventListener(event,paint);
+  const contentPause=()=>{if(!$('.music-keep').checked){music.pause();paint();}};
+  const contentPlay=()=>{if(follow&&music.paused)void start();};
+  content.addEventListener('pause',contentPause);content.addEventListener('ended',contentPause);content.addEventListener('play',contentPlay);
+  settings();
+  return {audio:music, update(incoming){
+    const next=JSON.stringify(incoming);
+    if(signature===next)return;
+    signature=next;
+    const previous=tracks[index],playing=!music.paused;
+    tracks=incoming;
+    $('.music-select').replaceChildren();
+    tracks.forEach((track,i)=>{const option=document.createElement('option');option.value=String(i);option.textContent=`${i+1}. ${track.title}`;$('.music-select').append(option);});
+    for(const selector of ['.music-select','.music-loop','.music-play','.music-next','.mix-play'])$(selector).disabled=!tracks.length;
+    $('.music-next').disabled=tracks.length<2;
+    if(!tracks.length){follow=false;music.pause();music.removeAttribute('src');music.load();$('.music-message').textContent='Upload music above, then choose a track or saved playlist.';paint();return;}
+    const retained=tracks.findIndex(track=>track.id===previous?.id&&track.src===previous?.src);
+    if(retained>=0){index=retained;$('.music-select').value=String(index);settings();}
+    else select(0,playing);
+  }, dispose(){disposed=true;music.pause();music.removeAttribute('src');music.load();root.removeEventListener('click',unlock,true);if(context)void context.close();content.removeEventListener('pause',contentPause);content.removeEventListener('ended',contentPause);content.removeEventListener('play',contentPlay);}};
 }

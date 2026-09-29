@@ -425,6 +425,10 @@ with review_tab:
     )
     scoped_items = [item for item in all_review_items
                     if queue_mock_id is None or item["mock_schedule_id"] == queue_mock_id]
+    from src.review_tasks_ui import render_tasks
+    task_rows = render_tasks(user_id, queue_mock_id, scoped_items, overview_only=True)
+    st.divider()
+    st.markdown("### Course review queues")
     view = queue_right.selectbox(
         "Show", ["Outstanding", "All", "Complete", "Pending", "In Progress"],
         key="mock_review_queue_status",
@@ -437,12 +441,12 @@ with review_tab:
     completed_col.metric("Completed", completed_count)
     if total_count:
         st.progress(completed_count / total_count,
-                    text=f"{completed_count} of {total_count} review items completed")
+                    text=f"Topic review · {completed_count / total_count:.0%} complete · {completed_count} of {total_count} review items completed")
     items = [item for item in scoped_items
              if view == "All"
              or (view == "Outstanding" and item["review_status"] != "Complete")
              or item["review_status"] == view]
-    if not items:
+    if not items and not (queue_mock_id and scoped_items):
         if all_review_items:
             st.info(
                 "No review items match this view. Switch Show to All or choose another mock."
@@ -457,8 +461,11 @@ with review_tab:
     else:
         window_sessions = {item["mock_schedule_id"]: get_review_window_practice_sessions(
             user_id, item["mock_schedule_id"], include_exams=False)
-            for item in {row["mock_schedule_id"]: row for row in items}.values()}
-        review_queue_table(items, window_sessions)
+            for item in {row["mock_schedule_id"]: row for row in scoped_items}.values()}
+        review_queue_table(items, window_sessions, user_id=user_id, mock_schedule_id=queue_mock_id,
+                           progress_items=scoped_items, task_rows=task_rows,
+                           render_course_queue=(lambda cid: render_tasks(user_id,queue_mock_id,scoped_items,course_id=cid))
+                           if queue_mock_id is not None else None)
         st.caption(
             "Review Count = completed attempts for this topic. Questions includes all attempts; "
             "Retest Score combines completed attempts, weighted by question count. "
@@ -466,16 +473,17 @@ with review_tab:
         )
 
         with st.expander("Manual status override or notes"):
+            editable_items = items or scoped_items
             item_map = {
                 item["id"]: f"{item['mock_label']} · {item['topic_display']}"
-                for item in items
+                for item in editable_items
             }
             selected_id = st.selectbox(
                 "Review item",
                 options=list(item_map),
                 format_func=lambda item_id: item_map[item_id],
             )
-            selected = next(item for item in items if item["id"] == selected_id)
+            selected = next(item for item in editable_items if item["id"] == selected_id)
             override_options = ["Automatic", *AUTO_STATUS]
             current_override = selected.get("status_override") or "Automatic"
             override = st.selectbox(

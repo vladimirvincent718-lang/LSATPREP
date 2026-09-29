@@ -231,14 +231,25 @@ def render_publish_controls() -> None:
                 st.error(str(exc))
     else:
         st.success(f"GitHub connected as {GITHUB_OWNER}.")
-        if st.button("Publish update", key="studyforge_publish_update", type="primary"):
-            try:
-                with st.spinner("Checking and uploading the latest app code..."):
-                    commit, changed = publish_update()
-                if changed:
-                    st.success(f"Uploaded {changed} changed source files (version {commit[:7]}). Streamlit is rebuilding the same link; refresh it in a minute or two.")
-                else:
-                    st.info("The online app already has the same source files.")
-            except PublishError as exc:
-                st.error(str(exc))
+    publish_column, unpublish_column = st.columns(2)
+    with publish_column:
+        publish_clicked = st.button("Publish update", key="studyforge_publish_update", type="primary", disabled=not connected)
+    with unpublish_column:
+        with st.popover("Unpublish online app", width="stretch"):
+            st.markdown("**Take the Streamlit app off the internet**")
+            st.write("Streamlit calls this **Delete app**. Complete the removal in your Streamlit account; opening these controls does not take the app offline.")
+            st.warning("Removing the hosted app deletes its cloud uploads, progress and settings. Save anything you need from the online app first. Your desktop app, local files and GitHub repository are kept.")
+            st.markdown("1. Open your Streamlit apps below and sign in.\n2. Find **LSATPREP · main · app.py**, open its **⋮** menu and choose **Delete**.\n3. Enter Streamlit's confirmation text and select **Delete** to take the link offline.")
+            st.link_button("Open Streamlit removal controls", f"https://share.streamlit.io/?workspaceName={GITHUB_OWNER}", type="primary")
+            st.caption("To put it online again, deploy LSATPREP / main / app.py in Streamlit. Publish update only updates the code; it does not recreate a deleted deployment.")
+    if publish_clicked:
+        try:
+            with st.spinner("Checking and uploading the latest app code..."):
+                commit, changed = publish_update()
+            if changed:
+                st.success(f"Uploaded {changed} changed source files (version {commit[:7]}). Streamlit is rebuilding the same link; refresh it in a minute or two.")
+            else:
+                st.info("The online app already has the same source files.")
+        except PublishError as exc:
+            st.error(str(exc))
     st.link_button("Open the live app", PUBLIC_APP_URL)

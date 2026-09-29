@@ -9,6 +9,7 @@ from src.utils import sidebar_nav,require_course,page_header
 from src.course_material_nav import course_material_nav
 from src import audio_study as audio
 from src.audio_player import render_player
+from src.audio_music import render_music_library
 from src.audio_upload import render_audio_upload
 from src.audio_course_setup import render_course_setup
 from src.drive_audio_ui import render_drive_settings
@@ -50,7 +51,8 @@ with library:
         recording=by_id[selected_id]
         st.caption('Coverage: '+coverage_label(audio.targets(user_id,course_id,recording['id']),*catalog(user_id)))
         st.caption('Green waveform · current playback position. Bottom-edge review flags: Red · needs review / Yellow · learning / Green · comfortable.')
-        render_player(user_id,course_id,recording)
+        music_tracks=render_music_library(user_id)
+        render_player(user_id,course_id,recording,music_tracks)
         render_transcript(user_id,course_id,recording)
         render_sharing(user_id,course_id,recording)
 with recall:render_recall(user_id,course_id,[r for r in recordings if r['user_id']==user_id])

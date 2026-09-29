@@ -8,6 +8,7 @@ from src import audio_study as store
 from src.audio_transcription import queue_transcription, transcription_state
 from src import audio_tutors as tutors
 from src.audio_attachments import media_for_marks
+from src.audio_music import media_tracks
 
 _JS = Path(__file__).with_suffix('.js').read_text(encoding='utf-8')
 
@@ -18,7 +19,7 @@ def rerun_player():
 
 
 @st.fragment(run_every=3)
-def render_player(user_id, course_id, audio):
+def render_player(user_id, course_id, audio, music_tracks=None):
     player = components.component('study_audio_player', js=_JS)
     key = f"audio_player_{user_id}_{course_id}_{audio['id']}"
     # Keep at most one selected recording per session; authorization is rechecked
@@ -47,6 +48,8 @@ def render_player(user_id, course_id, audio):
         st.rerun(scope='app')
     marks=media_for_marks(user_id,course_id,audio['id'],store.marks(user_id,course_id,audio['id']),st.session_state.get(key+'_attachment_pages',{}))
     result = player(key=key, data={'src':src,
+                     'music_tracks':media_tracks(user_id,music_tracks) if music_tracks else [],
+                     'music_scope':str(user_id),
                      'transcription':transcription,
                      'completion':completion,
                      'completion_result':st.session_state.get(key+'_completion_result'),
